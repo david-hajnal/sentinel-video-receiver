@@ -1,0 +1,27 @@
+# Rust / Cargo
+**/target/
+**/*.rs.bk
+Cargo.lock
+
+# If you are building a binary/app, keep Cargo.lock tracked instead:
+# !Cargo.lock
+
+# IDEs
+.idea/
+.vscode/
+
+# macOS
+.DS_Store
+
+# Logs / temp
+*.log
+*.tmp
+
+# Local config / secrets
+.env
+config.toml
+
+# Generated media outputs (from this project)
+*.h264
+*.mp4
+*.pcap
