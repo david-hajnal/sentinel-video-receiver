@@ -19,19 +19,27 @@ fn nal_type_from_annexb(nal: &[u8]) -> Option<u8> {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let rtsp_url = "rtsp://192.168.1.187:8554/cam";
-    let host = "192.168.1.187";
-    let port = 8554;
+    // Load .env file if it exists
+    dotenvy::dotenv().ok();
 
-    let mut c = RtspClient::connect(host, port).await?;
+    // Read configuration from environment variables
+    let host = std::env::var("UDP_RTSP_HOST").unwrap_or_else(|_| "192.168.1.187".to_string());
+    let port: u16 = std::env::var("UDP_RTSP_PORT")
+        .unwrap_or_else(|_| "8554".to_string())
+        .parse()
+        .unwrap_or(8554);
+    let path = std::env::var("UDP_RTSP_PATH").unwrap_or_else(|_| "/cam".to_string());
+    let rtsp_url = format!("rtsp://{}:{}{}", host, port, path);
 
-    let r = c.request("OPTIONS", rtsp_url, &[], None).await?;
+    let mut c = RtspClient::connect(&host, port).await?;
+
+    let r = c.request("OPTIONS", &rtsp_url, &[], None).await?;
     if r.status != 200 {
         bail!("OPTIONS failed: {}", r.status);
     }
 
     let r = c
-        .request("DESCRIBE", rtsp_url, &[("Accept", "application/sdp")], None)
+        .request("DESCRIBE", &rtsp_url, &[("Accept", "application/sdp")], None)
         .await?;
     if r.status != 200 {
         bail!("DESCRIBE failed: {}", r.status);
@@ -49,8 +57,14 @@ async fn main() -> Result<()> {
         )
     };
 
-    let rtp_port = 5004;
-    let rtcp_port = 5005;
+    let rtp_port: u16 = std::env::var("UDP_RTP_PORT")
+        .unwrap_or_else(|_| "5004".to_string())
+        .parse()
+        .unwrap_or(5004);
+    let rtcp_port: u16 = std::env::var("UDP_RTCP_PORT")
+        .unwrap_or_else(|_| "5005".to_string())
+        .parse()
+        .unwrap_or(5005);
 
     let transport = format!(
         "RTP/AVP;unicast;client_port={}-{};mode=play",
@@ -65,7 +79,7 @@ async fn main() -> Result<()> {
     c.set_session_from(&r);
 
     let r = c
-        .request("PLAY", rtsp_url, &[("Range", "npt=0.000-")], None)
+        .request("PLAY", &rtsp_url, &[("Range", "npt=0.000-")], None)
         .await?;
     if r.status != 200 {
         bail!("PLAY failed: {}", r.status);
@@ -74,7 +88,8 @@ async fn main() -> Result<()> {
     let sock = UdpSocket::bind(("0.0.0.0", rtp_port)).await?;
     println!("UDP mode: receiving RTP on udp://0.0.0.0:{rtp_port}");
 
-    let mut out = tokio::fs::File::create("udp_out.h264").await?;
+    let output_file = std::env::var("UDP_OUTPUT_FILE").unwrap_or_else(|_| "udp_out.h264".to_string());
+    let mut out = tokio::fs::File::create(&output_file).await?;
     let mut dep = H264Depacketizer::new();
 
     // Bigger buffer reduces chances of truncation if packets are larger than expected.

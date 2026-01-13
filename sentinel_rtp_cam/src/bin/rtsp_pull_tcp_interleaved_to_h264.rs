@@ -44,21 +44,28 @@ fn basic_auth_value(user: &str, pass: &str) -> String {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    // IMPORTANT: do NOT embed credentials in the URL.
-    let rtsp_url = "rtsp://192.168.1.187:554/stream1";
-    let host = "192.168.1.187";
-    let port = 554;
+    // Load .env file if it exists
+    dotenvy::dotenv().ok();
+
+    // Read configuration from environment variables
+    let host = std::env::var("TCP_RTSP_HOST").unwrap_or_else(|_| "192.168.1.187".to_string());
+    let port: u16 = std::env::var("TCP_RTSP_PORT")
+        .unwrap_or_else(|_| "554".to_string())
+        .parse()
+        .map_err(|_| anyhow!("Invalid TCP_RTSP_PORT"))?;
+    let path = std::env::var("TCP_RTSP_PATH").unwrap_or_else(|_| "/stream1".to_string());
+    let rtsp_url = format!("rtsp://{}:{}{}", host, port, path);
 
     // Read raw credentials from environment (no URL encoding issues).
     let user = std::env::var("RTSP_USER").map_err(|_| anyhow!("Missing RTSP_USER env var"))?;
     let pass = std::env::var("RTSP_PASS").map_err(|_| anyhow!("Missing RTSP_PASS env var"))?;
     let authz = basic_auth_value(&user, &pass);
 
-    let mut c = RtspClient::connect(host, port).await?;
+    let mut c = RtspClient::connect(&host, port).await?;
 
     // OPTIONS
     let r = c
-        .request("OPTIONS", rtsp_url, &[("Authorization", &authz)], None)
+        .request("OPTIONS", &rtsp_url, &[("Authorization", &authz)], None)
         .await?;
     println!("OPTIONS status: {}", r.status);
     if let Some(p) = header_value(&r.headers, "Public") {
@@ -72,7 +79,7 @@ async fn main() -> Result<()> {
     let r = c
         .request(
             "DESCRIBE",
-            rtsp_url,
+            &rtsp_url,
             &[("Accept", "application/sdp"), ("Authorization", &authz)],
             None,
         )
@@ -123,7 +130,7 @@ async fn main() -> Result<()> {
     let r = c
         .request(
             "PLAY",
-            rtsp_url,
+            &rtsp_url,
             &[("Range", "npt=0.000-"), ("Authorization", &authz)],
             None,
         )
@@ -138,7 +145,8 @@ async fn main() -> Result<()> {
 
     println!("TCP interleaved mode: reading RTP/RTCP from RTSP TCP connection");
 
-    let mut out = tokio::fs::File::create("tcp_out.h264").await?;
+    let output_file = std::env::var("TCP_OUTPUT_FILE").unwrap_or_else(|_| "tcp_out.h264".to_string());
+    let mut out = tokio::fs::File::create(&output_file).await?;
     let mut dep = H264Depacketizer::new();
 
     let mut last_sps: Option<Vec<u8>> = None;
