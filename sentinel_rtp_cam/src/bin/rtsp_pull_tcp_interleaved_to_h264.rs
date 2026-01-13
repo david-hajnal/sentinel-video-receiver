@@ -1,4 +1,4 @@
-use anyhow::{bail, Result};
+use anyhow::{anyhow, bail, Result};
 use tokio::io::AsyncWriteExt;
 
 use sentinel_rtp_cam::h264_depacketize::H264Depacketizer;
@@ -6,6 +6,8 @@ use sentinel_rtp_cam::interleaved::{read_interleaved_frame, InterleavedFrame};
 use sentinel_rtp_cam::rtp::RtpPacket;
 use sentinel_rtp_cam::rtsp::RtspClient;
 use sentinel_rtp_cam::sdp::parse_sdp_video_track;
+
+use base64::Engine;
 
 fn header_value<'a>(headers: &'a [(String, String)], key: &str) -> Option<&'a str> {
     headers
@@ -15,7 +17,6 @@ fn header_value<'a>(headers: &'a [(String, String)], key: &str) -> Option<&'a st
 }
 
 fn parse_interleaved_channels(transport: &str) -> Option<(u8, u8)> {
-    // Example: "RTP/AVP/TCP;unicast;interleaved=0-1;mode=play"
     for part in transport.split(';') {
         let part = part.trim();
         if let Some(v) = part.strip_prefix("interleaved=") {
@@ -29,39 +30,58 @@ fn parse_interleaved_channels(transport: &str) -> Option<(u8, u8)> {
 }
 
 fn nal_type_from_annexb(nal: &[u8]) -> Option<u8> {
-    // Expect Annex-B: 00 00 00 01 <nal_header> ...
-    if nal.len() < 5 {
-        return None;
-    }
-    if nal[0..4] != [0, 0, 0, 1] {
+    if nal.len() < 5 || nal[0..4] != [0, 0, 0, 1] {
         return None;
     }
     Some(nal[4] & 0x1F)
 }
 
+fn basic_auth_value(user: &str, pass: &str) -> String {
+    let token = format!("{user}:{pass}");
+    let b64 = base64::engine::general_purpose::STANDARD.encode(token.as_bytes());
+    format!("Basic {b64}")
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
-    let rtsp_url = "rtsp://admin:Ratatata4@@192.168.1.187:8554/stream1";
+    // IMPORTANT: do NOT embed credentials in the URL.
+    let rtsp_url = "rtsp://192.168.1.187:554/stream1";
     let host = "192.168.1.187";
-    let port = 8554;
+    let port = 554;
+
+    // Read raw credentials from environment (no URL encoding issues).
+    let user = std::env::var("RTSP_USER").map_err(|_| anyhow!("Missing RTSP_USER env var"))?;
+    let pass = std::env::var("RTSP_PASS").map_err(|_| anyhow!("Missing RTSP_PASS env var"))?;
+    let authz = basic_auth_value(&user, &pass);
 
     let mut c = RtspClient::connect(host, port).await?;
 
-    let r = c.request("OPTIONS", rtsp_url, &[], None).await?;
+    // OPTIONS
+    let r = c
+        .request("OPTIONS", rtsp_url, &[("Authorization", &authz)], None)
+        .await?;
     println!("OPTIONS status: {}", r.status);
-    for (k, v) in &r.headers {
-        if k.eq_ignore_ascii_case("Public") {
-            println!("Public: {v}");
-        }
+    if let Some(p) = header_value(&r.headers, "Public") {
+        println!("Public: {p}");
     }
     if r.status != 200 {
         bail!("OPTIONS failed: {}", r.status);
     }
 
+    // DESCRIBE
     let r = c
-        .request("DESCRIBE", rtsp_url, &[("Accept", "application/sdp")], None)
+        .request(
+            "DESCRIBE",
+            rtsp_url,
+            &[("Accept", "application/sdp"), ("Authorization", &authz)],
+            None,
+        )
         .await?;
     if r.status != 200 {
+        eprintln!("DESCRIBE failed: {}", r.status);
+        if let Some(wa) = header_value(&r.headers, "WWW-Authenticate") {
+            eprintln!("WWW-Authenticate: {wa}");
+        }
         bail!("DESCRIBE failed: {}", r.status);
     }
     let sdp = String::from_utf8_lossy(&r.body);
@@ -77,10 +97,15 @@ async fn main() -> Result<()> {
         )
     };
 
-    // Interleaved channels 0 (RTP) and 1 (RTCP)
+    // SETUP
     let transport = "RTP/AVP/TCP;unicast;interleaved=0-1;mode=play";
     let r = c
-        .request("SETUP", &setup_url, &[("Transport", transport)], None)
+        .request(
+            "SETUP",
+            &setup_url,
+            &[("Transport", transport), ("Authorization", &authz)],
+            None,
+        )
         .await?;
     if r.status != 200 {
         bail!("SETUP failed: {}", r.status);
@@ -88,15 +113,20 @@ async fn main() -> Result<()> {
     c.set_session_from(&r);
 
     let transport_resp = header_value(&r.headers, "Transport")
-        .ok_or_else(|| anyhow::anyhow!("SETUP response missing Transport header"))?;
-
+        .ok_or_else(|| anyhow!("SETUP response missing Transport header"))?;
     let (rtp_chan, rtcp_chan) = parse_interleaved_channels(transport_resp).ok_or_else(|| {
-        anyhow::anyhow!("SETUP Transport missing interleaved=..-..: {transport_resp}")
+        anyhow!("SETUP Transport missing interleaved=..-..: {transport_resp}")
     })?;
     println!("Negotiated interleaved channels: RTP={rtp_chan}, RTCP={rtcp_chan}");
 
+    // PLAY
     let r = c
-        .request("PLAY", rtsp_url, &[("Range", "npt=0.000-")], None)
+        .request(
+            "PLAY",
+            rtsp_url,
+            &[("Range", "npt=0.000-"), ("Authorization", &authz)],
+            None,
+        )
         .await?;
     if r.status != 200 {
         eprintln!("PLAY failed: {}", r.status);
@@ -111,12 +141,10 @@ async fn main() -> Result<()> {
     let mut out = tokio::fs::File::create("tcp_out.h264").await?;
     let mut dep = H264Depacketizer::new();
 
-    // --- Sync gate state ---
     let mut last_sps: Option<Vec<u8>> = None;
     let mut last_pps: Option<Vec<u8>> = None;
     let mut synced = false;
 
-    // --- RTP integrity state ---
     let mut expected_seq: Option<u16> = None;
 
     loop {
@@ -132,7 +160,6 @@ async fn main() -> Result<()> {
                     }
                 };
 
-                // RTP sequence continuity check (wrap-safe)
                 if let Some(exp) = expected_seq {
                     if pkt.sequence_number != exp {
                         dep.reset();
@@ -145,27 +172,18 @@ async fn main() -> Result<()> {
 
                 for nal in dep.push_rtp_payload(pkt.payload)? {
                     let Some(nt) = nal_type_from_annexb(&nal) else {
-                        // If depacketizer ever outputs something unexpected, resync hard
                         dep.reset();
                         synced = false;
                         expected_seq = None;
                         continue;
                     };
 
-                    // Cache SPS/PPS; don't write them immediately (we'll prepend at IDR)
                     match nt {
-                        7 => {
-                            last_sps = Some(nal);
-                            continue;
-                        }
-                        8 => {
-                            last_pps = Some(nal);
-                            continue;
-                        }
+                        7 => { last_sps = Some(nal); continue; }
+                        8 => { last_pps = Some(nal); continue; }
                         _ => {}
                     }
 
-                    // Not synced: wait for SPS+PPS and then an IDR.
                     if !synced {
                         if nt == 5 && last_sps.is_some() && last_pps.is_some() {
                             out.write_all(last_sps.as_ref().unwrap()).await?;
@@ -176,7 +194,6 @@ async fn main() -> Result<()> {
                         continue;
                     }
 
-                    // Synced: prepend SPS/PPS before every IDR for robustness.
                     if nt == 5 {
                         if let (Some(sps), Some(pps)) = (last_sps.as_ref(), last_pps.as_ref()) {
                             out.write_all(sps).await?;
@@ -187,12 +204,8 @@ async fn main() -> Result<()> {
                     out.write_all(&nal).await?;
                 }
             }
-            InterleavedFrame::Rtcp(_bytes) => {
-                // ignore for now
-            }
-            InterleavedFrame::Unknown(_ch, _bytes) => {
-                // ignore unknown channels safely
-            }
+            InterleavedFrame::Rtcp(_bytes) => {}
+            InterleavedFrame::Unknown(_ch, _bytes) => {}
         }
     }
 }
