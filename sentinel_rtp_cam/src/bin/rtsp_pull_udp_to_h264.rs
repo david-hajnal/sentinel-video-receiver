@@ -19,8 +19,10 @@ fn nal_type_from_annexb(nal: &[u8]) -> Option<u8> {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    // Load .env file if it exists
-    dotenvy::dotenv().ok();
+    // Load environment variables from .env file
+    if dotenvy::dotenv().is_err() {
+        dotenvy::from_filename("../.env").ok();
+    }
 
     // Read configuration from environment variables
     let host = std::env::var("UDP_RTSP_HOST").unwrap_or_else(|_| "192.168.1.187".to_string());

@@ -22,10 +22,11 @@ pub struct RtspClient {
 }
 
 impl RtspClient {
-    pub async fn connect(host: &str, port: u16) -> Result<Self> {
-        let stream = TcpStream::connect((host, port)).await?;
-        Ok(Self { stream, cseq: 1, session: None, leftover: Vec::new() })
-    }
+pub async fn connect(host: &str, port: u16) -> Result<Self> {
+    eprintln!("🎥 RTSP TcpStream::connect to {}:{}", host, port);
+    let stream = TcpStream::connect((host, port)).await?;
+    Ok(Self { stream, cseq: 1, session: None, leftover: Vec::new() })
+}
 
     pub async fn request(&mut self, method: &str, url: &str, extra_headers: &[(&str, &str)], body: Option<&[u8]>) -> Result<RtspResponse> {
         let mut req = String::new();

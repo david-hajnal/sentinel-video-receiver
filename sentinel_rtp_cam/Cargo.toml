@@ -12,11 +12,21 @@ tokio = { version = "1", features = [
     "io-util",
     "time",
     "process",
+    "signal",
     "fs"
 ] }
+tokio-util = "0.7"
 base64 = "0.22"
 regex = "1"
 md5 = "0.7"
 rand = "0.8"
 url = "2"
 dotenvy = "0.15"
+reqwest = { version = "0.12", features = ["rustls-tls"] }
+quick-xml = "0.31"
+chrono = { version = "0.4", features = ["clock"] }
+sha1 = "0.10"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+reqwest-middleware = "0.3"
+reqwest-retry = "0.6"
