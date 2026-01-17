@@ -1,4 +1,5 @@
 use tokio::sync::mpsc;
+use tracing::info;
 use crate::event_bus::Event;
 
 pub fn spawn_logger(mut rx: mpsc::Receiver<Event>) -> tokio::task::JoinHandle<()> {
@@ -7,9 +8,9 @@ pub fn spawn_logger(mut rx: mpsc::Receiver<Event>) -> tokio::task::JoinHandle<()
             match ev {
                 Event::Motion(m) => {
                     if m.active {
-                        println!("🚨 MOTION START rule={} ts={}", m.rule, m.ts);
+                        info!(rule = %m.rule, timestamp = %m.ts, "Motion detected");
                     } else {
-                        println!("✅ MOTION END   rule={} ts={}", m.rule, m.ts);
+                        info!(rule = %m.rule, timestamp = %m.ts, "Motion ended");
                     }
                 }
             }

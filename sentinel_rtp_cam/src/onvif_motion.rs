@@ -8,6 +8,7 @@ use reqwest::header::{HeaderMap, HeaderValue, CONNECTION, CONTENT_TYPE};
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 use tokio::time::{interval, sleep};
+use tracing::{debug, info, warn};
 
 use crate::event_bus::{Event, EventBus, MotionEvent};
 
@@ -69,13 +70,13 @@ fn dump_xml(tag: &str, xml: &str) {
     let filename = format!("onvif_dump/{}_{}.xml", ts, tag);
     let _ = std::fs::write(&filename, xml);
     if debug_enabled() {
-        eprintln!("🧾 dumped XML -> {}", filename);
+        debug!(file = %filename, "Dumped ONVIF XML");
     }
 }
 
 fn log_debug(msg: impl AsRef<str>) {
     if debug_enabled() {
-        eprintln!("{}", msg.as_ref());
+        debug!("{}", msg.as_ref());
     }
 }
 
@@ -400,14 +401,14 @@ pub async fn run_onvif_motion_poller(bus: EventBus) -> Result<()> {
 
     let onvif_service = format!("http://{}:{}/onvif/service", host, port);
 
-    eprintln!("🔧 ONVIF service: {}", onvif_service);
-    eprintln!(
-        "🔧 debug_enabled={} dump_enabled={} min_poll_gap_ms={} pull_timeout={} pull_limit={}",
-        debug_enabled(),
-        dump_enabled(),
-        min_poll_gap.as_millis(),
-        pull_timeout,
-        pull_limit
+    info!(
+        service = %onvif_service,
+        debug = debug_enabled(),
+        dump = dump_enabled(),
+        min_poll_gap_ms = min_poll_gap.as_millis(),
+        pull_timeout = %pull_timeout,
+        pull_limit = pull_limit,
+        "ONVIF motion poller starting"
     );
 
     // NOTE:
@@ -429,12 +430,11 @@ pub async fn run_onvif_motion_poller(bus: EventBus) -> Result<()> {
     let (mut sub_addr, mut sub_id) =
         create_subscription(&client, &onvif_service, &user, &pass, &sub_termination).await?;
 
-    println!("✅ PullPoint created");
-    println!("   Subscription Address: {}", sub_addr);
-    if let Some(id) = &sub_id {
-        println!("   SubscriptionId: {}", id);
-    }
-    println!("   Starting to poll for motion events...");
+    info!(
+        address = %sub_addr,
+        subscription_id = ?sub_id,
+        "PullPoint subscription created, starting event polling"
+    );
 
     let mut renew_tick = interval(Duration::from_secs(renew_every_secs));
     let mut consecutive_errors: u32 = 0;
@@ -446,14 +446,13 @@ pub async fn run_onvif_motion_poller(bus: EventBus) -> Result<()> {
         tokio::select! {
             _ = renew_tick.tick() => {
                 if let Err(e) = renew_subscription(&client, &sub_addr, &sub_id, &user, &pass, &sub_termination).await {
-                    eprintln!("⚠ Renew error: {:#}", e);
-                    eprintln!("⚠ Recreating PullPoint subscription...");
+                    warn!(error = %e, "Subscription renewal failed, recreating PullPoint");
                     (sub_addr, sub_id) = create_subscription(&client, &onvif_service, &user, &pass, &sub_termination).await?;
-                    println!("✅ PullPoint re-created");
-                    println!("   Subscription Address: {}", sub_addr);
-                    if let Some(id) = &sub_id {
-                        println!("   SubscriptionId: {}", id);
-                    }
+                    info!(
+                        address = %sub_addr,
+                        subscription_id = ?sub_id,
+                        "PullPoint subscription recreated"
+                    );
                     consecutive_errors = 0;
                     // reset pull pacing
                     last_pull_done = None;
@@ -513,16 +512,21 @@ pub async fn run_onvif_motion_poller(bus: EventBus) -> Result<()> {
                         }
 
                         consecutive_errors += 1;
-                        eprintln!("⚠ PullMessages error (#{}/{}): {:#}", consecutive_errors, resub_after, e);
+                        warn!(
+                            error = %e,
+                            consecutive = consecutive_errors,
+                            threshold = resub_after,
+                            "PullMessages error"
+                        );
 
                         if is_connectish || consecutive_errors >= resub_after {
-                            eprintln!("⚠ Recreating PullPoint subscription (endpoint likely dropped)...");
+                            warn!("Subscription endpoint dropped, recreating PullPoint");
                             (sub_addr, sub_id) = create_subscription(&client, &onvif_service, &user, &pass, &sub_termination).await?;
-                            println!("✅ PullPoint re-created");
-                            println!("   Subscription Address: {}", sub_addr);
-                            if let Some(id) = &sub_id {
-                                println!("   SubscriptionId: {}", id);
-                            }
+                            info!(
+                                address = %sub_addr,
+                                subscription_id = ?sub_id,
+                                "PullPoint subscription recreated"
+                            );
                             consecutive_errors = 0;
                             // slight backoff to avoid immediate hammering after resubscribe
                             sleep(Duration::from_millis(300)).await;

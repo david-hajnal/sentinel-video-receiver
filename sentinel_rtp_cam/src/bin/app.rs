@@ -1,6 +1,7 @@
 use anyhow::Result;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
+use tracing::{info, warn, error};
 
 use sentinel_rtp_cam::clip_recorder::{ClipRecorder, ClipRecorderConfig};
 use sentinel_rtp_cam::event_bus::{Event, EventBus};
@@ -13,9 +14,9 @@ fn spawn_logger(mut rx: mpsc::Receiver<Event>) {
         while let Some(ev) = rx.recv().await {
             let Event::Motion(m) = ev;
             if m.active {
-                println!("🚨 MOTION START rule={} ts={}", m.rule, m.ts);
+                info!(rule = %m.rule, timestamp = %m.ts, "Motion detected");
             } else {
-                println!("✅ MOTION END   rule={} ts={}", m.rule, m.ts);
+                info!(rule = %m.rule, timestamp = %m.ts, "Motion ended");
             }
         }
     });
@@ -27,6 +28,17 @@ fn arg_flag(name: &str) -> bool {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // Initialize tracing subscriber
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"))
+        )
+        .with_target(false)
+        .with_thread_ids(true)
+        .with_line_number(true)
+        .init();
+
     // .env support
     if dotenvy::dotenv().is_err() {
         dotenvy::from_filename("../.env").ok();
@@ -91,7 +103,7 @@ async fn main() -> Result<()> {
         tokio::spawn(async move {
             let rec = ClipRecorder::new(rec_cfg);
             if let Err(e) = rec.run(motion_rx, h264_rx).await {
-                eprintln!("❌ recorder error: {:#}", e);
+                error!(error = %e, "Clip recorder error");
             }
         });
     }
@@ -101,9 +113,9 @@ async fn main() -> Result<()> {
         let bus2 = bus.clone();
         tokio::spawn(async move {
             if let Err(e) = run_onvif_motion_poller(bus2).await {
-                eprintln!("❌ ONVIF poller error: {:#}", e);
+                error!(error = %e, "ONVIF motion poller error");
             }
-            eprintln!("⚠ ONVIF task ended.");
+            warn!("ONVIF task ended");
         });
     }
 
@@ -123,23 +135,22 @@ async fn main() -> Result<()> {
                 }
                 attempt += 1;
 
-                // Helpful: show what we're about to connect to
-                eprintln!(
-                    "🎥 RTSP: starting receiver attempt={} host={} port={} url={}",
-                    attempt,
-                    recv_cfg.host,
-                    recv_cfg.port,
-                    recv_cfg.rtsp_url()
+                // Log connection attempt with context
+                info!(
+                    attempt = attempt,
+                    host = %recv_cfg.host,
+                    port = recv_cfg.port,
+                    url = %recv_cfg.rtsp_url(),
+                    "Starting RTSP receiver"
                 );
 
                 match run_udp_receiver(recv_cfg.clone(), nal_tx2.clone(), recv_cancel.clone()).await {
                     Ok(_) => {
-                        eprintln!("⚠ RTSP receiver ended normally.");
+                        warn!("RTSP receiver ended normally");
                         break;
                     }
                     Err(e) => {
-                        eprintln!("❌ RTSP receiver error: {:#}", e);
-                        eprintln!("⚠ RTSP task ended (will retry in 2s).");
+                        error!(error = %e, "RTSP receiver error, retrying in 2s");
                         tokio::time::sleep(std::time::Duration::from_secs(2)).await;
                         continue;
                     }
@@ -147,13 +158,13 @@ async fn main() -> Result<()> {
             }
         });
     } else {
-        eprintln!("ℹ️ --onvif-only set: RTSP receiver disabled.");
+        info!("RTSP receiver disabled (--onvif-only flag set)");
     }
 
-    // ✅ Keep the process alive until Ctrl-C
+    // Keep the process alive until Ctrl-C
     tokio::select! {
         _ = tokio::signal::ctrl_c() => {
-            println!("🧯 Ctrl-C: shutting down...");
+            info!("Received shutdown signal, gracefully terminating");
             cancel.cancel();
         }
     }

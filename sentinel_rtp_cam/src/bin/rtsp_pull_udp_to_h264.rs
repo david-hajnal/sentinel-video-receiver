@@ -1,5 +1,6 @@
 use anyhow::{bail, Result};
 use tokio::{io::AsyncWriteExt, net::UdpSocket};
+use tracing::{info, debug, warn};
 
 use sentinel_rtp_cam::h264_depacketize::H264Depacketizer;
 use sentinel_rtp_cam::rtp::RtpPacket;
@@ -19,6 +20,14 @@ fn nal_type_from_annexb(nal: &[u8]) -> Option<u8> {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // Initialize tracing
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"))
+        )
+        .init();
+
     // Load environment variables from .env file
     if dotenvy::dotenv().is_err() {
         dotenvy::from_filename("../.env").ok();
@@ -88,7 +97,7 @@ async fn main() -> Result<()> {
     }
 
     let sock = UdpSocket::bind(("0.0.0.0", rtp_port)).await?;
-    println!("UDP mode: receiving RTP on udp://0.0.0.0:{rtp_port}");
+    info!(port = rtp_port, "Receiving RTP on UDP socket");
 
     let output_file = std::env::var("UDP_OUTPUT_FILE").unwrap_or_else(|_| "udp_out.h264".to_string());
     let mut out = tokio::fs::File::create(&output_file).await?;
@@ -111,7 +120,7 @@ async fn main() -> Result<()> {
             Ok(p) => p,
             Err(_) => {
                 // If we can't parse an RTP packet, treat as stream discontinuity.
-                println!("can't parse an RTP packet");
+                warn!("Failed to parse RTP packet, resetting depacketizer");
                 dep.reset();
                 synced = false;
                 expected_seq = None;
@@ -123,7 +132,11 @@ async fn main() -> Result<()> {
         if let Some(exp) = expected_seq {
             if pkt.sequence_number != exp {
                 // Gap/out-of-order: drop this packet and resync at next IDR.
-                println!("Gap/out-of-order: drop this packet and resync at next IDR.");
+                warn!(
+                    expected = exp,
+                    received = pkt.sequence_number,
+                    "RTP sequence discontinuity, resyncing"
+                );
                 dep.reset();
                 synced = false;
                 expected_seq = Some(pkt.sequence_number.wrapping_add(1));
@@ -135,7 +148,7 @@ async fn main() -> Result<()> {
         for nal in dep.push_rtp_payload(pkt.payload)? {
             let Some(nt) = nal_type_from_annexb(&nal) else {
                 // If depacketizer ever outputs something unexpected, resync hard.
-                println!("Resync hard");
+                warn!("Unexpected NAL format, forcing hard resync");
                 dep.reset();
                 synced = false;
                 expected_seq = None;
@@ -145,12 +158,12 @@ async fn main() -> Result<()> {
             // Cache SPS/PPS; don't write them immediately (we'll prepend at IDR).
             match nt {
                 7 => {
-                    println!("Cache SPS");
+                    debug!("Cached SPS parameter set");
                     last_sps = Some(nal);
                     continue;
                 }
                 8 => {
-                    println!("Cache PPS");
+                    debug!("Cached PPS parameter set");
                     last_pps = Some(nal);
                     continue;
                 }
@@ -159,19 +172,20 @@ async fn main() -> Result<()> {
 
             // Not synced yet: drop everything until SPS+PPS and then an IDR.
             if !synced {
-                println!("Not synced yet");
+                debug!("Waiting for sync (need SPS+PPS+IDR)");
                 if nt == 5 && last_sps.is_some() && last_pps.is_some() {
                     out.write_all(last_sps.as_ref().unwrap()).await?;
                     out.write_all(last_pps.as_ref().unwrap()).await?;
                     out.write_all(&nal).await?;
                     synced = true;
+                    info!("Stream synced, writing video data");
                 }
                 continue;
             }
 
             // Synced: prepend SPS/PPS before every IDR for robustness.
             if nt == 5 {
-                println!("Synced: prepend SPS/PPS before every IDR for robustness.");
+                debug!("Writing IDR frame with parameter sets");
                 if let (Some(sps), Some(pps)) = (last_sps.as_ref(), last_pps.as_ref()) {
                     out.write_all(sps).await?;
                     out.write_all(pps).await?;

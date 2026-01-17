@@ -2,6 +2,7 @@ use anyhow::{bail, Result};
 use base64::Engine;
 use tokio::{net::UdpSocket, sync::mpsc};
 use tokio_util::sync::CancellationToken;
+use tracing::{info, debug};
 
 use crate::h264_depacketize::H264Depacketizer;
 use crate::rtp::RtpPacket;
@@ -113,12 +114,12 @@ pub async fn run_udp_receiver(
 ) -> Result<()> {
     let rtsp_url = cfg.rtsp_url();
 
-    eprintln!(
-        "🎥 RTSP(UDP): starting host={} port={} url={} auth={}",
-        cfg.host,
-        cfg.port,
-        rtsp_url,
-        if cfg.has_auth() { "basic" } else { "none" }
+    info!(
+        host = %cfg.host,
+        port = cfg.port,
+        url = %rtsp_url,
+        auth = if cfg.has_auth() { "basic" } else { "none" },
+        "Starting RTSP UDP receiver"
     );
 
     let authz = if cfg.has_auth() {
@@ -128,7 +129,7 @@ pub async fn run_udp_receiver(
     };
 
     // RTSP control connection (TCP)
-    eprintln!("🎥 RTSP TcpStream::connect to {}:{}", cfg.host, cfg.port);
+    debug!(host = %cfg.host, port = cfg.port, "Connecting to RTSP server");
     let mut c = RtspClient::connect(&cfg.host, cfg.port).await?;
 
     // Build common headers for RTSP requests
@@ -141,7 +142,7 @@ pub async fn run_udp_receiver(
     let r = c.request("OPTIONS", &rtsp_url, &common_headers, None).await?;
     if r.status != 200 {
         if let Some(wa) = header_value(&r.headers, "WWW-Authenticate") {
-            eprintln!("RTSP WWW-Authenticate: {wa}");
+            debug!(auth_header = %wa, "RTSP authentication required");
         }
         bail!("OPTIONS failed: {}", r.status);
     }
@@ -152,7 +153,7 @@ pub async fn run_udp_receiver(
     let r = c.request("DESCRIBE", &rtsp_url, &describe_headers, None).await?;
     if r.status != 200 {
         if let Some(wa) = header_value(&r.headers, "WWW-Authenticate") {
-            eprintln!("RTSP WWW-Authenticate: {wa}");
+            debug!(auth_header = %wa, "RTSP authentication required");
         }
         bail!("DESCRIBE failed: {}", r.status);
     }
@@ -180,7 +181,7 @@ pub async fn run_udp_receiver(
     let r = c.request("SETUP", &setup_url, &setup_headers, None).await?;
     if r.status != 200 {
         if let Some(wa) = header_value(&r.headers, "WWW-Authenticate") {
-            eprintln!("RTSP WWW-Authenticate: {wa}");
+            debug!(auth_header = %wa, "RTSP authentication required");
         }
         bail!("SETUP failed: {}", r.status);
     }
@@ -192,14 +193,14 @@ pub async fn run_udp_receiver(
     let r = c.request("PLAY", &rtsp_url, &play_headers, None).await?;
     if r.status != 200 {
         if let Some(wa) = header_value(&r.headers, "WWW-Authenticate") {
-            eprintln!("RTSP WWW-Authenticate: {wa}");
+            debug!(auth_header = %wa, "RTSP authentication required");
         }
         bail!("PLAY failed: {}", r.status);
     }
 
     // Bind UDP socket for RTP
     let sock = UdpSocket::bind(("0.0.0.0", cfg.rtp_port)).await?;
-    println!("🎥 RTP: receiving on udp://0.0.0.0:{}", cfg.rtp_port);
+    info!(port = cfg.rtp_port, "RTP receiving on UDP socket");
 
     let mut dep = H264Depacketizer::new();
     let mut buf = vec![0u8; 8192];

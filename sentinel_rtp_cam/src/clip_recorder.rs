@@ -8,6 +8,7 @@ use tokio::{
     task::JoinHandle,
     time::{sleep, timeout, Instant},
 };
+use tracing::{warn, info, error};
 
 use crate::event_bus::{Event, MotionEvent};
 
@@ -168,7 +169,7 @@ impl ClipRecorder {
                 // Keep feeding NALs
                 if let Err(e) = stdin.write_all(&nal).await {
                     // ffmpeg died or pipe broken: stop and go idle
-                    eprintln!("⚠ recorder: ffmpeg stdin write failed: {e}");
+                    warn!(error = %e, "FFmpeg stdin write failed, stopping recording");
                     self.stop_recording().await?;
                 }
                 Ok(())
@@ -217,27 +218,39 @@ impl ClipRecorder {
             match status_res {
                 Ok(Ok(status)) => {
                     if !status.success() {
-                        eprintln!("⚠ recorder: ffmpeg exited with {status} for {:?}", file_path);
+                        warn!(
+                            status_code = status.code(),
+                            file = ?file_path,
+                            "FFmpeg exited with error"
+                        );
                         if !stderr_txt.trim().is_empty() {
-                            eprintln!("⚠ recorder: ffmpeg stderr (tail):\n{}", stderr_txt);
+                            warn!(stderr = %stderr_txt, "FFmpeg stderr output");
                         }
                     } else {
-                        println!("✅ saved clip {:?}", file_path);
+                        info!(file = ?file_path, "Clip saved successfully");
                     }
                 }
                 Ok(Err(e)) => {
-                    eprintln!("⚠ recorder: ffmpeg wait error for {:?}: {e}", file_path);
+                    error!(
+                        error = %e,
+                        file = ?file_path,
+                        "FFmpeg process wait error"
+                    );
                     if !stderr_txt.trim().is_empty() {
-                        eprintln!("⚠ recorder: ffmpeg stderr (tail):\n{}", stderr_txt);
+                        warn!(stderr = %stderr_txt, "FFmpeg stderr output");
                     }
                 }
                 Err(_) => {
                     // Timeout -> force kill. This WILL often produce a corrupt mp4.
                     // But draining stderr + closing stdin should make this rare.
                     let _ = child.kill().await;
-                    eprintln!("⚠ recorder: ffmpeg kill (hang) for {:?}", file_path);
+                    error!(
+                        file = ?file_path,
+                        timeout_secs = GRACEFUL_WAIT.as_secs(),
+                        "FFmpeg timeout, force killed (may produce corrupt file)"
+                    );
                     if !stderr_txt.trim().is_empty() {
-                        eprintln!("⚠ recorder: ffmpeg stderr (tail):\n{}", stderr_txt);
+                        warn!(stderr = %stderr_txt, "FFmpeg stderr output");
                     }
                 }
             }
@@ -258,7 +271,7 @@ impl ClipRecorder {
         stdin.write_all(pps).await.context("write PPS")?;
         stdin.write_all(idr).await.context("write IDR")?;
 
-        println!("🎥 recording started (rule={})", rule);
+        info!(rule = %rule, "Recording started");
         Ok(())
     }
 
