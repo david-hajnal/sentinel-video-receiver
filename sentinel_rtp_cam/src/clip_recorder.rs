@@ -1,11 +1,12 @@
 use anyhow::{anyhow, Context, Result};
 use chrono::Utc;
-use std::{path::PathBuf, time::Duration};
+use std::{path::PathBuf, process::Stdio, time::Duration};
 use tokio::{
-    io::AsyncWriteExt,
+    io::{AsyncReadExt, AsyncWriteExt},
     process::{Child, ChildStdin, Command},
     sync::mpsc,
-    time::{sleep, Instant},
+    task::JoinHandle,
+    time::{sleep, timeout, Instant},
 };
 
 use crate::event_bus::{Event, MotionEvent};
@@ -30,7 +31,6 @@ impl Default for ClipRecorderConfig {
         }
     }
 }
-
 enum State {
     Idle,
     Armed { rule: String },
@@ -42,6 +42,8 @@ enum State {
         #[allow(dead_code)]
         started_at: Instant,
         file_path: PathBuf,
+        /// Drain ffmpeg stderr to avoid deadlocks when stderr is piped.
+        stderr_task: Option<JoinHandle<String>>,
     },
 }
 
@@ -93,6 +95,9 @@ impl ClipRecorder {
             }
         }
 
+        // Best-effort finalize if still recording.
+        let _ = self.stop_recording().await;
+
         Ok(())
     }
 
@@ -124,8 +129,14 @@ impl ClipRecorder {
 
         // cache SPS/PPS always
         match nt {
-            7 => { self.last_sps = Some(nal); return Ok(()); }
-            8 => { self.last_pps = Some(nal); return Ok(()); }
+            7 => {
+                self.last_sps = Some(nal);
+                return Ok(());
+            }
+            8 => {
+                self.last_pps = Some(nal);
+                return Ok(());
+            }
             _ => {}
         }
 
@@ -136,7 +147,7 @@ impl ClipRecorder {
                 // Start only on IDR and only if SPS/PPS available (for decoders/MP4)
                 if nt == 5 && self.last_sps.is_some() && self.last_pps.is_some() {
                     let rule = rule.clone();
-                    let (child, stdin, file_path) = self.spawn_ffmpeg(&rule).await?;
+                    let (child, stdin, file_path, stderr_task) = self.spawn_ffmpeg(&rule).await?;
                     let mut new_state = State::Recording {
                         rule,
                         child,
@@ -144,6 +155,7 @@ impl ClipRecorder {
                         stop_at: None,
                         started_at: Instant::now(),
                         file_path,
+                        stderr_task: Some(stderr_task),
                     };
                     // Write SPS/PPS + first IDR
                     self.write_param_sets_and_idr(&mut new_state, &nal).await?;
@@ -177,25 +189,56 @@ impl ClipRecorder {
     }
 
     async fn stop_recording(&mut self) -> Result<()> {
-        if let State::Recording { mut child, mut stdin, file_path, .. } =
+        // Give ffmpeg enough time to finalize mp4 (faststart can add work).
+        const GRACEFUL_WAIT: Duration = Duration::from_secs(15);
+
+        if let State::Recording { mut child, mut stdin, file_path, stderr_task, .. } =
             std::mem::replace(&mut self.state, State::Idle)
         {
-            // Close stdin so ffmpeg can finalize MP4 (moov atom)
+            // Close stdin so ffmpeg can see EOF and finalize MP4 (moov atom).
+            // IMPORTANT: drop(stdin) is the reliable "close" for pipes.
             let _ = stdin.shutdown().await;
+            drop(stdin);
 
-            // Wait a bit for ffmpeg to exit cleanly
-            match tokio::time::timeout(Duration::from_secs(5), child.wait()).await {
+            // Wait for ffmpeg to exit cleanly.
+            let status_res = timeout(GRACEFUL_WAIT, child.wait()).await;
+
+            // Collect stderr (drained in background task).
+            let stderr_txt = if let Some(t) = stderr_task {
+                match timeout(Duration::from_secs(1), t).await {
+                    Ok(Ok(s)) => s,
+                    Ok(Err(join_err)) => format!("<<stderr task join error: {join_err}>>"),
+                    Err(_) => "<<stderr task timeout>>".to_string(),
+                }
+            } else {
+                String::new()
+            };
+
+            match status_res {
                 Ok(Ok(status)) => {
                     if !status.success() {
                         eprintln!("⚠ recorder: ffmpeg exited with {status} for {:?}", file_path);
+                        if !stderr_txt.trim().is_empty() {
+                            eprintln!("⚠ recorder: ffmpeg stderr (tail):\n{}", stderr_txt);
+                        }
                     } else {
                         println!("✅ saved clip {:?}", file_path);
                     }
                 }
-                _ => {
-                    // Force kill if it hangs
+                Ok(Err(e)) => {
+                    eprintln!("⚠ recorder: ffmpeg wait error for {:?}: {e}", file_path);
+                    if !stderr_txt.trim().is_empty() {
+                        eprintln!("⚠ recorder: ffmpeg stderr (tail):\n{}", stderr_txt);
+                    }
+                }
+                Err(_) => {
+                    // Timeout -> force kill. This WILL often produce a corrupt mp4.
+                    // But draining stderr + closing stdin should make this rare.
                     let _ = child.kill().await;
                     eprintln!("⚠ recorder: ffmpeg kill (hang) for {:?}", file_path);
+                    if !stderr_txt.trim().is_empty() {
+                        eprintln!("⚠ recorder: ffmpeg stderr (tail):\n{}", stderr_txt);
+                    }
                 }
             }
         }
@@ -219,18 +262,17 @@ impl ClipRecorder {
         Ok(())
     }
 
-    async fn spawn_ffmpeg(&self, rule: &str) -> Result<(Child, ChildStdin, PathBuf)> {
+    async fn spawn_ffmpeg(&self, rule: &str) -> Result<(Child, ChildStdin, PathBuf, JoinHandle<String>)> {
         let ts = Utc::now().format("%Y%m%d_%H%M%S%.3fZ").to_string();
         let safe_rule = rule.replace(['/', '\\', ' '], "_");
         let file_path = self.cfg.output_dir.join(format!("{ts}_{safe_rule}.mp4"));
 
-        // NOTE: raw h264 has no timestamps -> we give ffmpeg an assumed fps to generate PTS.
-        // If your camera is 30fps, set assumed_fps=30.
         let mut cmd = Command::new("ffmpeg");
         cmd.arg("-hide_banner")
             .arg("-loglevel").arg("error")
             .arg("-y")
             // input: raw H.264 Annex-B from stdin
+            .arg("-fflags").arg("+genpts")
             .arg("-r").arg(self.cfg.assumed_fps.to_string())
             .arg("-f").arg("h264")
             .arg("-i").arg("pipe:0");
@@ -239,20 +281,46 @@ impl ClipRecorder {
             cmd.arg("-c:v").arg("copy");
         } else {
             cmd.arg("-c:v").arg("libx264")
-               .arg("-preset").arg("veryfast")
-               .arg("-tune").arg("zerolatency");
+                .arg("-preset").arg("veryfast")
+                .arg("-tune").arg("zerolatency");
         }
 
         cmd.arg("-movflags").arg("+faststart")
-           .arg(file_path.to_string_lossy().to_string())
-           .stdin(std::process::Stdio::piped())
-           .stdout(std::process::Stdio::null())
-           .stderr(std::process::Stdio::piped());
+            .arg(file_path.to_string_lossy().to_string())
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            // IMPORTANT: keep stderr piped but DRAIN it to avoid deadlock.
+            .stderr(Stdio::piped());
 
         let mut child = cmd.spawn().context("spawn ffmpeg")?;
-        let stdin = child.stdin.take().ok_or_else(|| anyhow!("ffmpeg stdin missing"))?;
 
-        Ok((child, stdin, file_path))
+        let stdin = child.stdin.take().ok_or_else(|| anyhow!("ffmpeg stdin missing"))?;
+        let mut stderr = child.stderr.take().ok_or_else(|| anyhow!("ffmpeg stderr missing"))?;
+
+        // Drain stderr in the background and keep only a tail (avoid unbounded memory).
+        let stderr_task: JoinHandle<String> = tokio::spawn(async move {
+            const TAIL_MAX: usize = 64 * 1024;
+            let mut tail: Vec<u8> = Vec::with_capacity(TAIL_MAX.min(8192));
+            let mut buf = [0u8; 4096];
+
+            loop {
+                match stderr.read(&mut buf).await {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        tail.extend_from_slice(&buf[..n]);
+                        if tail.len() > TAIL_MAX {
+                            let drop_n = tail.len() - TAIL_MAX;
+                            tail.drain(0..drop_n);
+                        }
+                    }
+                    Err(_) => break,
+                }
+            }
+
+            String::from_utf8_lossy(&tail).to_string()
+        });
+
+        Ok((child, stdin, file_path, stderr_task))
     }
 }
 
