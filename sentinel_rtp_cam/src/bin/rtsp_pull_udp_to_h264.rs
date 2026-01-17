@@ -1,6 +1,6 @@
 use anyhow::{bail, Result};
 use tokio::{io::AsyncWriteExt, net::UdpSocket};
-use tracing::{info, debug, warn};
+use tracing::{debug, info, warn};
 
 use sentinel_rtp_cam::h264_depacketize::H264Depacketizer;
 use sentinel_rtp_cam::rtp::RtpPacket;
@@ -24,7 +24,7 @@ async fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"))
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
         )
         .init();
 
@@ -50,7 +50,12 @@ async fn main() -> Result<()> {
     }
 
     let r = c
-        .request("DESCRIBE", &rtsp_url, &[("Accept", "application/sdp")], None)
+        .request(
+            "DESCRIBE",
+            &rtsp_url,
+            &[("Accept", "application/sdp")],
+            None,
+        )
         .await?;
     if r.status != 200 {
         bail!("DESCRIBE failed: {}", r.status);
@@ -99,7 +104,8 @@ async fn main() -> Result<()> {
     let sock = UdpSocket::bind(("0.0.0.0", rtp_port)).await?;
     info!(port = rtp_port, "Receiving RTP on UDP socket");
 
-    let output_file = std::env::var("UDP_OUTPUT_FILE").unwrap_or_else(|_| "udp_out.h264".to_string());
+    let output_file =
+        std::env::var("UDP_OUTPUT_FILE").unwrap_or_else(|_| "udp_out.h264".to_string());
     let mut out = tokio::fs::File::create(&output_file).await?;
     let mut dep = H264Depacketizer::new();
 

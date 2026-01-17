@@ -1,7 +1,8 @@
-use tokio::sync::mpsc;
-use tokio::sync::Mutex;
-use std::sync::Arc;
 use chrono::{DateTime, Utc};
+use std::collections::HashMap;
+use std::sync::Arc;
+use tokio::sync::Mutex;
+use tokio::sync::{mpsc, watch};
 
 #[derive(Debug, Clone)]
 pub enum Event {
@@ -23,7 +24,10 @@ pub struct EventBus {
 
 impl EventBus {
     pub fn new(queue: usize) -> Self {
-        Self { inner: Arc::new(Mutex::new(Vec::new())), queue }
+        Self {
+            inner: Arc::new(Mutex::new(Vec::new())),
+            queue,
+        }
     }
 
     pub async fn subscribe(&self) -> mpsc::Receiver<Event> {
@@ -42,5 +46,57 @@ impl EventBus {
             // non-blocking: if subscriber queue is full, we drop the event for that subscriber
             let _ = tx.try_send(ev.clone());
         }
+    }
+}
+
+// ============================================================================
+// Motion State Bus (watch-based state synchronization)
+// ============================================================================
+
+/// Motion state: maps rule names to their current active status
+pub type MotionState = HashMap<String, bool>;
+
+/// MotionStateBus provides a watch channel for motion state.
+/// Unlike EventBus (mpsc-based edge events), this provides current state
+/// that can be observed by multiple subscribers without missing updates.
+#[derive(Clone)]
+pub struct MotionStateBus {
+    tx: Arc<watch::Sender<MotionState>>,
+}
+
+impl MotionStateBus {
+    /// Create a new MotionStateBus and return a receiver for the initial subscriber
+    pub fn new() -> (Self, watch::Receiver<MotionState>) {
+        let (tx, rx) = watch::channel(HashMap::new());
+        (Self { tx: Arc::new(tx) }, rx)
+    }
+
+    /// Subscribe to motion state changes
+    pub fn subscribe(&self) -> watch::Receiver<MotionState> {
+        self.tx.subscribe()
+    }
+
+    /// Update motion state for a specific rule (idempotent)
+    /// Only sends update if the state actually changes
+    pub fn set(&self, rule: String, active: bool) {
+        self.tx.send_if_modified(|state| {
+            let current = state.get(&rule).copied();
+            if current == Some(active) {
+                // No change, don't send update
+                false
+            } else {
+                if active {
+                    state.insert(rule, active);
+                } else {
+                    state.remove(&rule);
+                }
+                true
+            }
+        });
+    }
+
+    /// Get current snapshot of motion state
+    pub fn current(&self) -> MotionState {
+        self.tx.borrow().clone()
     }
 }

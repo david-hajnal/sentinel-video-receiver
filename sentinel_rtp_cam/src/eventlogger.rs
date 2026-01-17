@@ -1,6 +1,6 @@
+use crate::event_bus::Event;
 use tokio::sync::mpsc;
 use tracing::info;
-use crate::event_bus::Event;
 
 pub fn spawn_logger(mut rx: mpsc::Receiver<Event>) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {

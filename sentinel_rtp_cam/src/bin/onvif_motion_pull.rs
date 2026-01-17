@@ -6,7 +6,7 @@ use quick_xml::Reader;
 use rand::{rngs::OsRng, RngCore};
 use reqwest::header::{HeaderMap, HeaderValue, CONTENT_TYPE};
 use std::time::Duration;
-use tokio::time::{sleep, interval};
+use tokio::time::{interval, sleep};
 
 const TOPIC_DIALECT_CONCRETE_SET: &str =
     "http://www.onvif.org/ver10/tev/topicExpression/ConcreteSet";
@@ -20,11 +20,11 @@ const ACTION_RENEW_REQ: &str =
     "http://www.onvif.org/ver10/events/wsdl/PullPointSubscription/RenewRequest";
 
 // Tune these as needed
-const SUB_TERMINATION: &str = "PT10M";            // ask for 10 minutes
-const RENEW_EVERY_SECS: u64 = 300;                // renew every 5 minutes
-const PULL_TIMEOUT: &str = "PT30S";               // long poll 30s
+const SUB_TERMINATION: &str = "PT10M"; // ask for 10 minutes
+const RENEW_EVERY_SECS: u64 = 300; // renew every 5 minutes
+const PULL_TIMEOUT: &str = "PT30S"; // long poll 30s
 const PULL_LIMIT: u32 = 10;
-const RESUBSCRIBE_AFTER_ERRORS: u32 = 3;          // recreate after N consecutive errors
+const RESUBSCRIBE_AFTER_ERRORS: u32 = 3; // recreate after N consecutive errors
 
 fn wsse_password_digest(nonce_raw: &[u8], created: &str, password: &str) -> String {
     use sha1::{Digest, Sha1};
@@ -105,8 +105,7 @@ fn create_pullpoint_body_motion_only() -> String {
   </tev:Filter>
   <tev:InitialTerminationTime>{}</tev:InitialTerminationTime>
 </tev:CreatePullPointSubscription>"#,
-        TOPIC_DIALECT_CONCRETE_SET,
-        SUB_TERMINATION
+        TOPIC_DIALECT_CONCRETE_SET, SUB_TERMINATION
     )
 }
 
@@ -240,9 +239,17 @@ async fn soap_post(client: &reqwest::Client, url: &str, action: &str, xml: &str)
             action
         ))?,
     );
-    headers.insert("SOAPAction", HeaderValue::from_str(&format!(r#""{}""#, action))?);
+    headers.insert(
+        "SOAPAction",
+        HeaderValue::from_str(&format!(r#""{}""#, action))?,
+    );
 
-    let resp = client.post(url).headers(headers).body(xml.to_string()).send().await?;
+    let resp = client
+        .post(url)
+        .headers(headers)
+        .body(xml.to_string())
+        .send()
+        .await?;
     let status = resp.status();
     let text = resp.text().await?;
     if !status.is_success() {
@@ -273,8 +280,9 @@ async fn create_subscription(
     let req_xml = soap_envelope(onvif_service, ACTION_CREATE_PULLPOINT_REQ, &sec, &body, "");
 
     let resp_xml = soap_post(client, onvif_service, ACTION_CREATE_PULLPOINT_REQ, &req_xml).await?;
-    let sub_addr = extract_subscription_address(&resp_xml)
-        .ok_or_else(|| anyhow!("No SubscriptionReference/Address found in CreatePullPointSubscription response"))?;
+    let sub_addr = extract_subscription_address(&resp_xml).ok_or_else(|| {
+        anyhow!("No SubscriptionReference/Address found in CreatePullPointSubscription response")
+    })?;
     let sub_id = extract_subscription_id(&resp_xml);
 
     Ok((sub_addr, sub_id))
@@ -301,7 +309,7 @@ async fn main() -> Result<()> {
     if dotenvy::dotenv().is_err() {
         dotenvy::from_filename("../.env").ok();
     }
-    
+
     // Use env vars so special chars are safe.
     let host = std::env::var("ONVIF_HOST").unwrap_or_else(|_| "192.168.1.187".to_string());
     let port: u16 = std::env::var("ONVIF_PORT")
@@ -322,7 +330,8 @@ async fn main() -> Result<()> {
         .build()?;
 
     // Create initial subscription
-    let (mut sub_addr, mut sub_id) = create_subscription(&client, &onvif_service, &user, &pass).await?;
+    let (mut sub_addr, mut sub_id) =
+        create_subscription(&client, &onvif_service, &user, &pass).await?;
     println!("✅ PullPoint created");
     println!("   Subscription Address: {}", sub_addr);
     if let Some(id) = &sub_id {

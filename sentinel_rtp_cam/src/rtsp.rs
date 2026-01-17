@@ -1,5 +1,8 @@
 use anyhow::{bail, Result};
-use tokio::{io::{AsyncReadExt, AsyncWriteExt}, net::TcpStream};
+use tokio::{
+    io::{AsyncReadExt, AsyncWriteExt},
+    net::TcpStream,
+};
 use tracing::debug;
 
 #[derive(Debug, Clone)]
@@ -9,27 +12,39 @@ pub struct RtspResponse {
     pub body: Vec<u8>,
 }
 
-fn header_get(headers: &[(String,String)], key: &str) -> Option<String> {
-    headers.iter()
-        .find(|(k,_)| k.eq_ignore_ascii_case(key))
-        .map(|(_,v)| v.clone())
+fn header_get(headers: &[(String, String)], key: &str) -> Option<String> {
+    headers
+        .iter()
+        .find(|(k, _)| k.eq_ignore_ascii_case(key))
+        .map(|(_, v)| v.clone())
 }
 
 pub struct RtspClient {
     pub stream: TcpStream,
     pub cseq: u32,
     pub session: Option<String>,
-    pub leftover: Vec<u8>,   // ✅ NEW: bytes we read "too far"
+    pub leftover: Vec<u8>, // ✅ NEW: bytes we read "too far"
 }
 
 impl RtspClient {
-pub async fn connect(host: &str, port: u16) -> Result<Self> {
-    debug!(host = %host, port = port, "Connecting to RTSP server");
-    let stream = TcpStream::connect((host, port)).await?;
-    Ok(Self { stream, cseq: 1, session: None, leftover: Vec::new() })
-}
+    pub async fn connect(host: &str, port: u16) -> Result<Self> {
+        debug!(host = %host, port = port, "Connecting to RTSP server");
+        let stream = TcpStream::connect((host, port)).await?;
+        Ok(Self {
+            stream,
+            cseq: 1,
+            session: None,
+            leftover: Vec::new(),
+        })
+    }
 
-    pub async fn request(&mut self, method: &str, url: &str, extra_headers: &[(&str, &str)], body: Option<&[u8]>) -> Result<RtspResponse> {
+    pub async fn request(
+        &mut self,
+        method: &str,
+        url: &str,
+        extra_headers: &[(&str, &str)],
+        body: Option<&[u8]>,
+    ) -> Result<RtspResponse> {
         let mut req = String::new();
         req.push_str(&format!("{method} {url} RTSP/1.0\r\n"));
         req.push_str(&format!("CSeq: {}\r\n", self.cseq));
@@ -39,7 +54,7 @@ pub async fn connect(host: &str, port: u16) -> Result<Self> {
             req.push_str(&format!("Session: {}\r\n", sess));
         }
 
-        for (k,v) in extra_headers {
+        for (k, v) in extra_headers {
             req.push_str(&format!("{k}: {v}\r\n"));
         }
 
@@ -61,10 +76,16 @@ pub async fn connect(host: &str, port: u16) -> Result<Self> {
 
         loop {
             let n = self.stream.read(&mut buf).await?;
-            if n == 0 { bail!("RTSP connection closed"); }
+            if n == 0 {
+                bail!("RTSP connection closed");
+            }
             head.extend_from_slice(&buf[..n]);
-            if head.windows(4).any(|w| w == b"\r\n\r\n") { break; }
-            if head.len() > 64 * 1024 { bail!("RTSP headers too large"); }
+            if head.windows(4).any(|w| w == b"\r\n\r\n") {
+                break;
+            }
+            if head.len() > 64 * 1024 {
+                bail!("RTSP headers too large");
+            }
         }
 
         let split = head.windows(4).position(|w| w == b"\r\n\r\n").unwrap();
@@ -72,14 +93,16 @@ pub async fn connect(host: &str, port: u16) -> Result<Self> {
 
         let head_str = String::from_utf8_lossy(head_bytes);
         let mut lines = head_str.split("\r\n").filter(|l| !l.is_empty());
-        let status_line = lines.next().ok_or_else(|| anyhow::anyhow!("Missing status line"))?;
+        let status_line = lines
+            .next()
+            .ok_or_else(|| anyhow::anyhow!("Missing status line"))?;
         let mut parts = status_line.split_whitespace();
         let _proto = parts.next().unwrap_or("");
         let status: u16 = parts.next().unwrap_or("0").parse().unwrap_or(0);
 
         let mut headers = Vec::new();
         for line in lines {
-            if let Some((k,v)) = line.split_once(":") {
+            if let Some((k, v)) = line.split_once(":") {
                 headers.push((k.trim().to_string(), v.trim().to_string()));
             }
         }
@@ -93,13 +116,19 @@ pub async fn connect(host: &str, port: u16) -> Result<Self> {
             body.extend_from_slice(rest);
             while body.len() < content_len {
                 let n = self.stream.read(&mut buf).await?;
-                if n == 0 { bail!("RTSP connection closed while reading body"); }
+                if n == 0 {
+                    bail!("RTSP connection closed while reading body");
+                }
                 body.extend_from_slice(&buf[..n]);
             }
             body.truncate(content_len);
         }
 
-        Ok(RtspResponse { status, headers, body })
+        Ok(RtspResponse {
+            status,
+            headers,
+            body,
+        })
     }
     pub async fn read_exact_bytes(&mut self, n: usize) -> Result<Vec<u8>> {
         let mut out = Vec::with_capacity(n);

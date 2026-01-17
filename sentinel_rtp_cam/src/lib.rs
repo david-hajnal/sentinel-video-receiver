@@ -41,10 +41,10 @@
 pub mod error;
 
 // Protocol implementation
+pub mod interleaved;
 pub mod rtp;
 pub mod rtsp;
 pub mod sdp;
-pub mod interleaved;
 
 // Video codec support
 pub mod h264_depacketize;
@@ -67,5 +67,5 @@ pub mod clip_recorder;
 
 // Re-export commonly used types
 pub use error::{Error, Result};
-pub use event_bus::{Event, EventBus, MotionEvent};
+pub use event_bus::{Event, EventBus, MotionEvent, MotionState, MotionStateBus};
 pub use video::VideoNal;

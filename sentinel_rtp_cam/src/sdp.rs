@@ -17,13 +17,17 @@ pub fn parse_sdp_video_track(sdp: &str) -> Result<SdpVideoTrack> {
         if line.starts_with("m=video ") {
             in_video = true;
             let parts: Vec<&str> = line.split_whitespace().collect();
-            if parts.len() < 4 { bail!("Bad m=video line"); }
+            if parts.len() < 4 {
+                bail!("Bad m=video line");
+            }
             pt = Some(parts[3].parse()?);
         } else if line.starts_with("m=") {
             in_video = false;
         }
 
-        if !in_video { continue; }
+        if !in_video {
+            continue;
+        }
 
         if let Some(p) = pt {
             if line.starts_with(&format!("a=rtpmap:{p}")) {

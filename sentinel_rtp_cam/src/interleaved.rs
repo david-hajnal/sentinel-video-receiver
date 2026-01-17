@@ -1,5 +1,5 @@
-use anyhow::{bail, Result};
 use crate::rtsp::RtspClient;
+use anyhow::{bail, Result};
 
 #[derive(Debug)]
 pub enum InterleavedFrame {

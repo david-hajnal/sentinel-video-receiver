@@ -10,7 +10,7 @@ use std::time::{Duration, Instant};
 use tokio::time::{interval, sleep};
 use tracing::{debug, info, warn};
 
-use crate::event_bus::{Event, EventBus, MotionEvent};
+use crate::event_bus::{Event, EventBus, MotionEvent, MotionStateBus};
 
 // --- Dialect / Actions (match camera expectations) ---
 const TOPIC_DIALECT_CONCRETE_SET: &str =
@@ -39,10 +39,16 @@ fn env_bool(key: &str) -> bool {
     )
 }
 fn env_u64(key: &str, default: u64) -> u64 {
-    std::env::var(key).ok().and_then(|v| v.parse().ok()).unwrap_or(default)
+    std::env::var(key)
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(default)
 }
 fn env_u32(key: &str, default: u32) -> u32 {
-    std::env::var(key).ok().and_then(|v| v.parse().ok()).unwrap_or(default)
+    std::env::var(key)
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(default)
 }
 fn env_string(key: &str, default: &str) -> String {
     std::env::var(key).unwrap_or_else(|_| default.to_string())
@@ -120,7 +126,13 @@ fn wsse_header(username: &str, password: &str) -> String {
 }
 
 // ---------- SOAP envelope (SOAP 1.2 + WS-A 2005/08) ----------
-fn soap_envelope(to: &str, action: &str, security: &str, body: &str, extra_headers_xml: &str) -> String {
+fn soap_envelope(
+    to: &str,
+    action: &str,
+    security: &str,
+    body: &str,
+    extra_headers_xml: &str,
+) -> String {
     format!(
         r#"<?xml version="1.0" encoding="UTF-8"?>
 <SOAP-ENV:Envelope
@@ -193,7 +205,13 @@ fn subscription_id_header(sub_id: &Option<String>) -> String {
 }
 
 // ---------- HTTP SOAP POST ----------
-async fn soap_post(client: &reqwest::Client, url: &str, action: &str, xml: &str, dump_tag: &str) -> Result<String> {
+async fn soap_post(
+    client: &reqwest::Client,
+    url: &str,
+    action: &str,
+    xml: &str,
+    dump_tag: &str,
+) -> Result<String> {
     let mut headers = HeaderMap::new();
     headers.insert(
         CONTENT_TYPE,
@@ -202,7 +220,10 @@ async fn soap_post(client: &reqwest::Client, url: &str, action: &str, xml: &str,
             action
         ))?,
     );
-    headers.insert("SOAPAction", HeaderValue::from_str(&format!(r#""{}""#, action))?);
+    headers.insert(
+        "SOAPAction",
+        HeaderValue::from_str(&format!(r#""{}""#, action))?,
+    );
 
     // Many embedded devices behave better with explicit close on these ephemeral ports.
     headers.insert(CONNECTION, HeaderValue::from_static("close"));
@@ -211,14 +232,22 @@ async fn soap_post(client: &reqwest::Client, url: &str, action: &str, xml: &str,
         dump_xml(&format!("{}_req", dump_tag), xml);
     }
 
-    let resp = client.post(url).headers(headers).body(xml.to_string()).send().await;
+    let resp = client
+        .post(url)
+        .headers(headers)
+        .body(xml.to_string())
+        .send()
+        .await;
     let resp = match resp {
         Ok(r) => r,
         Err(e) => return Err(e.into()),
     };
 
     let status = resp.status();
-    let text = resp.text().await.unwrap_or_else(|e| format!("<<failed to read body: {e}>>"));
+    let text = resp
+        .text()
+        .await
+        .unwrap_or_else(|e| format!("<<failed to read body: {e}>>"));
 
     if !status.is_success() {
         if dump_enabled() {
@@ -356,8 +385,9 @@ async fn create_subscription(
     )
     .await?;
 
-    let sub_addr = extract_subscription_address(&resp_xml)
-        .ok_or_else(|| anyhow!("No SubscriptionReference/Address found in CreatePullPointSubscription response"))?;
+    let sub_addr = extract_subscription_address(&resp_xml).ok_or_else(|| {
+        anyhow!("No SubscriptionReference/Address found in CreatePullPointSubscription response")
+    })?;
 
     let sub_id = extract_subscription_id(&resp_xml);
 
@@ -382,7 +412,7 @@ async fn renew_subscription(
 }
 
 // ---------- Public entrypoint used by app.rs ----------
-pub async fn run_onvif_motion_poller(bus: EventBus) -> Result<()> {
+pub async fn run_onvif_motion_poller(bus: EventBus, motion_state: MotionStateBus) -> Result<()> {
     let host = env_string("ONVIF_HOST", "192.168.1.187");
     let port: u16 = std::env::var("ONVIF_PORT")
         .ok()
@@ -396,8 +426,12 @@ pub async fn run_onvif_motion_poller(bus: EventBus) -> Result<()> {
     let renew_every_secs = env_u64("ONVIF_RENEW_EVERY_SECS", DEFAULT_RENEW_EVERY_SECS);
     let pull_timeout = env_string("ONVIF_PULL_TIMEOUT", DEFAULT_PULL_TIMEOUT);
     let pull_limit = env_u32("ONVIF_PULL_LIMIT", DEFAULT_PULL_LIMIT);
-    let resub_after = env_u32("ONVIF_RESUBSCRIBE_AFTER_ERRORS", DEFAULT_RESUBSCRIBE_AFTER_ERRORS);
-    let min_poll_gap = Duration::from_millis(env_u64("ONVIF_MIN_POLL_GAP_MS", DEFAULT_MIN_POLL_GAP_MS));
+    let resub_after = env_u32(
+        "ONVIF_RESUBSCRIBE_AFTER_ERRORS",
+        DEFAULT_RESUBSCRIBE_AFTER_ERRORS,
+    );
+    let min_poll_gap =
+        Duration::from_millis(env_u64("ONVIF_MIN_POLL_GAP_MS", DEFAULT_MIN_POLL_GAP_MS));
 
     let onvif_service = format!("http://{}:{}/onvif/service", host, port);
 
@@ -492,6 +526,10 @@ pub async fn run_onvif_motion_poller(bus: EventBus) -> Result<()> {
                             }
                             state.insert(rule.clone(), is_motion);
 
+                            // Update motion state (for recorder)
+                            motion_state.set(rule.clone(), is_motion);
+
+                            // Publish edge event (for logging)
                             let ev = MotionEvent { rule, active: is_motion, ts: Utc::now() };
                             bus.publish(Event::Motion(ev)).await;
                         }

@@ -1,10 +1,10 @@
 use anyhow::Result;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
-use tracing::{info, warn, error};
+use tracing::{error, info, warn};
 
 use sentinel_rtp_cam::clip_recorder::{ClipRecorder, ClipRecorderConfig};
-use sentinel_rtp_cam::event_bus::{Event, EventBus};
+use sentinel_rtp_cam::event_bus::{Event, EventBus, MotionStateBus};
 use sentinel_rtp_cam::onvif_motion::run_onvif_motion_poller;
 use sentinel_rtp_cam::rtsp_receiver_udp::{run_udp_receiver, UdpReceiverConfig};
 use sentinel_rtp_cam::video::VideoNal;
@@ -32,7 +32,7 @@ async fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"))
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
         )
         .with_target(false)
         .with_thread_ids(true)
@@ -48,8 +48,11 @@ async fn main() -> Result<()> {
 
     let cancel = CancellationToken::new();
 
-    // Event bus for motion events
+    // Event bus for motion events (logging)
     let bus = EventBus::new(128);
+
+    // Motion state bus (recorder control)
+    let (motion_state, _motion_rx) = MotionStateBus::new();
 
     // Logger subscriber
     spawn_logger(bus.subscribe().await);
@@ -68,7 +71,7 @@ async fn main() -> Result<()> {
 
     // Recorder task
     {
-        let motion_rx = bus.subscribe().await;
+        let motion_rx = motion_state.subscribe();
         let rec_cfg = ClipRecorderConfig {
             output_dir: std::env::var("OUTPUT_DIR")
                 .or_else(|_| std::env::var("CLIP_DIR"))
@@ -98,6 +101,21 @@ async fn main() -> Result<()> {
                     }
                 })
                 .unwrap_or(true),
+            max_files: std::env::var("CLIP_MAX_FILES")
+                .ok()
+                .and_then(|v| v.parse().ok()),
+            max_age_secs: std::env::var("CLIP_MAX_AGE_SECS")
+                .ok()
+                .and_then(|v| v.parse().ok()),
+            max_total_bytes: std::env::var("CLIP_MAX_TOTAL_BYTES")
+                .ok()
+                .and_then(|v| v.parse().ok()),
+            max_clip_bytes: std::env::var("CLIP_MAX_BYTES")
+                .ok()
+                .and_then(|v| v.parse().ok()),
+            max_clip_secs: std::env::var("CLIP_MAX_SECS")
+                .ok()
+                .and_then(|v| v.parse().ok()),
         };
 
         tokio::spawn(async move {
@@ -111,8 +129,9 @@ async fn main() -> Result<()> {
     // ONVIF poller task (DO NOT bubble errors to main)
     {
         let bus2 = bus.clone();
+        let motion_state2 = motion_state.clone();
         tokio::spawn(async move {
-            if let Err(e) = run_onvif_motion_poller(bus2).await {
+            if let Err(e) = run_onvif_motion_poller(bus2, motion_state2).await {
                 error!(error = %e, "ONVIF motion poller error");
             }
             warn!("ONVIF task ended");
@@ -144,7 +163,8 @@ async fn main() -> Result<()> {
                     "Starting RTSP receiver"
                 );
 
-                match run_udp_receiver(recv_cfg.clone(), nal_tx2.clone(), recv_cancel.clone()).await {
+                match run_udp_receiver(recv_cfg.clone(), nal_tx2.clone(), recv_cancel.clone()).await
+                {
                     Ok(_) => {
                         warn!("RTSP receiver ended normally");
                         break;

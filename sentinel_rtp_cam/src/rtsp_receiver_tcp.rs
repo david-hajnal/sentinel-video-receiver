@@ -29,7 +29,8 @@ pub struct TcpInterleavedReceiverConfig {
 
 impl TcpInterleavedReceiverConfig {
     pub fn from_env_defaults() -> Result<Self> {
-        let rtsp_url = std::env::var("RTSP_URL").map_err(|_| anyhow!("Missing RTSP_URL env var"))?;
+        let rtsp_url =
+            std::env::var("RTSP_URL").map_err(|_| anyhow!("Missing RTSP_URL env var"))?;
         let host = std::env::var("RTSP_HOST").map_err(|_| anyhow!("Missing RTSP_HOST env var"))?;
         let port: u16 = std::env::var("RTSP_PORT")
             .ok()
@@ -136,7 +137,10 @@ pub async fn run_tcp_interleaved_receiver(
         .request(
             "SETUP",
             &setup_url,
-            &[("Transport", &cfg.interleaved_request), ("Authorization", &authz)],
+            &[
+                ("Transport", &cfg.interleaved_request),
+                ("Authorization", &authz),
+            ],
             None,
         )
         .await?;
@@ -148,9 +152,8 @@ pub async fn run_tcp_interleaved_receiver(
     let transport_resp = header_value(&r.headers, "Transport")
         .ok_or_else(|| anyhow!("SETUP response missing Transport header"))?;
 
-    let (rtp_chan, rtcp_chan) = parse_interleaved_channels(transport_resp).ok_or_else(|| {
-        anyhow!("SETUP Transport missing interleaved=..-..: {transport_resp}")
-    })?;
+    let (rtp_chan, rtcp_chan) = parse_interleaved_channels(transport_resp)
+        .ok_or_else(|| anyhow!("SETUP Transport missing interleaved=..-..: {transport_resp}"))?;
 
     // PLAY
     let r = c
@@ -217,8 +220,12 @@ pub async fn run_tcp_interleaved_receiver(
 
                     // cache SPS/PPS
                     match nt {
-                        7 => { last_sps = Some(nal.clone()); }
-                        8 => { last_pps = Some(nal.clone()); }
+                        7 => {
+                            last_sps = Some(nal.clone());
+                        }
+                        8 => {
+                            last_pps = Some(nal.clone());
+                        }
                         _ => {}
                     }
 

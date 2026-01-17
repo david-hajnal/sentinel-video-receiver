@@ -2,7 +2,7 @@ use anyhow::{bail, Result};
 use base64::Engine;
 use tokio::{net::UdpSocket, sync::mpsc};
 use tokio_util::sync::CancellationToken;
-use tracing::{info, debug};
+use tracing::{debug, info};
 
 use crate::h264_depacketize::H264Depacketizer;
 use crate::rtp::RtpPacket;
@@ -139,7 +139,9 @@ pub async fn run_udp_receiver(
     }
 
     // OPTIONS
-    let r = c.request("OPTIONS", &rtsp_url, &common_headers, None).await?;
+    let r = c
+        .request("OPTIONS", &rtsp_url, &common_headers, None)
+        .await?;
     if r.status != 200 {
         if let Some(wa) = header_value(&r.headers, "WWW-Authenticate") {
             debug!(auth_header = %wa, "RTSP authentication required");
@@ -150,7 +152,9 @@ pub async fn run_udp_receiver(
     // DESCRIBE
     let mut describe_headers = common_headers.clone();
     describe_headers.push(("Accept", "application/sdp"));
-    let r = c.request("DESCRIBE", &rtsp_url, &describe_headers, None).await?;
+    let r = c
+        .request("DESCRIBE", &rtsp_url, &describe_headers, None)
+        .await?;
     if r.status != 200 {
         if let Some(wa) = header_value(&r.headers, "WWW-Authenticate") {
             debug!(auth_header = %wa, "RTSP authentication required");

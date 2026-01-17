@@ -1,6 +1,6 @@
 use anyhow::{anyhow, bail, Result};
 use tokio::io::AsyncWriteExt;
-use tracing::{info, debug, error};
+use tracing::{debug, error, info};
 
 use sentinel_rtp_cam::h264_depacketize::H264Depacketizer;
 use sentinel_rtp_cam::interleaved::{read_interleaved_frame, InterleavedFrame};
@@ -49,7 +49,7 @@ async fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"))
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
         )
         .init();
 
@@ -130,9 +130,8 @@ async fn main() -> Result<()> {
 
     let transport_resp = header_value(&r.headers, "Transport")
         .ok_or_else(|| anyhow!("SETUP response missing Transport header"))?;
-    let (rtp_chan, rtcp_chan) = parse_interleaved_channels(transport_resp).ok_or_else(|| {
-        anyhow!("SETUP Transport missing interleaved=..-..: {transport_resp}")
-    })?;
+    let (rtp_chan, rtcp_chan) = parse_interleaved_channels(transport_resp)
+        .ok_or_else(|| anyhow!("SETUP Transport missing interleaved=..-..: {transport_resp}"))?;
     info!(
         rtp_channel = rtp_chan,
         rtcp_channel = rtcp_chan,
@@ -158,7 +157,8 @@ async fn main() -> Result<()> {
 
     info!("Reading RTP/RTCP from RTSP TCP connection (interleaved mode)");
 
-    let output_file = std::env::var("TCP_OUTPUT_FILE").unwrap_or_else(|_| "tcp_out.h264".to_string());
+    let output_file =
+        std::env::var("TCP_OUTPUT_FILE").unwrap_or_else(|_| "tcp_out.h264".to_string());
     let mut out = tokio::fs::File::create(&output_file).await?;
     let mut dep = H264Depacketizer::new();
 
@@ -200,8 +200,14 @@ async fn main() -> Result<()> {
                     };
 
                     match nt {
-                        7 => { last_sps = Some(nal); continue; }
-                        8 => { last_pps = Some(nal); continue; }
+                        7 => {
+                            last_sps = Some(nal);
+                            continue;
+                        }
+                        8 => {
+                            last_pps = Some(nal);
+                            continue;
+                        }
                         _ => {}
                     }
 

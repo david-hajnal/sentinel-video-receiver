@@ -9,7 +9,9 @@ pub struct H264Depacketizer {
 }
 
 impl H264Depacketizer {
-    pub fn new() -> Self { Self::default() }
+    pub fn new() -> Self {
+        Self::default()
+    }
 
     pub fn reset(&mut self) {
         self.fu_active = false;
@@ -17,7 +19,9 @@ impl H264Depacketizer {
     }
 
     pub fn push_rtp_payload(&mut self, payload: &[u8]) -> Result<Vec<Vec<u8>>> {
-        if payload.is_empty() { return Ok(vec![]); }
+        if payload.is_empty() {
+            return Ok(vec![]);
+        }
         let nal_type = payload[0] & 0x1F;
 
         match nal_type {
@@ -27,7 +31,7 @@ impl H264Depacketizer {
                 out.extend_from_slice(payload);
                 Ok(vec![out])
             }
-            24 => self.handle_stap_a(payload),   // ✅ add this
+            24 => self.handle_stap_a(payload), // ✅ add this
             28 => self.handle_fu_a(payload),
             _ => bail!("Unsupported H.264 RTP NAL type: {}", nal_type),
         }
@@ -71,7 +75,9 @@ impl H264Depacketizer {
     }
 
     fn handle_fu_a(&mut self, payload: &[u8]) -> Result<Vec<Vec<u8>>> {
-        if payload.len() < 2 { bail!("FU-A too short"); }
+        if payload.len() < 2 {
+            bail!("FU-A too short");
+        }
 
         let fu_indicator = payload[0];
         let fu_header = payload[1];

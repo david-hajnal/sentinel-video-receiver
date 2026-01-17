@@ -38,7 +38,11 @@ fn exp_backoff(attempt: usize, base: Duration, max: Duration) -> Duration {
     // attempt is 0-based: 0 => base, 1 => 2x, 2 => 4x ...
     let mul = 2u64.saturating_pow(attempt.min(20) as u32);
     let d = base.saturating_mul(mul.try_into().unwrap());
-    if d > max { max } else { d }
+    if d > max {
+        max
+    } else {
+        d
+    }
 }
 
 /// Retry a request builder factory.
