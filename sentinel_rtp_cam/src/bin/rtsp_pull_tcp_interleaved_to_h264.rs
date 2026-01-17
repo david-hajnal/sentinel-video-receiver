@@ -1,5 +1,6 @@
 use anyhow::{anyhow, bail, Result};
 use tokio::io::AsyncWriteExt;
+use tracing::{info, debug, error};
 
 use sentinel_rtp_cam::h264_depacketize::H264Depacketizer;
 use sentinel_rtp_cam::interleaved::{read_interleaved_frame, InterleavedFrame};
@@ -44,6 +45,14 @@ fn basic_auth_value(user: &str, pass: &str) -> String {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // Initialize tracing
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"))
+        )
+        .init();
+
     // Load .env file if it exists
     dotenvy::dotenv().ok();
 
@@ -67,9 +76,9 @@ async fn main() -> Result<()> {
     let r = c
         .request("OPTIONS", &rtsp_url, &[("Authorization", &authz)], None)
         .await?;
-    println!("OPTIONS status: {}", r.status);
+    debug!(status = r.status, "OPTIONS response");
     if let Some(p) = header_value(&r.headers, "Public") {
-        println!("Public: {p}");
+        debug!(methods = %p, "Supported RTSP methods");
     }
     if r.status != 200 {
         bail!("OPTIONS failed: {}", r.status);
@@ -85,9 +94,9 @@ async fn main() -> Result<()> {
         )
         .await?;
     if r.status != 200 {
-        eprintln!("DESCRIBE failed: {}", r.status);
+        error!(status = r.status, "DESCRIBE failed");
         if let Some(wa) = header_value(&r.headers, "WWW-Authenticate") {
-            eprintln!("WWW-Authenticate: {wa}");
+            debug!(auth_header = %wa, "Authentication challenge");
         }
         bail!("DESCRIBE failed: {}", r.status);
     }
@@ -124,7 +133,11 @@ async fn main() -> Result<()> {
     let (rtp_chan, rtcp_chan) = parse_interleaved_channels(transport_resp).ok_or_else(|| {
         anyhow!("SETUP Transport missing interleaved=..-..: {transport_resp}")
     })?;
-    println!("Negotiated interleaved channels: RTP={rtp_chan}, RTCP={rtcp_chan}");
+    info!(
+        rtp_channel = rtp_chan,
+        rtcp_channel = rtcp_chan,
+        "Negotiated interleaved channels"
+    );
 
     // PLAY
     let r = c
@@ -136,14 +149,14 @@ async fn main() -> Result<()> {
         )
         .await?;
     if r.status != 200 {
-        eprintln!("PLAY failed: {}", r.status);
+        error!(status = r.status, "PLAY failed");
         for (k, v) in &r.headers {
-            eprintln!("  {}: {}", k, v);
+            debug!(header = %k, value = %v, "Response header");
         }
         bail!("PLAY failed: {}", r.status);
     }
 
-    println!("TCP interleaved mode: reading RTP/RTCP from RTSP TCP connection");
+    info!("Reading RTP/RTCP from RTSP TCP connection (interleaved mode)");
 
     let output_file = std::env::var("TCP_OUTPUT_FILE").unwrap_or_else(|_| "tcp_out.h264".to_string());
     let mut out = tokio::fs::File::create(&output_file).await?;

@@ -1,5 +1,6 @@
 use anyhow::{bail, Result};
 use tokio::{io::{AsyncReadExt, AsyncWriteExt}, net::TcpStream};
+use tracing::debug;
 
 #[derive(Debug, Clone)]
 pub struct RtspResponse {
@@ -23,7 +24,7 @@ pub struct RtspClient {
 
 impl RtspClient {
 pub async fn connect(host: &str, port: u16) -> Result<Self> {
-    eprintln!("🎥 RTSP TcpStream::connect to {}:{}", host, port);
+    debug!(host = %host, port = port, "Connecting to RTSP server");
     let stream = TcpStream::connect((host, port)).await?;
     Ok(Self { stream, cseq: 1, session: None, leftover: Vec::new() })
 }

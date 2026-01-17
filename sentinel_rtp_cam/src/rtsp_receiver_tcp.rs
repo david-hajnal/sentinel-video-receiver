@@ -1,5 +1,6 @@
 use anyhow::{anyhow, bail, Result};
 use tokio::sync::mpsc;
+use tracing::debug;
 
 use crate::h264_depacketize::H264Depacketizer;
 use crate::interleaved::{read_interleaved_frame, InterleavedFrame};
@@ -112,7 +113,7 @@ pub async fn run_tcp_interleaved_receiver(
         .await?;
     if r.status != 200 {
         if let Some(wa) = header_value(&r.headers, "WWW-Authenticate") {
-            eprintln!("WWW-Authenticate: {wa}");
+            debug!(auth_header = %wa, "RTSP authentication required");
         }
         bail!("DESCRIBE failed: {}", r.status);
     }
