@@ -13,8 +13,8 @@
 //! ## Example
 //!
 //! ```no_run
-//! use sentinel_rtp_cam::rtsp_receiver_udp::{run_udp_receiver, UdpReceiverConfig};
-//! use sentinel_rtp_cam::event_bus::EventBus;
+//! use sentinel_rtp_cam::rtsp::{run_udp_receiver, UdpReceiverConfig};
+//! use sentinel_rtp_cam::event::EventBus;
 //! use tokio::sync::mpsc;
 //! use tokio_util::sync::CancellationToken;
 //!
@@ -37,35 +37,55 @@
 //! }
 //! ```
 
-// Core error types (using thiserror for type-safe error handling)
-pub mod error;
+// ============================================================================
+// Module Organization
+// ============================================================================
 
-// Protocol implementation
-pub mod interleaved;
-pub mod rtp;
+// Configuration
+pub mod config;
+
+// Core protocol & codec implementation
+pub mod core;
+
+// RTSP streaming
 pub mod rtsp;
-pub mod sdp;
 
-// Video codec support
-pub mod h264_depacketize;
-pub mod video;
-
-// ONVIF integration
-pub mod onvif_motion;
-pub mod retry_helper;
+// ONVIF motion detection
+pub mod onvif;
 
 // Event system
-pub mod event_bus;
-pub mod eventlogger;
+pub mod event;
 
-// High-level receivers
-pub mod rtsp_receiver_tcp;
-pub mod rtsp_receiver_udp;
+// Server integration
+pub mod server;
 
-// Recording
-pub mod clip_recorder;
+// Utilities
+pub mod utils;
 
-// Re-export commonly used types
-pub use error::{Error, Result};
-pub use event_bus::{Event, EventBus, MotionEvent, MotionState, MotionStateBus};
-pub use video::VideoNal;
+// ============================================================================
+// Public API Re-exports
+// ============================================================================
+
+// Configuration
+pub use config::AgentConfig;
+
+// Core types
+pub use core::{ClipMeta, ClipRecorder, ClipRecorderConfig, VideoNal};
+
+// RTSP
+pub use rtsp::{run_udp_receiver, UdpReceiverConfig};
+
+// ONVIF
+pub use onvif::run_onvif_motion_poller;
+
+// Events
+pub use event::{Event, EventBus, MotionEvent, MotionMetadata, MotionState, MotionStateBus};
+
+// Server
+pub use server::{
+    retry_forever, run_clip_meta_poster, run_heartbeat_poster, run_motion_event_poster,
+    run_sse_config_listener,
+};
+
+// Utils
+pub use utils::{run_disk_cleanup, DiskCleanupConfig, Error, Result};

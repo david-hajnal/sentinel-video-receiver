@@ -3,20 +3,33 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 
-use sentinel_rtp_cam::clip_recorder::{ClipRecorder, ClipRecorderConfig};
-use sentinel_rtp_cam::event_bus::{Event, EventBus, MotionStateBus};
-use sentinel_rtp_cam::onvif_motion::run_onvif_motion_poller;
-use sentinel_rtp_cam::rtsp_receiver_udp::{run_udp_receiver, UdpReceiverConfig};
-use sentinel_rtp_cam::video::VideoNal;
+use sentinel_rtp_cam::{
+    run_clip_meta_poster, run_disk_cleanup, run_heartbeat_poster, run_motion_event_poster,
+    run_onvif_motion_poller, run_sse_config_listener, run_udp_receiver, AgentConfig, ClipRecorder,
+    ClipRecorderConfig, DiskCleanupConfig, Event, EventBus, MotionStateBus, UdpReceiverConfig,
+    VideoNal,
+};
 
 fn spawn_logger(mut rx: mpsc::Receiver<Event>) {
     tokio::spawn(async move {
         while let Some(ev) = rx.recv().await {
             let Event::Motion(m) = ev;
             if m.active {
-                info!(rule = %m.rule, timestamp = %m.ts, "Motion detected");
+                info!(
+                    camera_id = %m.camera_id,
+                    event_id = %m.event_id,
+                    rule = %m.rule,
+                    timestamp = %m.ts,
+                    "Motion detected"
+                );
             } else {
-                info!(rule = %m.rule, timestamp = %m.ts, "Motion ended");
+                info!(
+                    camera_id = %m.camera_id,
+                    event_id = %m.event_id,
+                    rule = %m.rule,
+                    timestamp = %m.ts,
+                    "Motion ended"
+                );
             }
         }
     });
@@ -46,6 +59,15 @@ async fn main() -> Result<()> {
 
     let onvif_only = arg_flag("--onvif-only");
 
+    // Load agent configuration
+    let agent_config = AgentConfig::from_env();
+    info!(
+        camera_id = %agent_config.camera_id,
+        motion_enabled = agent_config.motion.enabled,
+        server_enabled = agent_config.server.enabled,
+        "Agent configuration loaded"
+    );
+
     let cancel = CancellationToken::new();
 
     // Event bus for motion events (logging)
@@ -60,6 +82,9 @@ async fn main() -> Result<()> {
     // NAL channel from receiver to recorder
     let (nal_tx, video_nal_rx) = mpsc::channel::<VideoNal>(2048);
     let (h264_tx, h264_rx) = mpsc::channel::<Vec<u8>>(2048);
+
+    // ClipMeta channel from recorder to server
+    let (clip_meta_tx, clip_meta_rx) = mpsc::channel(128);
 
     // Convert VideoNal -> Vec<u8> for recorder
     tokio::spawn(async move {
@@ -83,6 +108,12 @@ async fn main() -> Result<()> {
                     .ok()
                     .and_then(|v| v.parse().ok())
                     .unwrap_or(3),
+            ),
+            min_clip_duration: std::time::Duration::from_secs(
+                std::env::var("CLIP_MIN_DURATION_SECS")
+                    .ok()
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(5),
             ),
             assumed_fps: std::env::var("ASSUMED_FPS")
                 .or_else(|_| std::env::var("CLIP_FPS"))
@@ -119,7 +150,7 @@ async fn main() -> Result<()> {
         };
 
         tokio::spawn(async move {
-            let rec = ClipRecorder::new(rec_cfg);
+            let rec = ClipRecorder::new(rec_cfg).with_clip_meta_tx(clip_meta_tx);
             if let Err(e) = rec.run(motion_rx, h264_rx).await {
                 error!(error = %e, "Clip recorder error");
             }
@@ -137,6 +168,93 @@ async fn main() -> Result<()> {
             warn!("ONVIF task ended");
         });
     }
+
+    // Server integration tasks (optional)
+    if agent_config.server.enabled {
+        info!("Starting server integration tasks");
+        let server_cfg = agent_config.server.clone();
+
+        // SSE config listener
+        let camera_id_clone = agent_config.camera_id.clone();
+        let server_cfg_clone = server_cfg.clone();
+        tokio::spawn(async move {
+            match run_sse_config_listener(server_cfg_clone, camera_id_clone).await {
+                Ok(mut config_rx) => {
+                    info!("SSE config listener started, waiting for updates");
+                    loop {
+                        config_rx.changed().await.ok();
+                        let new_config = config_rx.borrow().clone();
+                        info!(
+                            config = %serde_json::to_string(&new_config).unwrap_or_default(),
+                            "Received config update from server"
+                        );
+                    }
+                }
+                Err(e) => {
+                    error!(error = %e, "Failed to start SSE config listener");
+                }
+            }
+        });
+
+        // Motion event poster
+        let motion_rx = bus.subscribe().await;
+        let server_cfg_clone = server_cfg.clone();
+        tokio::spawn(async move {
+            // Convert Event to MotionEvent
+            let (motion_event_tx, motion_event_rx) = mpsc::channel(128);
+            tokio::spawn(async move {
+                let mut rx = motion_rx;
+                while let Some(ev) = rx.recv().await {
+                    let sentinel_rtp_cam::Event::Motion(m) = ev;
+                    let _ = motion_event_tx.send(m).await;
+                }
+            });
+
+            if let Err(e) = run_motion_event_poster(motion_event_rx, server_cfg_clone).await {
+                error!(error = %e, "Motion event poster error");
+            }
+        });
+
+        // Clip metadata poster
+        let server_cfg_clone = server_cfg.clone();
+        tokio::spawn(async move {
+            if let Err(e) = run_clip_meta_poster(clip_meta_rx, server_cfg_clone).await {
+                error!(error = %e, "Clip metadata poster error");
+            }
+        });
+
+        // Heartbeat poster
+        let camera_id = agent_config.camera_id.clone();
+        let server_cfg_clone = server_cfg.clone();
+        tokio::spawn(async move {
+            if let Err(e) = run_heartbeat_poster(server_cfg_clone, camera_id).await {
+                error!(error = %e, "Heartbeat poster error");
+            }
+        });
+    }
+
+    // Disk cleanup task
+    let cleanup_cfg = &agent_config.cleanup;
+    info!(
+        interval_secs = cleanup_cfg.interval_secs,
+        min_free_mb = cleanup_cfg.min_free_bytes / 1_000_000,
+        "Starting disk cleanup task"
+    );
+
+    let disk_cfg = DiskCleanupConfig {
+        clips_dir: std::env::var("OUTPUT_DIR")
+            .or_else(|_| std::env::var("CLIP_DIR"))
+            .unwrap_or_else(|_| "clips".to_string())
+            .into(),
+        min_free_bytes: cleanup_cfg.min_free_bytes,
+        check_interval: std::time::Duration::from_secs(cleanup_cfg.interval_secs),
+    };
+
+    tokio::spawn(async move {
+        if let Err(e) = run_disk_cleanup(disk_cfg).await {
+            error!(error = %e, "Disk cleanup task error");
+        }
+    });
 
     // RTSP receiver task (optional, and should NOT kill the process)
     if !onvif_only {

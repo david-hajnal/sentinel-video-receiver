@@ -1,0 +1,47 @@
+[Unit]
+Description=Sentinel RTP Camera Agent
+Documentation=https://github.com/yourusername/sentinel-video-receiver
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=sentinel
+Group=sentinel
+WorkingDirectory=/var/lib/sentinel_rtp_cam
+
+# Security hardening
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/sentinel_rtp_cam
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictRealtime=true
+RestrictNamespaces=true
+LockPersonality=true
+
+# Resource limits
+LimitNOFILE=65536
+
+# Environment
+EnvironmentFile=/etc/sentinel_rtp_cam/env
+
+# Execution
+ExecStart=/usr/local/bin/sentinel_rtp_cam
+
+# Restart policy
+Restart=on-failure
+RestartSec=10
+StartLimitInterval=200
+StartLimitBurst=5
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=sentinel_rtp_cam
+
+[Install]
+WantedBy=multi-user.target
