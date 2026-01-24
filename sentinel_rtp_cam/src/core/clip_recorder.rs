@@ -278,15 +278,17 @@ impl ClipRecorder {
                 rule,
                 camera_id,
                 event_id,
-                armed_at: _,
+                armed_at,
             } => {
                 // Start only on IDR and only if SPS/PPS available (for decoders/MP4)
                 if nt == 5 && self.last_sps.is_some() && self.last_pps.is_some() {
+                    let armed_duration = armed_at.elapsed();
                     info!(
                         rule = %rule,
                         camera_id = %camera_id,
                         event_id = %event_id,
-                        "Recording started"
+                        armed_duration_ms = armed_duration.as_millis(),
+                        "IDR frame received while armed, starting recording"
                     );
                     let rule = rule.clone();
                     let camera_id = camera_id.clone();
@@ -299,13 +301,17 @@ impl ClipRecorder {
                         .cfg
                         .max_clip_secs
                         .map(|secs| started_at + Duration::from_secs(secs));
+                    
+                    // Set stop_at to ensure minimum duration recording
+                    let stop_at = Some(started_at + self.cfg.min_clip_duration);
+                    
                     let mut new_state = State::Recording {
                         rule,
                         camera_id,
                         event_id,
                         child,
                         stdin,
-                        stop_at: None,
+                        stop_at,
                         hard_stop_at,
                         started_at,
                         started_at_utc,
@@ -319,6 +325,7 @@ impl ClipRecorder {
                     warn!(
                         has_sps = self.last_sps.is_some(),
                         has_pps = self.last_pps.is_some(),
+                        armed_duration_ms = armed_at.elapsed().as_millis(),
                         "IDR frame received but missing SPS/PPS, waiting for parameter sets"
                     );
                 }
