@@ -94,6 +94,9 @@ download_and_verify() {
     local version="$2"
     local output_path="$3"
     
+    # Strip 'v' prefix if present to normalize version
+    version="${version#v}"
+    
     # Handle "latest" by fetching latest release tag from GitHub
     if [[ "$version" == "latest" ]]; then
         log_info "Fetching latest release version from GitHub API..."
