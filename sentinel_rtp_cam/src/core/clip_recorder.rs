@@ -405,13 +405,19 @@ impl ClipRecorder {
             match status_res {
                 Ok(Ok(status)) => {
                     if !status.success() {
-                        warn!(
+                        error!(
                             status_code = status.code(),
                             part_file = ?file_path.with_extension("mp4.part"),
+                            camera_id = %camera_id,
+                            event_id = %event_id,
+                            rule = %rule,
                             "FFmpeg exited with error, keeping .part file for debugging"
                         );
-                        if !stderr_txt.trim().is_empty() {
-                            warn!(stderr = %stderr_txt, "FFmpeg stderr output");
+                        // Always log stderr on failure, even if empty
+                        if stderr_txt.trim().is_empty() {
+                            error!("FFmpeg stderr was empty - process may have crashed immediately");
+                        } else {
+                            error!(stderr = %stderr_txt, "FFmpeg stderr output");
                         }
                     } else {
                         // Success: rename .part to final .mp4
@@ -467,10 +473,16 @@ impl ClipRecorder {
                     error!(
                         error = %e,
                         file = ?file_path,
+                        camera_id = %camera_id,
+                        event_id = %event_id,
+                        rule = %rule,
                         "FFmpeg process wait error"
                     );
-                    if !stderr_txt.trim().is_empty() {
-                        warn!(stderr = %stderr_txt, "FFmpeg stderr output");
+                    // Always log stderr on error
+                    if stderr_txt.trim().is_empty() {
+                        error!("FFmpeg stderr was empty");
+                    } else {
+                        error!(stderr = %stderr_txt, "FFmpeg stderr output");
                     }
                 }
                 Err(_) => {
