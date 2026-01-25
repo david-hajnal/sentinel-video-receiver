@@ -551,7 +551,7 @@ impl ClipRecorder {
             // input: raw H.264 Annex-B from stdin
             .arg("-fflags")
             .arg("+genpts")
-            .arg("-r")
+            .arg("-framerate")
             .arg(self.cfg.assumed_fps.to_string())
             .arg("-f")
             .arg("h264")
@@ -587,13 +587,17 @@ impl ClipRecorder {
                 .arg("-shortest");
         }
 
-        // Add file size limit if configured
-        if let Some(max_bytes) = self.cfg.max_clip_bytes {
-            cmd.arg("-fs").arg(max_bytes.to_string());
+        // Add time-based limit if configured (safer than byte limit)
+        if let Some(max_secs) = self.cfg.max_clip_secs {
+            cmd.arg("-t").arg(max_secs.to_string());
         }
 
+        // Use fragmented MP4 for crash-tolerance and playability during recording
+        // Add AUD (Access Unit Delimiter) for better player compatibility
         cmd.arg("-movflags")
-            .arg("+faststart")
+            .arg("+frag_keyframe+empty_moov+default_base_moof")
+            .arg("-bsf:v")
+            .arg("h264_metadata=aud=insert")
             // Explicitly specify MP4 format for .part file
             .arg("-f")
             .arg("mp4")
