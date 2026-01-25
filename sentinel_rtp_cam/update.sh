@@ -3,7 +3,12 @@
 # update.sh - Safe, idempotent update script for sentinel_rtp_cam
 #
 # Usage:
-#   sudo ./update.sh [--dry-run]
+#   sudo ./update.sh [version] [--dry-run]
+#
+# Examples:
+#   sudo ./update.sh latest
+#   sudo ./update.sh v0.2.0
+#   sudo ./update.sh --dry-run
 #
 # Environment variables:
 #   SENTINEL_VERSION    - Version to update to (default: "latest")
@@ -258,8 +263,18 @@ main() {
                 log_info "Running in DRY-RUN mode (no changes will be made)"
                 shift
                 ;;
+            -*)
+                die "Unknown option: $1"
+                ;;
             *)
-                die "Unknown argument: $1"
+                # Accept version as positional argument
+                if [[ -z "${SENTINEL_VERSION_SET:-}" ]]; then
+                    SENTINEL_VERSION="$1"
+                    SENTINEL_VERSION_SET=1
+                    shift
+                else
+                    die "Unknown argument: $1"
+                fi
                 ;;
         esac
     done
