@@ -34,6 +34,8 @@ pub struct ClipRecorderConfig {
     pub assumed_fps: u32,
     /// If true: -c:v copy (fast, no re-encode). If false: re-encode with libx264.
     pub stream_copy: bool,
+    /// If true: add silent audio track for browser compatibility (CPU intensive on low-power devices)
+    pub audio_enabled: bool,
     /// Maximum number of .mp4 files to keep (oldest deleted first)
     pub max_files: Option<usize>,
     /// Maximum age of .mp4 files in seconds (older files deleted)
@@ -54,6 +56,7 @@ impl Default for ClipRecorderConfig {
             min_clip_duration: Duration::from_secs(5),
             assumed_fps: 25,
             stream_copy: true,
+            audio_enabled: true,
             max_files: None,
             max_age_secs: None,
             max_total_bytes: None,
@@ -541,12 +544,16 @@ impl ClipRecorder {
             .arg("-f")
             .arg("h264")
             .arg("-i")
-            .arg("pipe:0")
-            // Add silent audio track for browser compatibility (Firefox/Safari requirement)
-            .arg("-f")
-            .arg("lavfi")
-            .arg("-i")
-            .arg("anullsrc=channel_layout=stereo:sample_rate=48000");
+            .arg("pipe:0");
+
+        // Conditionally add silent audio track for browser compatibility
+        // (Firefox/Safari requirement, but CPU-intensive on low-power devices)
+        if self.cfg.audio_enabled {
+            cmd.arg("-f")
+                .arg("lavfi")
+                .arg("-i")
+                .arg("anullsrc=channel_layout=stereo:sample_rate=48000");
+        }
 
         if self.cfg.stream_copy {
             cmd.arg("-c:v").arg("copy");
@@ -559,12 +566,14 @@ impl ClipRecorder {
                 .arg("zerolatency");
         }
         
-        // Encode silent audio as AAC, stop when video ends
-        cmd.arg("-c:a")
-            .arg("aac")
-            .arg("-b:a")
-            .arg("64k")
-            .arg("-shortest");
+        // Encode silent audio as AAC if audio is enabled
+        if self.cfg.audio_enabled {
+            cmd.arg("-c:a")
+                .arg("aac")
+                .arg("-b:a")
+                .arg("64k")
+                .arg("-shortest");
+        }
 
         // Add file size limit if configured
         if let Some(max_bytes) = self.cfg.max_clip_bytes {

@@ -132,6 +132,17 @@ async fn main() -> Result<()> {
                     }
                 })
                 .unwrap_or(true),
+            audio_enabled: std::env::var("CLIP_AUDIO_ENABLED")
+                .ok()
+                .and_then(|v| {
+                    // support 1/0 and true/false
+                    match v.as_str() {
+                        "1" => Some(true),
+                        "0" => Some(false),
+                        _ => v.parse().ok(),
+                    }
+                })
+                .unwrap_or(true),
             max_files: std::env::var("CLIP_MAX_FILES")
                 .ok()
                 .and_then(|v| v.parse().ok()),
