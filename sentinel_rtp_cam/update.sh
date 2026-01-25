@@ -420,11 +420,18 @@ main() {
         die "Binary verification failed"
     fi
     
-    # Try to get version from new binary
+    # Try to get version from new binary (with timeout)
     log_info "Testing new binary..."
     local new_bin_version
-    new_bin_version=$("$new_binary" --version 2>/dev/null | head -n1 || echo "version check failed")
-    log_info "New binary version: $new_bin_version"
+    if new_bin_version=$(timeout 5 "$new_binary" --version 2>&1 | head -n1 || echo "version check failed"); then
+        log_info "New binary version: $new_bin_version"
+    else
+        log_warn "Could not get version from binary (exit code: $?)"
+        log_warn "This may indicate a dynamic linking issue"
+        log_warn "Checking binary type..."
+        file "$new_binary" || true
+        ldd "$new_binary" 2>&1 | head -n 5 || true
+    fi
     
     log_info "✓ New binary downloaded and verified successfully"
     
