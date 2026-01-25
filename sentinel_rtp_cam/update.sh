@@ -77,10 +77,12 @@ detect_arch() {
 get_installed_version() {
     local binary="${INSTALL_DIR}/${BINARY_NAME}"
     if [[ ! -x "$binary" ]]; then
+        log_info "No existing binary found at $binary"
         echo "none"
         return
     fi
     
+    log_info "Checking version of installed binary..."
     # Try to get version from binary (assuming it supports --version)
     local version
     version=$("$binary" --version 2>/dev/null | head -n1 | awk '{print $NF}') || echo "unknown"
@@ -94,14 +96,17 @@ download_and_verify() {
     
     # Handle "latest" by fetching latest release tag from GitHub
     if [[ "$version" == "latest" ]]; then
-        log_info "Fetching latest release version from GitHub..."
+        log_info "Fetching latest release version from GitHub API..."
+        log_info "API endpoint: https://api.github.com/repos/${SENTINEL_REPO}/releases/latest"
         version=$(curl -fsSL --max-time 30 "https://api.github.com/repos/${SENTINEL_REPO}/releases/latest" | grep '"tag_name"' | sed -E 's/.*"v([^"]+)".*/\1/')
         if [[ -z "$version" ]]; then
-            log_error "Failed to fetch latest version from GitHub"
-            log_error "Check: https://github.com/${SENTINEL_REPO}/releases"
+            log_error "Failed to fetch latest version from GitHub API"
+            log_error "Check releases manually: https://github.com/${SENTINEL_REPO}/releases"
             return 1
         fi
-        log_info "Latest version: $version"
+        log_info "✓ Latest version resolved: v$version"
+    else
+        log_info "Using specified version: v$version"
     fi
     
     local tarball_name="${BINARY_NAME}-${version}-${arch}.tar.gz"
@@ -111,51 +116,77 @@ download_and_verify() {
     temp_dir=$(mktemp -d)
     local tarball_path="${temp_dir}/${tarball_name}"
     
-    log_info "Downloading ${tarball_name} from GitHub releases..."
-    log_info "URL: $download_url"
+    log_info "Downloading ${tarball_name}..."
+    log_info "From: $download_url"
+    log_info "To: $tarball_path"
+    log_info "Timeout: 300 seconds"
     
     if ! curl -fL --progress-bar --max-time 300 -o "$tarball_path" "$download_url"; then
-        log_error "Download failed. Check if release exists:"
-        log_error "https://github.com/${SENTINEL_REPO}/releases/tag/v${version}"
+        log_error "Download failed!"
+        log_error "Check if release exists: https://github.com/${SENTINEL_REPO}/releases/tag/v${version}"
+        log_error "Check network connectivity and GitHub status"
         rm -rf "$temp_dir"
         return 1
     fi
     
+    log_info "✓ Download completed: $(du -h "$tarball_path" | cut -f1)"
+    
     # Verify checksum (always available from GitHub releases)
-    log_info "Verifying checksum..."
+    log_info "Verifying SHA256 checksum..."
+    log_info "Checksum URL: $checksum_url"
     local expected_sha
     expected_sha=$(curl -fsSL --max-time 30 "$checksum_url" | awk '{print $1}')
     if [[ -z "$expected_sha" ]]; then
-        log_warn "Could not fetch checksum, skipping verification"
-        log_warn "Checksum URL: $checksum_url"
+        log_warn "Could not fetch checksum file, skipping verification"
+        log_warn "This is not recommended - binary may be corrupted"
     else
+        log_info "Computing SHA256 of downloaded file..."
         local actual_sha
         actual_sha=$(sha256sum "$tarball_path" | awk '{print $1}')
         
+        log_info "Expected: $expected_sha"
+        log_info "Actual:   $actual_sha"
+        
         if [[ "$expected_sha" != "$actual_sha" ]]; then
-            log_error "Checksum verification failed!"
-            log_error "Expected: $expected_sha"
-            log_error "Got: $actual_sha"
+            log_error "✗ Checksum verification FAILED!"
+            log_error "The downloaded file is corrupted or tampered with"
             rm -rf "$temp_dir"
             return 1
         fi
-        log_info "Checksum verified successfully"
+        log_info "✓ Checksum verified successfully"
     fi
     
     # Extract binary
-    log_info "Extracting binary..."
-    tar -xzf "$tarball_path" -C "$temp_dir"
+    log_info "Extracting tarball..."
+    log_info "Archive contents:"
+    tar -tzf "$tarball_path" | head -n 10
     
-    if [[ ! -f "${temp_dir}/${BINARY_NAME}" ]]; then
-        log_error "Binary not found in tarball"
+    if ! tar -xzf "$tarball_path" -C "$temp_dir"; then
+        log_error "Failed to extract tarball"
         rm -rf "$temp_dir"
         return 1
     fi
     
+    log_info "✓ Extraction completed"
+    
+    if [[ ! -f "${temp_dir}/${BINARY_NAME}" ]]; then
+        log_error "Binary '$BINARY_NAME' not found in tarball!"
+        log_error "Contents of extracted archive:"
+        ls -lah "$temp_dir"
+        rm -rf "$temp_dir"
+        return 1
+    fi
+    
+    log_info "Binary found: ${temp_dir}/${BINARY_NAME}"
+    log_info "Binary size: $(du -h "${temp_dir}/${BINARY_NAME}" | cut -f1)"
+    log_info "Binary type: $(file "${temp_dir}/${BINARY_NAME}" 2>/dev/null || echo 'unknown')"
+    
     # Move to output path
+    log_info "Moving binary to: $output_path"
     mv "${temp_dir}/${BINARY_NAME}" "$output_path"
     chmod 755 "$output_path"
     
+    log_info "✓ Binary installed at $output_path"
     rm -rf "$temp_dir"
     return 0
 }
@@ -165,7 +196,7 @@ create_backup() {
     local backup="${INSTALL_DIR}/${BINARY_NAME}.prev"
     
     if [[ ! -f "$current" ]]; then
-        log_warn "No current binary to back up"
+        log_warn "No current binary to back up (fresh install)"
         return
     fi
     
@@ -174,8 +205,16 @@ create_backup() {
         return
     fi
     
-    log_info "Creating backup: $backup"
-    cp -f "$current" "$backup"
+    log_info "Creating backup of current binary..."
+    log_info "Current: $current ($(du -h "$current" | cut -f1))"
+    log_info "Backup:  $backup"
+    
+    if cp -f "$current" "$backup"; then
+        log_info "✓ Backup created successfully"
+    else
+        log_error "Failed to create backup!"
+        return 1
+    fi
 }
 
 install_new_binary() {
@@ -188,8 +227,25 @@ install_new_binary() {
     fi
     
     log_info "Installing new binary..."
-    mv -f "$new_binary" "$target"
+    log_info "Source: $new_binary"
+    log_info "Target: $target"
+    
+    if ! mv -f "$new_binary" "$target"; then
+        log_error "Failed to move binary to install location!"
+        return 1
+    fi
+    
     chmod 755 "$target"
+    
+    log_info "✓ New binary installed"
+    log_info "Verifying installation..."
+    
+    if [[ ! -x "$target" ]]; then
+        log_error "Binary is not executable after installation!"
+        return 1
+    fi
+    
+    log_info "Binary permissions: $(ls -l "$target" | awk '{print $1, $3, $4}')"
 }
 
 restart_service() {
@@ -218,27 +274,45 @@ verify_service() {
         return 0
     fi
     
-    log_info "Verifying service started successfully..."
-    log_info "Waiting for service to stabilize..."
-    sleep 5
+    log_info "Verifying service health..."
+    log_info "Waiting for service to stabilize (5 seconds)..."
+    
+    for i in {5..1}; do
+        echo -n "$i "
+        sleep 1
+    done
+    echo ""
+    
+    log_info "Checking service status..."
     
     if systemctl is-active --quiet "$SERVICE_NAME"; then
-        log_info "Service is running"
+        log_info "✓ Service is active and running"
+        
+        # Get service PID
+        local service_pid
+        service_pid=$(systemctl show -p MainPID --value "$SERVICE_NAME")
+        log_info "Service PID: $service_pid"
         
         # Check recent logs for errors
+        log_info "Scanning recent logs for errors..."
         local error_count
         error_count=$(journalctl -u "$SERVICE_NAME" --since "30 seconds ago" -p err --no-pager | wc -l)
         
         if [[ $error_count -gt 0 ]]; then
-            log_warn "Found $error_count error(s) in recent logs"
-            log_warn "Recent logs:"
-            journalctl -u "$SERVICE_NAME" --since "30 seconds ago" --no-pager | tail -n 10
+            log_warn "⚠ Found $error_count error(s) in recent logs"
+            log_warn "Recent error logs:"
+            journalctl -u "$SERVICE_NAME" --since "30 seconds ago" -p err --no-pager | tail -n 10
+            log_warn "Full logs available: sudo journalctl -u $SERVICE_NAME -f"
             return 1
         fi
         
+        log_info "✓ No errors found in recent logs"
         return 0
     else
-        log_error "Service failed to start"
+        log_error "✗ Service is not active!"
+        log_error "Service status:"
+        systemctl status "$SERVICE_NAME" --no-pager -n 0 || true
+        log_error ""
         log_error "Recent logs:"
         journalctl -u "$SERVICE_NAME" --since "1 minute ago" --no-pager | tail -n 20
         return 1
@@ -333,12 +407,23 @@ main() {
     fi
     
     # Verify new binary is executable
+    log_info "Verifying new binary..."
+    
     if [[ ! -x "$new_binary" ]]; then
+        log_error "Downloaded binary is not executable!"
+        log_error "Binary path: $new_binary"
+        log_error "Permissions: $(ls -l "$new_binary")"
         rm -f "$new_binary"
-        die "Downloaded binary is not executable"
+        die "Binary verification failed"
     fi
     
-    log_info "New binary downloaded successfully"
+    # Try to get version from new binary
+    log_info "Testing new binary..."
+    local new_bin_version
+    new_bin_version=$("$new_binary" --version 2>/dev/null | head -n1 || echo "version check failed")
+    log_info "New binary version: $new_bin_version"
+    
+    log_info "✓ New binary downloaded and verified successfully"
     
     # Create backup
     create_backup
