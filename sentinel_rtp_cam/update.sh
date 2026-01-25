@@ -7,8 +7,8 @@
 #
 # Environment variables:
 #   SENTINEL_VERSION    - Version to update to (default: "latest")
-#   SENTINEL_BASE_URL   - Base URL for artifacts
-#   SENTINEL_SHA256_URL - Optional SHA256 checksum URL
+#   SENTINEL_REPO       - GitHub repo (default: "kaszperek/sentinel-video-receiver")
+#   SENTINEL_BASE_URL   - Base URL for artifacts (default: GitHub releases)
 #
 set -euo pipefail
 
@@ -20,8 +20,8 @@ readonly STATE_DIR="/var/lib/${BINARY_NAME}"
 readonly SERVICE_NAME="${BINARY_NAME}"
 
 SENTINEL_VERSION="${SENTINEL_VERSION:-latest}"
-SENTINEL_BASE_URL="${SENTINEL_BASE_URL:-https://releases.example.com/sentinel_rtp_cam}"
-SENTINEL_SHA256_URL="${SENTINEL_SHA256_URL:-}"
+SENTINEL_REPO="${SENTINEL_REPO:-kaszperek/sentinel-video-receiver}"
+SENTINEL_BASE_URL="${SENTINEL_BASE_URL:-https://github.com/${SENTINEL_REPO}/releases/download}"
 DRY_RUN=0
 
 # --- Colors for output ---
@@ -87,25 +87,38 @@ download_and_verify() {
     local version="$2"
     local output_path="$3"
     
+    # Handle "latest" by fetching latest release tag from GitHub
+    if [[ "$version" == "latest" ]]; then
+        log_info "Fetching latest release version from GitHub..."
+        version=$(curl -fsSL "https://api.github.com/repos/${SENTINEL_REPO}/releases/latest" | grep '"tag_name"' | sed -E 's/.*"v([^"]+)".*/\1/')
+        if [[ -z "$version" ]]; then
+            log_error "Failed to fetch latest version from GitHub"
+            return 1
+        fi
+        log_info "Latest version: $version"
+    fi
+    
     local tarball_name="${BINARY_NAME}-${version}-${arch}.tar.gz"
-    local download_url="${SENTINEL_BASE_URL}/${version}/${tarball_name}"
+    local download_url="${SENTINEL_BASE_URL}/v${version}/${tarball_name}"
+    local checksum_url="${SENTINEL_BASE_URL}/v${version}/${tarball_name}.sha256"
     local temp_dir
     temp_dir=$(mktemp -d)
     local tarball_path="${temp_dir}/${tarball_name}"
     
-    log_info "Downloading ${tarball_name}..."
+    log_info "Downloading ${tarball_name} from GitHub releases..."
     
     if ! curl -fsSL -o "$tarball_path" "$download_url"; then
         rm -rf "$temp_dir"
         return 1
     fi
     
-    # Verify checksum if provided
-    if [[ -n "$SENTINEL_SHA256_URL" ]]; then
-        log_info "Verifying checksum..."
-        local checksum_url="${SENTINEL_SHA256_URL}/${version}/${tarball_name}.sha256"
-        local expected_sha
-        expected_sha=$(curl -fsSL "$checksum_url" | awk '{print $1}')
+    # Verify checksum (always available from GitHub releases)
+    log_info "Verifying checksum..."
+    local expected_sha
+    expected_sha=$(curl -fsSL "$checksum_url" | awk '{print $1}')
+    if [[ -z "$expected_sha" ]]; then
+        log_warn "Could not fetch checksum, skipping verification"
+    else
         local actual_sha
         actual_sha=$(sha256sum "$tarball_path" | awk '{print $1}')
         
