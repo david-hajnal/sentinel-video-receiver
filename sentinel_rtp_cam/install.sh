@@ -362,9 +362,22 @@ main() {
     else
         if ! download_binary "$arch" "$SENTINEL_VERSION"; then
             log_warn "Failed to download prebuilt binary"
-            log_warn "Falling back to building from source..."
-            BUILD_FROM_SOURCE=1
-            build_from_source
+            
+            # Ask user if they want to build from source
+            if [[ -t 0 ]]; then
+                log_info "Would you like to build from source instead? (y/n)"
+                read -r response
+                if [[ "$response" =~ ^[Yy]$ ]]; then
+                    BUILD_FROM_SOURCE=1
+                    build_from_source
+                else
+                    die "Installation aborted. You can retry with: sudo BUILD_FROM_SOURCE=1 ./install.sh"
+                fi
+            else
+                # Non-interactive mode - fail instead of auto-building
+                log_error "Non-interactive mode: cannot prompt for source build"
+                die "Installation failed. Retry with: sudo BUILD_FROM_SOURCE=1 ./install.sh"
+            fi
         fi
     fi
     
