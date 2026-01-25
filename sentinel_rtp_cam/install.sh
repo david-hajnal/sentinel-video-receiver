@@ -22,7 +22,7 @@ readonly SERVICE_USER="sentinel"
 readonly SERVICE_FILE="/etc/systemd/system/${BINARY_NAME}.service"
 
 SENTINEL_VERSION="${SENTINEL_VERSION:-latest}"
-SENTINEL_REPO="${SENTINEL_REPO:-kaszperek/sentinel-video-receiver}"
+SENTINEL_REPO="${SENTINEL_REPO:-david-hajnal/sentinel-video-receiver}"
 SENTINEL_BASE_URL="${SENTINEL_BASE_URL:-https://github.com/${SENTINEL_REPO}/releases/download}"
 BUILD_FROM_SOURCE="${BUILD_FROM_SOURCE:-0}"
 
@@ -191,7 +191,10 @@ build_from_source() {
     
     # Check if we're in the project directory
     if [[ ! -f "Cargo.toml" ]]; then
-        die "Not in project root directory (Cargo.toml not found)"
+        log_info "Not in project directory, cloning repository..."
+        local tmp_dir="/tmp/sentinel-video-receiver-$$"
+        git clone "https://github.com/${SENTINEL_REPO}.git" "$tmp_dir"
+        cd "$tmp_dir/sentinel_rtp_cam"
     fi
     
     # Install Rust if needed

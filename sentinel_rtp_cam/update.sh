@@ -20,7 +20,7 @@ readonly STATE_DIR="/var/lib/${BINARY_NAME}"
 readonly SERVICE_NAME="${BINARY_NAME}"
 
 SENTINEL_VERSION="${SENTINEL_VERSION:-latest}"
-SENTINEL_REPO="${SENTINEL_REPO:-kaszperek/sentinel-video-receiver}"
+SENTINEL_REPO="${SENTINEL_REPO:-david-hajnal/sentinel-video-receiver}"
 SENTINEL_BASE_URL="${SENTINEL_BASE_URL:-https://github.com/${SENTINEL_REPO}/releases/download}"
 DRY_RUN=0
 
