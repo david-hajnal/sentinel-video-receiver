@@ -95,9 +95,10 @@ download_and_verify() {
     # Handle "latest" by fetching latest release tag from GitHub
     if [[ "$version" == "latest" ]]; then
         log_info "Fetching latest release version from GitHub..."
-        version=$(curl -fsSL "https://api.github.com/repos/${SENTINEL_REPO}/releases/latest" | grep '"tag_name"' | sed -E 's/.*"v([^"]+)".*/\1/')
+        version=$(curl -fsSL --max-time 30 "https://api.github.com/repos/${SENTINEL_REPO}/releases/latest" | grep '"tag_name"' | sed -E 's/.*"v([^"]+)".*/\1/')
         if [[ -z "$version" ]]; then
             log_error "Failed to fetch latest version from GitHub"
+            log_error "Check: https://github.com/${SENTINEL_REPO}/releases"
             return 1
         fi
         log_info "Latest version: $version"
@@ -111,8 +112,11 @@ download_and_verify() {
     local tarball_path="${temp_dir}/${tarball_name}"
     
     log_info "Downloading ${tarball_name} from GitHub releases..."
+    log_info "URL: $download_url"
     
-    if ! curl -fsSL -o "$tarball_path" "$download_url"; then
+    if ! curl -fL --progress-bar --max-time 300 -o "$tarball_path" "$download_url"; then
+        log_error "Download failed. Check if release exists:"
+        log_error "https://github.com/${SENTINEL_REPO}/releases/tag/v${version}"
         rm -rf "$temp_dir"
         return 1
     fi
@@ -120,9 +124,10 @@ download_and_verify() {
     # Verify checksum (always available from GitHub releases)
     log_info "Verifying checksum..."
     local expected_sha
-    expected_sha=$(curl -fsSL "$checksum_url" | awk '{print $1}')
+    expected_sha=$(curl -fsSL --max-time 30 "$checksum_url" | awk '{print $1}')
     if [[ -z "$expected_sha" ]]; then
         log_warn "Could not fetch checksum, skipping verification"
+        log_warn "Checksum URL: $checksum_url"
     else
         local actual_sha
         actual_sha=$(sha256sum "$tarball_path" | awk '{print $1}')
@@ -193,8 +198,18 @@ restart_service() {
         return
     fi
     
-    log_info "Restarting $SERVICE_NAME service..."
-    systemctl restart "$SERVICE_NAME"
+    log_info "Stopping $SERVICE_NAME service..."
+    systemctl stop "$SERVICE_NAME" || true
+    
+    log_info "Starting $SERVICE_NAME service..."
+    if ! systemctl start "$SERVICE_NAME"; then
+        log_error "Failed to start service"
+        log_error "Checking logs:"
+        journalctl -u "$SERVICE_NAME" -n 20 --no-pager
+        return 1
+    fi
+    
+    log_info "Service restarted successfully"
 }
 
 verify_service() {
@@ -204,7 +219,8 @@ verify_service() {
     fi
     
     log_info "Verifying service started successfully..."
-    sleep 3
+    log_info "Waiting for service to stabilize..."
+    sleep 5
     
     if systemctl is-active --quiet "$SERVICE_NAME"; then
         log_info "Service is running"
