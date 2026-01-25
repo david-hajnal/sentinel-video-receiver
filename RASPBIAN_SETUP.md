@@ -30,8 +30,22 @@ sudo apt install -y \
 
 ## 2. Install Rust
 
-Install Rust using rustup:
+**Check available disk space first:**
 ```bash
+df -h
+# Ensure you have at least 2GB free space
+```
+
+Install Rust using rustup with **minimal profile** (recommended for Raspberry Pi):
+```bash
+# Minimal installation (saves ~600MB by skipping docs)
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- --profile minimal -y
+source $HOME/.cargo/env
+```
+
+**Alternative:** If you have plenty of disk space (32GB+ SD card):
+```bash
+# Standard installation (includes documentation and extra tools)
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 source $HOME/.cargo/env
 ```
@@ -40,6 +54,20 @@ Verify installation:
 ```bash
 rustc --version
 cargo --version
+```
+
+**If installation fails with "No space left on device":**
+```bash
+# Clean up failed installation
+rm -rf ~/.rustup ~/.cargo
+
+# Free up space
+sudo apt clean
+sudo apt autoremove
+
+# Retry with minimal profile
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- --profile minimal -y
+source $HOME/.cargo/env
 ```
 
 ## 3. Clone and Build
@@ -265,7 +293,9 @@ sudo systemctl restart sentinel-agent
 - **Raspberry Pi 5**: Best performance for multiple cameras
 
 ### Storage
-- **Class 10 microSD card** (minimum 32GB)
+- **Class 10 microSD card** (minimum 32GB recommended)
+  - **16GB minimum** if using minimal Rust profile and limiting clip storage
+  - **64GB+** recommended for production with multiple cameras
 - **USB SSD** for better performance and longevity
 
 ### Power Supply
