@@ -187,9 +187,17 @@ pub async fn run_clip_meta_poster(
 
     while let Some(clip) = clip_rx.recv().await {
         let metadata_url = format!("{}/api/clips/metadata", config.base_url);
+        
+        // Extract just the filename (not the full path)
+        let filename = clip.file_path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("unknown.mp4")
+            .to_string();
+        
         let payload = json!({
             "event_id": clip.event_id,
-            "filename": clip.file_path.display().to_string(),
+            "filename": format!("clips/{}", filename),
             "size_bytes": clip.file_size as i64,
         });
 
