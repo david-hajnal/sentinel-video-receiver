@@ -1,7 +1,10 @@
 use anyhow::{Context, Result};
+use serde::de;
+use tracing_subscriber::field::debug;
 use std::path::PathBuf;
 use tokio::fs::File;
 use tokio::io::{AsyncWriteExt, BufWriter};
+use tracing::{debug};
 
 pub struct ClipWriter {
     part_path: PathBuf,
@@ -23,16 +26,19 @@ impl ClipWriter {
     }
 
     pub async fn write_nal(&mut self, nal: &[u8]) -> Result<()> {
+        debug!(nal_size = nal.len(), "writing nal unit");
         self.writer.write_all(nal).await?;
         Ok(())
     }
 
     pub async fn flush(&mut self) -> Result<()> {
+        debug!("flushing clip writer");
         self.writer.flush().await?;
         Ok(())
     }
 
     pub async fn finalize(mut self) -> Result<PathBuf> {
+        debug!("finalizing clip writer");
         self.writer.flush().await?;
         drop(self.writer);
         tokio::fs::rename(&self.part_path, &self.final_path)
