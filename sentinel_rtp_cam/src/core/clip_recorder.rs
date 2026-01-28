@@ -6,7 +6,7 @@ use tokio::{
     sync::mpsc,
     time::{sleep, Instant},
 };
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::core::clip_writer::ClipWriter;
 use crate::core::video::nal_type_from_annexb;
@@ -176,6 +176,11 @@ impl ClipRecorder {
     /// Handle motion state changes (watch-based)
     async fn on_motion_state_change(&mut self, state: &MotionState) -> Result<()> {
         let has_active_motion = !state.is_empty();
+        debug!(
+            active = has_active_motion,
+            active_count = state.len(),
+            "Motion state update"
+        );
 
         match &mut self.state {
             State::Idle => {
@@ -247,6 +252,7 @@ impl ClipRecorder {
                             let deadline = Instant::now() + remaining_min;
                             info!(
                                 min_remaining_secs = remaining_min.as_secs(),
+                                elapsed_secs = elapsed.as_secs(),
                                 "Motion ended, recording minimum duration"
                             );
                             *stop_at = Some(deadline);
@@ -255,10 +261,13 @@ impl ClipRecorder {
                             let deadline = Instant::now() + self.cfg.post_roll;
                             info!(
                                 post_roll_secs = self.cfg.post_roll.as_secs(),
+                                elapsed_secs = elapsed.as_secs(),
                                 "Motion ended, post-roll timer started"
                             );
                             *stop_at = Some(deadline);
                         }
+                    } else {
+                        debug!("Motion ended, stop deadline already set");
                     }
                 }
             }
@@ -315,6 +324,7 @@ impl ClipRecorder {
                     let event_id = event_id.clone();
                     let (writer, file_path) =
                         self.spawn_clip_writer(&rule, &camera_id, &event_id).await?;
+                    info!(file = ?file_path, "Clip writer created");
                     let started_at = Instant::now();
                     let started_at_utc = Utc::now();
                     let hard_stop_at = self
@@ -362,20 +372,25 @@ impl ClipRecorder {
     }
 
     async fn maybe_stop_on_deadline(&mut self) -> Result<()> {
-        let should_stop = match &self.state {
+        let (should_stop, stop_reason) = match &self.state {
             State::Recording {
                 stop_at,
                 hard_stop_at,
                 ..
             } => {
                 let now = Instant::now();
-                stop_at.map(|t| now >= t).unwrap_or(false)
-                    || hard_stop_at.map(|t| now >= t).unwrap_or(false)
+                let stop_due = stop_at.map(|t| now >= t).unwrap_or(false);
+                let hard_due = hard_stop_at.map(|t| now >= t).unwrap_or(false);
+                (
+                    stop_due || hard_due,
+                    if hard_due { "hard_stop" } else if stop_due { "stop_at" } else { "none" },
+                )
             }
-            _ => false,
+            _ => (false, "none"),
         };
 
         if should_stop {
+            info!(reason = stop_reason, "Stop deadline reached, finalizing clip");
             self.stop_recording().await?;
         }
         Ok(())
@@ -392,6 +407,7 @@ impl ClipRecorder {
             ..
         } = std::mem::replace(&mut self.state, State::Idle)
         {
+            info!(file = ?file_path, "Stopping recording");
             if let Err(e) = writer.flush().await {
                 warn!(error = %e, "Clip flush failed");
             }
@@ -409,6 +425,7 @@ impl ClipRecorder {
                     return Ok(());
                 }
             };
+            info!(part_file = ?part_path, final_file = ?final_path, "Clip finalized");
 
             let file_size = tokio::fs::metadata(&final_path)
                 .await
@@ -452,7 +469,9 @@ impl ClipRecorder {
 
     async fn flush_recording(&mut self) -> Result<()> {
         if let State::Recording { writer, .. } = &mut self.state {
-            let _ = writer.flush().await;
+            if let Err(e) = writer.flush().await {
+                debug!(error = %e, "Periodic clip flush failed");
+            }
         }
         Ok(())
     }
@@ -493,6 +512,7 @@ impl ClipRecorder {
     async fn cleanup_stale_parts(&self) -> Result<()> {
         use std::time::SystemTime;
         let cutoff = SystemTime::now() - self.cfg.stale_part_max_age;
+        debug!(cutoff_secs = self.cfg.stale_part_max_age.as_secs(), "Scanning for stale .part clips");
 
         let mut read_dir = tokio::fs::read_dir(&self.cfg.output_dir).await?;
         while let Some(entry) = read_dir.next_entry().await? {
