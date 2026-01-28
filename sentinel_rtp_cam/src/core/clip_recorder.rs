@@ -1,15 +1,15 @@
 use anyhow::{anyhow, Context, Result};
 use chrono::{DateTime, Utc};
-use std::{path::PathBuf, process::Stdio, time::Duration};
+use serde::Serialize;
+use std::{path::PathBuf, time::Duration};
 use tokio::{
-    io::{AsyncReadExt, AsyncWriteExt},
-    process::{Child, ChildStdin, Command},
     sync::mpsc,
-    task::JoinHandle,
-    time::{sleep, timeout, Instant},
+    time::{sleep, Instant},
 };
 use tracing::{error, info, warn};
 
+use crate::core::clip_writer::ClipWriter;
+use crate::core::video::nal_type_from_annexb;
 use crate::event::MotionState;
 
 /// Metadata sent when a clip finishes recording successfully
@@ -24,26 +24,34 @@ pub struct ClipMeta {
     pub ended_at: DateTime<Utc>,
 }
 
+#[derive(Serialize)]
+struct ClipSidecar {
+    camera_id: String,
+    event_id: String,
+    rule: String,
+    filename: String,
+    file_size_bytes: u64,
+    started_at: String,
+    ended_at: String,
+    duration_secs: i64,
+}
+
 #[derive(Clone, Debug)]
 pub struct ClipRecorderConfig {
     pub output_dir: PathBuf,
     pub post_roll: Duration,
     /// Minimum clip duration - even if motion ends before IDR or shortly after, record at least this long
     pub min_clip_duration: Duration,
-    /// Used only to help ffmpeg generate timestamps for raw h264 input.
-    pub assumed_fps: u32,
-    /// If true: -c:v copy (fast, no re-encode). If false: re-encode with libx264.
-    pub stream_copy: bool,
-    /// If true: add silent audio track for browser compatibility (CPU intensive on low-power devices)
-    pub audio_enabled: bool,
-    /// Maximum number of .mp4 files to keep (oldest deleted first)
+    /// Flush clip file periodically to reduce data loss on crash
+    pub flush_interval: Duration,
+    /// Delete stale .part files older than this on startup
+    pub stale_part_max_age: Duration,
+    /// Maximum number of .h264 files to keep (oldest deleted first)
     pub max_files: Option<usize>,
-    /// Maximum age of .mp4 files in seconds (older files deleted)
+    /// Maximum age of .h264 files in seconds (older files deleted)
     pub max_age_secs: Option<u64>,
-    /// Maximum total bytes of all .mp4 files (oldest deleted until under limit)
+    /// Maximum total bytes of all .h264 files (oldest deleted until under limit)
     pub max_total_bytes: Option<u64>,
-    /// Maximum size per clip in bytes (passed to ffmpeg -fs)
-    pub max_clip_bytes: Option<u64>,
     /// Maximum duration per clip in seconds (hard stop)
     pub max_clip_secs: Option<u64>,
 }
@@ -54,13 +62,11 @@ impl Default for ClipRecorderConfig {
             output_dir: PathBuf::from("clips"),
             post_roll: Duration::from_secs(3),
             min_clip_duration: Duration::from_secs(5),
-            assumed_fps: 25,
-            stream_copy: true,
-            audio_enabled: true,
+            flush_interval: Duration::from_secs(1),
+            stale_part_max_age: Duration::from_secs(24 * 60 * 60),
             max_files: None,
             max_age_secs: None,
             max_total_bytes: None,
-            max_clip_bytes: None,
             max_clip_secs: None,
         }
     }
@@ -77,16 +83,13 @@ enum State {
         rule: String,
         camera_id: String,
         event_id: String,
-        child: Child,
-        stdin: ChildStdin,
+        writer: ClipWriter,
         stop_at: Option<Instant>,
         hard_stop_at: Option<Instant>,
         #[allow(dead_code)]
         started_at: Instant,
         started_at_utc: DateTime<Utc>,
         file_path: PathBuf,
-        /// Drain ffmpeg stderr to avoid deadlocks when stderr is piped.
-        stderr_task: Option<JoinHandle<String>>,
     },
 }
 
@@ -123,10 +126,14 @@ impl ClipRecorder {
         mut nal_rx: mpsc::Receiver<Vec<u8>>,
     ) -> Result<()> {
         tokio::fs::create_dir_all(&self.cfg.output_dir).await?;
+        let _ = self.cleanup_stale_parts().await;
 
         // Periodic cleanup timer (every 60s)
         let mut cleanup_interval = tokio::time::interval(Duration::from_secs(60));
         cleanup_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+        let mut flush_interval = tokio::time::interval(self.cfg.flush_interval);
+        flush_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
         loop {
             // Periodically check stop deadline
@@ -140,6 +147,10 @@ impl ClipRecorder {
 
                 _ = cleanup_interval.tick() => {
                     let _ = self.cleanup_old_clips().await;
+                }
+
+                _ = flush_interval.tick() => {
+                    let _ = self.flush_recording().await;
                 }
 
                 // Watch for motion state changes
@@ -265,10 +276,16 @@ impl ClipRecorder {
         match nt {
             7 => {
                 self.last_sps = Some(nal);
+                if let State::Recording { writer, .. } = &mut self.state {
+                    let _ = writer.write_nal(self.last_sps.as_ref().unwrap()).await;
+                }
                 return Ok(());
             }
             8 => {
                 self.last_pps = Some(nal);
+                if let State::Recording { writer, .. } = &mut self.state {
+                    let _ = writer.write_nal(self.last_pps.as_ref().unwrap()).await;
+                }
                 return Ok(());
             }
             _ => {}
@@ -296,8 +313,8 @@ impl ClipRecorder {
                     let rule = rule.clone();
                     let camera_id = camera_id.clone();
                     let event_id = event_id.clone();
-                    let (child, stdin, file_path, stderr_task) =
-                        self.spawn_ffmpeg(&rule, &camera_id, &event_id).await?;
+                    let (writer, file_path) =
+                        self.spawn_clip_writer(&rule, &camera_id, &event_id).await?;
                     let started_at = Instant::now();
                     let started_at_utc = Utc::now();
                     let hard_stop_at = self
@@ -312,14 +329,12 @@ impl ClipRecorder {
                         rule,
                         camera_id,
                         event_id,
-                        child,
-                        stdin,
+                        writer,
                         stop_at,
                         hard_stop_at,
                         started_at,
                         started_at_utc,
                         file_path,
-                        stderr_task: Some(stderr_task),
                     };
                     // Write SPS/PPS + first IDR
                     self.write_param_sets_and_idr(&mut new_state, &nal).await?;
@@ -335,11 +350,10 @@ impl ClipRecorder {
                 Ok(())
             }
 
-            State::Recording { stdin, .. } => {
+            State::Recording { writer, .. } => {
                 // Keep feeding NALs
-                if let Err(e) = stdin.write_all(&nal).await {
-                    // ffmpeg died or pipe broken: stop and go idle
-                    warn!(error = %e, "FFmpeg stdin write failed, stopping recording");
+                if let Err(e) = writer.write_nal(&nal).await {
+                    warn!(error = %e, "Clip write failed, stopping recording");
                     self.stop_recording().await?;
                 }
                 Ok(())
@@ -368,144 +382,143 @@ impl ClipRecorder {
     }
 
     async fn stop_recording(&mut self) -> Result<()> {
-        // Give ffmpeg enough time to finalize mp4 (faststart can add work).
-        const GRACEFUL_WAIT: Duration = Duration::from_secs(15);
-
         if let State::Recording {
             rule,
             camera_id,
             event_id,
-            mut child,
-            mut stdin,
             file_path,
             started_at_utc,
-            stderr_task,
+            mut writer,
             ..
         } = std::mem::replace(&mut self.state, State::Idle)
         {
-            // Close stdin so ffmpeg can see EOF and finalize MP4 (moov atom).
-            // IMPORTANT: drop(stdin) is the reliable "close" for pipes.
-            let _ = stdin.shutdown().await;
-            drop(stdin);
+            if let Err(e) = writer.flush().await {
+                warn!(error = %e, "Clip flush failed");
+            }
 
-            // Wait for ffmpeg to exit cleanly.
-            let status_res = timeout(GRACEFUL_WAIT, child.wait()).await;
-
-            // Collect stderr (drained in background task).
-            let stderr_txt = if let Some(t) = stderr_task {
-                match timeout(Duration::from_secs(1), t).await {
-                    Ok(Ok(s)) => s,
-                    Ok(Err(join_err)) => format!("<<stderr task join error: {join_err}>>"),
-                    Err(_) => "<<stderr task timeout>>".to_string(),
-                }
-            } else {
-                String::new()
-            };
-
-            match status_res {
-                Ok(Ok(status)) => {
-                    if !status.success() {
-                        error!(
-                            status_code = status.code(),
-                            part_file = ?file_path.with_extension("mp4.part"),
-                            camera_id = %camera_id,
-                            event_id = %event_id,
-                            rule = %rule,
-                            "FFmpeg exited with error, keeping .part file for debugging"
-                        );
-                        // Always log stderr on failure, even if empty
-                        if stderr_txt.trim().is_empty() {
-                            error!("FFmpeg stderr was empty - process may have crashed immediately");
-                        } else {
-                            error!(stderr = %stderr_txt, "FFmpeg stderr output");
-                        }
-                    } else {
-                        // Success: rename .part to final .mp4
-                        let part_path = file_path.with_extension("mp4.part");
-                        if let Err(e) = tokio::fs::rename(&part_path, &file_path).await {
-                            error!(
-                                error = %e,
-                                part_file = ?part_path,
-                                final_file = ?file_path,
-                                "Failed to rename .part file to final .mp4"
-                            );
-                        } else {
-                            // Get file size
-                            let file_size = tokio::fs::metadata(&file_path)
-                                .await
-                                .map(|m| m.len())
-                                .unwrap_or(0);
-                            
-                            let ended_at = Utc::now();
-                            let duration_secs = (ended_at - started_at_utc).num_seconds();
-                            
-                            info!(
-                                camera_id = %camera_id,
-                                event_id = %event_id,
-                                rule = %rule,
-                                file = ?file_path,
-                                size_mb = file_size / 1_000_000,
-                                duration_secs = duration_secs,
-                                "Clip saved successfully"
-                            );
-
-                            // Send clip metadata if channel is configured
-                            if let Some(tx) = &self.clip_meta_tx {
-                                let meta = ClipMeta {
-                                    camera_id,
-                                    event_id,
-                                    rule,
-                                    file_path: file_path.clone(),
-                                    file_size,
-                                    started_at: started_at_utc,
-                                    ended_at: Utc::now(),
-                                };
-                                // Non-blocking send: if consumer is slow, we don't wait
-                                let _ = tx.try_send(meta);
-                            }
-
-                            // Trigger cleanup after successful save
-                            let _ = self.cleanup_old_clips().await;
-                        }
-                    }
-                }
-                Ok(Err(e)) => {
+            let part_path = writer.part_path().clone();
+            let final_path = match writer.finalize().await {
+                Ok(p) => p,
+                Err(e) => {
                     error!(
                         error = %e,
-                        file = ?file_path,
-                        camera_id = %camera_id,
-                        event_id = %event_id,
-                        rule = %rule,
-                        "FFmpeg process wait error"
+                        part_file = ?part_path,
+                        final_file = ?file_path,
+                        "Failed to finalize clip file, keeping .part"
                     );
-                    // Always log stderr on error
-                    if stderr_txt.trim().is_empty() {
-                        error!("FFmpeg stderr was empty");
-                    } else {
-                        error!(stderr = %stderr_txt, "FFmpeg stderr output");
-                    }
+                    return Ok(());
                 }
-                Err(_) => {
-                    // Timeout -> force kill. This WILL often produce a corrupt mp4.
-                    // But draining stderr + closing stdin should make this rare.
-                    let _ = child.kill().await;
-                    error!(
-                        file = ?file_path,
-                        timeout_secs = GRACEFUL_WAIT.as_secs(),
-                        "FFmpeg timeout, force killed (may produce corrupt file)"
-                    );
-                    if !stderr_txt.trim().is_empty() {
-                        warn!(stderr = %stderr_txt, "FFmpeg stderr output");
-                    }
-                }
+            };
+
+            let file_size = tokio::fs::metadata(&final_path)
+                .await
+                .map(|m| m.len())
+                .unwrap_or(0);
+
+            let ended_at = Utc::now();
+            let duration_secs = (ended_at - started_at_utc).num_seconds();
+
+            info!(
+                camera_id = %camera_id,
+                event_id = %event_id,
+                rule = %rule,
+                file = ?final_path,
+                size_mb = file_size / 1_000_000,
+                duration_secs = duration_secs,
+                "Clip saved successfully"
+            );
+
+            let _ = self
+                .write_sidecar_json(&final_path, &camera_id, &event_id, &rule, file_size, started_at_utc, ended_at)
+                .await;
+
+            if let Some(tx) = &self.clip_meta_tx {
+                let meta = ClipMeta {
+                    camera_id,
+                    event_id,
+                    rule,
+                    file_path: final_path.clone(),
+                    file_size,
+                    started_at: started_at_utc,
+                    ended_at,
+                };
+                let _ = tx.try_send(meta);
             }
+
+            let _ = self.cleanup_old_clips().await;
         }
         Ok(())
     }
 
+    async fn flush_recording(&mut self) -> Result<()> {
+        if let State::Recording { writer, .. } = &mut self.state {
+            let _ = writer.flush().await;
+        }
+        Ok(())
+    }
+
+    async fn write_sidecar_json(
+        &self,
+        file_path: &PathBuf,
+        camera_id: &str,
+        event_id: &str,
+        rule: &str,
+        file_size: u64,
+        started_at: DateTime<Utc>,
+        ended_at: DateTime<Utc>,
+    ) -> Result<()> {
+        let filename = file_path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("unknown.h264")
+            .to_string();
+
+        let sidecar = ClipSidecar {
+            camera_id: camera_id.to_string(),
+            event_id: event_id.to_string(),
+            rule: rule.to_string(),
+            filename,
+            file_size_bytes: file_size,
+            started_at: started_at.to_rfc3339(),
+            ended_at: ended_at.to_rfc3339(),
+            duration_secs: (ended_at - started_at).num_seconds(),
+        };
+
+        let json_path = file_path.with_extension("json");
+        let json = serde_json::to_vec_pretty(&sidecar)?;
+        tokio::fs::write(&json_path, json).await?;
+        Ok(())
+    }
+
+    async fn cleanup_stale_parts(&self) -> Result<()> {
+        use std::time::SystemTime;
+        let cutoff = SystemTime::now() - self.cfg.stale_part_max_age;
+
+        let mut read_dir = tokio::fs::read_dir(&self.cfg.output_dir).await?;
+        while let Some(entry) = read_dir.next_entry().await? {
+            let path = entry.path();
+            let filename = path.file_name().and_then(|s| s.to_str()).unwrap_or("");
+            if !filename.ends_with(".h264.part") {
+                continue;
+            }
+
+            let metadata = match tokio::fs::metadata(&path).await {
+                Ok(m) => m,
+                Err(_) => continue,
+            };
+            let mtime = metadata.modified().unwrap_or(SystemTime::UNIX_EPOCH);
+            if mtime < cutoff {
+                let _ = tokio::fs::remove_file(&path).await;
+                warn!(file = ?path, "Deleted stale .part clip");
+            }
+        }
+
+        Ok(())
+    }
+
     async fn write_param_sets_and_idr(&mut self, st: &mut State, idr: &Vec<u8>) -> Result<()> {
-        let (stdin, rule) = match st {
-            State::Recording { stdin, rule, .. } => (stdin, rule.clone()),
+        let (writer, rule) = match st {
+            State::Recording { writer, rule, .. } => (writer, rule.clone()),
             _ => return Ok(()),
         };
 
@@ -518,143 +531,46 @@ impl ClipRecorder {
             .as_ref()
             .ok_or_else(|| anyhow!("missing PPS"))?;
 
-        stdin.write_all(sps).await.context("write SPS")?;
-        stdin.write_all(pps).await.context("write PPS")?;
-        stdin.write_all(idr).await.context("write IDR")?;
+        writer.write_nal(sps).await.context("write SPS")?;
+        writer.write_nal(pps).await.context("write PPS")?;
+        writer.write_nal(idr).await.context("write IDR")?;
 
         info!(rule = %rule, "Recording started");
         Ok(())
     }
 
-    async fn spawn_ffmpeg(
+    async fn spawn_clip_writer(
         &self,
         rule: &str,
         camera_id: &str,
         event_id: &str,
-    ) -> Result<(Child, ChildStdin, PathBuf, JoinHandle<String>)> {
+    ) -> Result<(ClipWriter, PathBuf)> {
         let ts = Utc::now().format("%Y%m%d_%H%M%S%.3fZ").to_string();
         let safe_rule = rule.replace(['/', '\\', ' '], "_");
         let file_path = self
             .cfg
             .output_dir
-            .join(format!("{ts}_{camera_id}_{event_id}_{safe_rule}.mp4"));
+            .join(format!("{ts}_{camera_id}_{event_id}_{safe_rule}.h264"));
         let part_path = self
             .cfg
             .output_dir
-            .join(format!("{ts}_{camera_id}_{event_id}_{safe_rule}.mp4.part"));
+            .join(format!("{ts}_{camera_id}_{event_id}_{safe_rule}.h264.part"));
 
-        let mut cmd = Command::new("ffmpeg");
-        cmd.arg("-hide_banner")
-            .arg("-loglevel")
-            .arg("error")
-            .arg("-y")
-            // input: raw H.264 Annex-B from stdin
-            .arg("-fflags")
-            .arg("+genpts")
-            .arg("-framerate")
-            .arg(self.cfg.assumed_fps.to_string())
-            .arg("-f")
-            .arg("h264")
-            .arg("-i")
-            .arg("pipe:0");
-
-        // Conditionally add silent audio track for browser compatibility
-        // (Firefox/Safari requirement, but CPU-intensive on low-power devices)
-        if self.cfg.audio_enabled {
-            cmd.arg("-f")
-                .arg("lavfi")
-                .arg("-i")
-                .arg("anullsrc=channel_layout=stereo:sample_rate=48000");
-        }
-
-        if self.cfg.stream_copy {
-            cmd.arg("-c:v").arg("copy");
-        } else {
-            cmd.arg("-c:v")
-                .arg("libx264")
-                .arg("-preset")
-                .arg("veryfast")
-                .arg("-tune")
-                .arg("zerolatency");
-        }
-        
-        // Encode silent audio as AAC if audio is enabled
-        if self.cfg.audio_enabled {
-            cmd.arg("-c:a")
-                .arg("aac")
-                .arg("-b:a")
-                .arg("64k")
-                .arg("-shortest");
-        }
-
-        // Add time-based limit if configured (safer than byte limit)
-        if let Some(max_secs) = self.cfg.max_clip_secs {
-            cmd.arg("-t").arg(max_secs.to_string());
-        }
-
-        // Use fragmented MP4 for crash-tolerance and playability during recording
-        // Add AUD (Access Unit Delimiter) for better player compatibility
-        cmd.arg("-movflags")
-            .arg("+frag_keyframe+empty_moov+default_base_moof")
-            .arg("-bsf:v")
-            .arg("h264_metadata=aud=insert")
-            // Explicitly specify MP4 format for .part file
-            .arg("-f")
-            .arg("mp4")
-            .arg(part_path.to_string_lossy().to_string())
-            .stdin(Stdio::piped())
-            .stdout(Stdio::null())
-            // IMPORTANT: keep stderr piped but DRAIN it to avoid deadlock.
-            .stderr(Stdio::piped());
-
-        let mut child = cmd.spawn().context("spawn ffmpeg")?;
-
-        let stdin = child
-            .stdin
-            .take()
-            .ok_or_else(|| anyhow!("ffmpeg stdin missing"))?;
-        let mut stderr = child
-            .stderr
-            .take()
-            .ok_or_else(|| anyhow!("ffmpeg stderr missing"))?;
-
-        // Drain stderr in the background and keep only a tail (avoid unbounded memory).
-        let stderr_task: JoinHandle<String> = tokio::spawn(async move {
-            const TAIL_MAX: usize = 64 * 1024;
-            let mut tail: Vec<u8> = Vec::with_capacity(TAIL_MAX.min(8192));
-            let mut buf = [0u8; 4096];
-
-            loop {
-                match stderr.read(&mut buf).await {
-                    Ok(0) => break,
-                    Ok(n) => {
-                        tail.extend_from_slice(&buf[..n]);
-                        if tail.len() > TAIL_MAX {
-                            let drop_n = tail.len() - TAIL_MAX;
-                            tail.drain(0..drop_n);
-                        }
-                    }
-                    Err(_) => break,
-                }
-            }
-
-            String::from_utf8_lossy(&tail).to_string()
-        });
-
-        Ok((child, stdin, file_path, stderr_task))
+        let writer = ClipWriter::create(part_path, file_path.clone()).await?;
+        Ok((writer, file_path))
     }
 
     /// Cleanup old clips based on config constraints
     async fn cleanup_old_clips(&self) -> Result<()> {
         use std::time::SystemTime;
 
-        // Only operate on *.mp4 files (not .part)
+        // Only operate on *.h264 files (not .part)
         let mut clips: Vec<(PathBuf, SystemTime, u64)> = Vec::new();
 
         let mut read_dir = tokio::fs::read_dir(&self.cfg.output_dir).await?;
         while let Some(entry) = read_dir.next_entry().await? {
             let path = entry.path();
-            if path.extension().and_then(|s| s.to_str()) != Some("mp4") {
+            if path.extension().and_then(|s| s.to_str()) != Some("h264") {
                 continue;
             }
 
@@ -716,8 +632,9 @@ impl ClipRecorder {
             }
         }
 
-        // Delete marked files
+        // Delete marked files (and sidecar JSON if present)
         for path in to_delete {
+            let sidecar = path.with_extension("json");
             match tokio::fs::remove_file(&path).await {
                 Ok(()) => {
                     info!(file = ?path, "Deleted old clip");
@@ -726,18 +643,9 @@ impl ClipRecorder {
                     warn!(error = %e, file = ?path, "Failed to delete old clip");
                 }
             }
+            let _ = tokio::fs::remove_file(&sidecar).await;
         }
 
         Ok(())
     }
-}
-
-fn nal_type_from_annexb(nal: &[u8]) -> Option<u8> {
-    if nal.len() < 5 {
-        return None;
-    }
-    if &nal[0..4] != [0, 0, 0, 1].as_slice() {
-        return None;
-    }
-    Some(nal[4] & 0x1F)
 }

@@ -3,8 +3,10 @@ use tokio::sync::mpsc;
 use tracing::debug;
 
 use crate::core::h264_depacketize::H264Depacketizer;
+use crate::core::h264_sync::H264SyncGate;
 use crate::core::rtp::RtpPacket;
 use crate::core::sdp::parse_sdp_video_track;
+use crate::core::video::annexb_from_raw_nal;
 use crate::rtsp::interleaved::{read_interleaved_frame, InterleavedFrame};
 use crate::rtsp::rtsp::RtspClient;
 
@@ -71,13 +73,6 @@ fn parse_interleaved_channels(transport: &str) -> Option<(u8, u8)> {
         }
     }
     None
-}
-
-fn nal_type_from_annexb(nal: &[u8]) -> Option<u8> {
-    if nal.len() < 5 || nal[0..4] != [0, 0, 0, 1] {
-        return None;
-    }
-    Some(nal[4] & 0x1F)
 }
 
 fn basic_auth_value(user: &str, pass: &str) -> String {
@@ -170,9 +165,10 @@ pub async fn run_tcp_interleaved_receiver(
 
     // Depacketizer + sync gate
     let mut dep = H264Depacketizer::new();
-    let mut last_sps: Option<Vec<u8>> = None;
-    let mut last_pps: Option<Vec<u8>> = None;
-    let mut synced = !cfg.require_idr_sync;
+    let mut gate = H264SyncGate::new(cfg.require_idr_sync);
+    if let (Some(sps), Some(pps)) = (track.sprop_sps, track.sprop_pps) {
+        gate.set_sprop_param_sets(annexb_from_raw_nal(&sps), annexb_from_raw_nal(&pps));
+    }
 
     let mut expected_seq: Option<u16> = None;
 
@@ -183,7 +179,7 @@ pub async fn run_tcp_interleaved_receiver(
                     Ok(p) => p,
                     Err(_) => {
                         dep.reset();
-                        synced = !cfg.require_idr_sync;
+                        gate.reset();
                         expected_seq = None;
                         continue;
                     }
@@ -193,7 +189,7 @@ pub async fn run_tcp_interleaved_receiver(
                 if let Some(exp) = expected_seq {
                     if pkt.sequence_number != exp {
                         dep.reset();
-                        synced = !cfg.require_idr_sync;
+                        gate.reset();
                         expected_seq = Some(pkt.sequence_number.wrapping_add(1));
                         continue;
                     }
@@ -204,53 +200,16 @@ pub async fn run_tcp_interleaved_receiver(
                     Ok(v) => v,
                     Err(_) => {
                         dep.reset();
-                        synced = !cfg.require_idr_sync;
+                        gate.reset();
                         expected_seq = None;
                         continue;
                     }
                 };
 
                 for nal in nals {
-                    let Some(nt) = nal_type_from_annexb(&nal) else {
-                        dep.reset();
-                        synced = !cfg.require_idr_sync;
-                        expected_seq = None;
-                        continue;
-                    };
-
-                    // cache SPS/PPS
-                    match nt {
-                        7 => {
-                            last_sps = Some(nal.clone());
-                        }
-                        8 => {
-                            last_pps = Some(nal.clone());
-                        }
-                        _ => {}
+                    for out in gate.push_nal(nal) {
+                        let _ = nal_tx.try_send(out);
                     }
-
-                    // If sync is required, wait for SPS+PPS then IDR
-                    if !synced {
-                        if nt == 5 && last_sps.is_some() && last_pps.is_some() {
-                            // Prepend SPS/PPS before first IDR (helps MP4/decoders)
-                            let _ = nal_tx.try_send(last_sps.as_ref().unwrap().clone());
-                            let _ = nal_tx.try_send(last_pps.as_ref().unwrap().clone());
-                            let _ = nal_tx.try_send(nal);
-                            synced = true;
-                        }
-                        continue;
-                    }
-
-                    // Synced: prepend SPS/PPS before each IDR for robustness
-                    if nt == 5 {
-                        if let (Some(sps), Some(pps)) = (last_sps.as_ref(), last_pps.as_ref()) {
-                            let _ = nal_tx.try_send(sps.clone());
-                            let _ = nal_tx.try_send(pps.clone());
-                        }
-                    }
-
-                    // Forward NAL downstream (recorder / pipeline)
-                    let _ = nal_tx.try_send(nal);
                 }
             }
 

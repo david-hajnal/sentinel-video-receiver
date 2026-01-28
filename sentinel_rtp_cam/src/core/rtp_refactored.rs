@@ -6,7 +6,7 @@
 //! ## Example
 //!
 //! ```no_run
-//! use sentinel_rtp_cam::rtp::RtpPacket;
+//! use sentinel_rtp_cam::core::rtp_refactored::RtpPacket;
 //! use bytes::Bytes;
 //!
 //! let data = Bytes::from_static(&[

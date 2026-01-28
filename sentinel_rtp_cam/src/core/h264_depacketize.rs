@@ -113,3 +113,63 @@ impl H264Depacketizer {
         Ok(vec![])
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn single_nal_packet() {
+        let mut dep = H264Depacketizer::new();
+        let payload = vec![0x65, 0xAA, 0xBB]; // NAL type 5 (IDR)
+        let out = dep.push_rtp_payload(&payload).unwrap();
+        assert_eq!(out.len(), 1);
+        assert_eq!(&out[0][0..4], &ANNEXB_START);
+        assert_eq!(out[0][4], 0x65);
+    }
+
+    #[test]
+    fn stap_a_unpacking() {
+        let mut dep = H264Depacketizer::new();
+        let nal1 = vec![0x67, 0x11, 0x22];
+        let nal2 = vec![0x68, 0x33];
+        let mut payload = vec![24u8]; // STAP-A
+        payload.extend_from_slice(&(nal1.len() as u16).to_be_bytes());
+        payload.extend_from_slice(&nal1);
+        payload.extend_from_slice(&(nal2.len() as u16).to_be_bytes());
+        payload.extend_from_slice(&nal2);
+
+        let out = dep.push_rtp_payload(&payload).unwrap();
+        assert_eq!(out.len(), 2);
+        assert_eq!(&out[0][0..4], &ANNEXB_START);
+        assert_eq!(&out[0][4..], &nal1);
+        assert_eq!(&out[1][4..], &nal2);
+    }
+
+    #[test]
+    fn fu_a_reassembly() {
+        let mut dep = H264Depacketizer::new();
+        let fu_indicator = 0x7C; // F=0, NRI=3, Type=28
+        let fu_header_start = 0x85; // S=1, E=0, Type=5
+        let fu_header_end = 0x45; // S=0, E=1, Type=5
+
+        let p1 = vec![fu_indicator, fu_header_start, 0xAA, 0xBB];
+        let p2 = vec![fu_indicator, fu_header_end, 0xCC];
+
+        assert!(dep.push_rtp_payload(&p1).unwrap().is_empty());
+        let out = dep.push_rtp_payload(&p2).unwrap();
+        assert_eq!(out.len(), 1);
+        assert_eq!(&out[0][0..4], &ANNEXB_START);
+        assert_eq!(out[0][4], 0x65); // reconstructed IDR header
+        assert_eq!(&out[0][5..], &[0xAA, 0xBB, 0xCC]);
+    }
+
+    #[test]
+    fn fu_a_continuation_without_start_is_error() {
+        let mut dep = H264Depacketizer::new();
+        let fu_indicator = 0x7C;
+        let fu_header_mid = 0x05; // S=0, E=0, Type=5
+        let p = vec![fu_indicator, fu_header_mid, 0xAA];
+        assert!(dep.push_rtp_payload(&p).is_err());
+    }
+}

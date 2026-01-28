@@ -115,34 +115,18 @@ async fn main() -> Result<()> {
                     .and_then(|v| v.parse().ok())
                     .unwrap_or(5),
             ),
-            assumed_fps: std::env::var("ASSUMED_FPS")
-                .or_else(|_| std::env::var("CLIP_FPS"))
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(25),
-            stream_copy: std::env::var("STREAM_COPY")
-                .or_else(|_| std::env::var("CLIP_STREAM_COPY"))
-                .ok()
-                .and_then(|v| {
-                    // support 1/0 and true/false
-                    match v.as_str() {
-                        "1" => Some(true),
-                        "0" => Some(false),
-                        _ => v.parse().ok(),
-                    }
-                })
-                .unwrap_or(true),
-            audio_enabled: std::env::var("CLIP_AUDIO_ENABLED")
-                .ok()
-                .and_then(|v| {
-                    // support 1/0 and true/false
-                    match v.as_str() {
-                        "1" => Some(true),
-                        "0" => Some(false),
-                        _ => v.parse().ok(),
-                    }
-                })
-                .unwrap_or(true),
+            flush_interval: std::time::Duration::from_secs(
+                std::env::var("CLIP_FLUSH_SECS")
+                    .ok()
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(1),
+            ),
+            stale_part_max_age: std::time::Duration::from_secs(
+                std::env::var("CLIP_STALE_PART_SECS")
+                    .ok()
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(24 * 60 * 60),
+            ),
             max_files: std::env::var("CLIP_MAX_FILES")
                 .ok()
                 .and_then(|v| v.parse().ok()),
@@ -150,9 +134,6 @@ async fn main() -> Result<()> {
                 .ok()
                 .and_then(|v| v.parse().ok()),
             max_total_bytes: std::env::var("CLIP_MAX_TOTAL_BYTES")
-                .ok()
-                .and_then(|v| v.parse().ok()),
-            max_clip_bytes: std::env::var("CLIP_MAX_BYTES")
                 .ok()
                 .and_then(|v| v.parse().ok()),
             max_clip_secs: std::env::var("CLIP_MAX_SECS")
@@ -318,7 +299,6 @@ async fn main() -> Result<()> {
         }
     }
 
-    // Give ffmpeg time to finalize mp4
-    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     Ok(())
 }
