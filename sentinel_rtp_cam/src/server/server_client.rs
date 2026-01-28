@@ -192,7 +192,7 @@ pub async fn run_clip_meta_poster(
         let filename = clip.file_path
             .file_name()
             .and_then(|n| n.to_str())
-            .unwrap_or("unknown.mp4")
+            .unwrap_or("unknown.h264")
             .to_string();
         
         let payload = json!({
@@ -320,7 +320,7 @@ async fn upload_clip_file(
     // Create multipart form
     let part = reqwest::multipart::Part::bytes(buffer)
         .file_name(filename.to_string())
-        .mime_str("video/mp4")?;
+        .mime_str("video/h264")?;
 
     let form = reqwest::multipart::Form::new()
         .part("file", part);

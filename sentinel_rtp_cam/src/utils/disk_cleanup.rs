@@ -60,7 +60,7 @@ pub fn get_available_space(_path: &Path) -> Result<u64> {
     Err(anyhow::anyhow!("statvfs not available on this platform"))
 }
 
-/// Delete oldest .mp4 files until available space is above threshold
+/// Delete oldest .h264 files until available space is above threshold
 async fn cleanup_until_space_available(clips_dir: &Path, min_free_bytes: u64) -> Result<usize> {
     let mut deleted = 0;
 
@@ -70,13 +70,13 @@ async fn cleanup_until_space_available(clips_dir: &Path, min_free_bytes: u64) ->
             break;
         }
 
-        // Find oldest .mp4 file
+        // Find oldest .h264 file
         let mut entries = tokio::fs::read_dir(clips_dir).await?;
         let mut oldest: Option<(std::path::PathBuf, std::time::SystemTime)> = None;
 
         while let Some(entry) = entries.next_entry().await? {
             let path = entry.path();
-            if path.extension().and_then(|s| s.to_str()) != Some("mp4") {
+            if path.extension().and_then(|s| s.to_str()) != Some("h264") {
                 continue;
             }
 
@@ -93,7 +93,7 @@ async fn cleanup_until_space_available(clips_dir: &Path, min_free_bytes: u64) ->
             }
         }
 
-        // Delete the oldest file
+        // Delete the oldest file (and sidecar JSON if present)
         if let Some((oldest_path, _)) = oldest {
             match tokio::fs::remove_file(&oldest_path).await {
                 Ok(_) => {
@@ -114,8 +114,9 @@ async fn cleanup_until_space_available(clips_dir: &Path, min_free_bytes: u64) ->
                     break;
                 }
             }
+            let _ = tokio::fs::remove_file(oldest_path.with_extension("json")).await;
         } else {
-            // No more .mp4 files to delete
+            // No more .h264 files to delete
             warn!(
                 available_mb = available / 1_000_000,
                 threshold_mb = min_free_bytes / 1_000_000,

@@ -3,10 +3,12 @@ use tokio::io::AsyncWriteExt;
 use tracing::{debug, error, info};
 
 use sentinel_rtp_cam::core::h264_depacketize::H264Depacketizer;
+use sentinel_rtp_cam::core::h264_sync::H264SyncGate;
 use sentinel_rtp_cam::rtsp::interleaved::{read_interleaved_frame, InterleavedFrame};
 use sentinel_rtp_cam::core::rtp::RtpPacket;
 use sentinel_rtp_cam::rtsp::rtsp::RtspClient;
 use sentinel_rtp_cam::core::sdp::parse_sdp_video_track;
+use sentinel_rtp_cam::core::video::annexb_from_raw_nal;
 
 use base64::Engine;
 
@@ -28,13 +30,6 @@ fn parse_interleaved_channels(transport: &str) -> Option<(u8, u8)> {
         }
     }
     None
-}
-
-fn nal_type_from_annexb(nal: &[u8]) -> Option<u8> {
-    if nal.len() < 5 || nal[0..4] != [0, 0, 0, 1] {
-        return None;
-    }
-    Some(nal[4] & 0x1F)
 }
 
 fn basic_auth_value(user: &str, pass: &str) -> String {
@@ -161,10 +156,10 @@ async fn main() -> Result<()> {
         std::env::var("TCP_OUTPUT_FILE").unwrap_or_else(|_| "tcp_out.h264".to_string());
     let mut out = tokio::fs::File::create(&output_file).await?;
     let mut dep = H264Depacketizer::new();
-
-    let mut last_sps: Option<Vec<u8>> = None;
-    let mut last_pps: Option<Vec<u8>> = None;
-    let mut synced = false;
+    let mut gate = H264SyncGate::new(true);
+    if let (Some(sps), Some(pps)) = (track.sprop_sps, track.sprop_pps) {
+        gate.set_sprop_param_sets(annexb_from_raw_nal(&sps), annexb_from_raw_nal(&pps));
+    }
 
     let mut expected_seq: Option<u16> = None;
 
@@ -175,7 +170,7 @@ async fn main() -> Result<()> {
                     Ok(p) => p,
                     Err(_) => {
                         dep.reset();
-                        synced = false;
+                        gate.reset();
                         expected_seq = None;
                         continue;
                     }
@@ -184,7 +179,7 @@ async fn main() -> Result<()> {
                 if let Some(exp) = expected_seq {
                     if pkt.sequence_number != exp {
                         dep.reset();
-                        synced = false;
+                        gate.reset();
                         expected_seq = Some(pkt.sequence_number.wrapping_add(1));
                         continue;
                     }
@@ -192,43 +187,9 @@ async fn main() -> Result<()> {
                 expected_seq = Some(pkt.sequence_number.wrapping_add(1));
 
                 for nal in dep.push_rtp_payload(pkt.payload)? {
-                    let Some(nt) = nal_type_from_annexb(&nal) else {
-                        dep.reset();
-                        synced = false;
-                        expected_seq = None;
-                        continue;
-                    };
-
-                    match nt {
-                        7 => {
-                            last_sps = Some(nal);
-                            continue;
-                        }
-                        8 => {
-                            last_pps = Some(nal);
-                            continue;
-                        }
-                        _ => {}
+                    for out_nal in gate.push_nal(nal) {
+                        out.write_all(&out_nal).await?;
                     }
-
-                    if !synced {
-                        if nt == 5 && last_sps.is_some() && last_pps.is_some() {
-                            out.write_all(last_sps.as_ref().unwrap()).await?;
-                            out.write_all(last_pps.as_ref().unwrap()).await?;
-                            out.write_all(&nal).await?;
-                            synced = true;
-                        }
-                        continue;
-                    }
-
-                    if nt == 5 {
-                        if let (Some(sps), Some(pps)) = (last_sps.as_ref(), last_pps.as_ref()) {
-                            out.write_all(sps).await?;
-                            out.write_all(pps).await?;
-                        }
-                    }
-
-                    out.write_all(&nal).await?;
                 }
             }
             InterleavedFrame::Rtcp(_bytes) => {}

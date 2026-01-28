@@ -5,9 +5,10 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, info};
 
 use crate::core::h264_depacketize::H264Depacketizer;
+use crate::core::h264_sync::H264SyncGate;
 use crate::core::rtp::RtpPacket;
 use crate::core::sdp::parse_sdp_video_track;
-use crate::core::video::{nal_type_from_annexb, VideoNal};
+use crate::core::video::{annexb_from_raw_nal, VideoNal};
 use crate::rtsp::rtsp::RtspClient;
 
 #[derive(Clone, Debug)]
@@ -207,6 +208,10 @@ pub async fn run_udp_receiver(
     info!(port = cfg.rtp_port, "RTP receiving on UDP socket");
 
     let mut dep = H264Depacketizer::new();
+    let mut gate = H264SyncGate::new(true);
+    if let (Some(sps), Some(pps)) = (track.sprop_sps, track.sprop_pps) {
+        gate.set_sprop_param_sets(annexb_from_raw_nal(&sps), annexb_from_raw_nal(&pps));
+    }
     let mut buf = vec![0u8; 8192];
 
     // continuity
@@ -225,6 +230,7 @@ pub async fn run_udp_receiver(
                     Ok(p) => p,
                     Err(_) => {
                         dep.reset();
+                        gate.reset();
                         expected_seq = None;
                         continue;
                     }
@@ -234,6 +240,7 @@ pub async fn run_udp_receiver(
                 if let Some(exp) = expected_seq {
                     if pkt.sequence_number != exp {
                         dep.reset();
+                        gate.reset();
                         expected_seq = Some(pkt.sequence_number.wrapping_add(1));
                         continue;
                     }
@@ -245,16 +252,18 @@ pub async fn run_udp_receiver(
 
                 let nals = match dep.push_rtp_payload(pkt.payload) {
                     Ok(v) => v,
-                    Err(_) => { dep.reset(); expected_seq = None; continue; }
+                    Err(_) => {
+                        dep.reset();
+                        gate.reset();
+                        expected_seq = None;
+                        continue;
+                    }
                 };
 
                 for nal in nals {
-                    if nal_type_from_annexb(&nal).is_none() {
-                        dep.reset();
-                        expected_seq = None;
-                        break;
+                    for out in gate.push_nal(nal) {
+                        let _ = nal_tx.try_send(VideoNal { data: out, rtp_ts, marker });
                     }
-                    let _ = nal_tx.try_send(VideoNal { data: nal, rtp_ts, marker });
                 }
             }
         }
