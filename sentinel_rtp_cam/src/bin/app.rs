@@ -39,7 +39,7 @@ fn arg_flag(name: &str) -> bool {
     std::env::args().any(|a| a == name)
 }
 
-#[tokio::main]
+#[tokio::main(flavor = "multi_thread", worker_threads = 2)]
 async fn main() -> Result<()> {
     // Initialize tracing subscriber
     tracing_subscriber::fmt()
