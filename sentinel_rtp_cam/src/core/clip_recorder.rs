@@ -46,12 +46,16 @@ pub struct ClipRecorderConfig {
     pub flush_interval: Duration,
     /// Delete stale .part files older than this on startup
     pub stale_part_max_age: Duration,
+    /// Maximum buffered bytes before forcing a write
+    pub write_batch_bytes: usize,
     /// Maximum number of .h264 files to keep (oldest deleted first)
     pub max_files: Option<usize>,
     /// Maximum age of .h264 files in seconds (older files deleted)
     pub max_age_secs: Option<u64>,
     /// Maximum total bytes of all .h264 files (oldest deleted until under limit)
     pub max_total_bytes: Option<u64>,
+    /// Maximum size per clip in bytes (hard stop)
+    pub max_clip_bytes: Option<u64>,
     /// Maximum duration per clip in seconds (hard stop)
     pub max_clip_secs: Option<u64>,
 }
@@ -64,9 +68,11 @@ impl Default for ClipRecorderConfig {
             min_clip_duration: Duration::from_secs(5),
             flush_interval: Duration::from_secs(1),
             stale_part_max_age: Duration::from_secs(24 * 60 * 60),
+            write_batch_bytes: 256 * 1024,
             max_files: None,
             max_age_secs: None,
             max_total_bytes: None,
+            max_clip_bytes: None,
             max_clip_secs: None,
         }
     }
@@ -365,6 +371,18 @@ impl ClipRecorder {
                 if let Err(e) = writer.write_nal(&nal).await {
                     warn!(error = %e, "Clip write failed, stopping recording");
                     self.stop_recording().await?;
+                    return Ok(());
+                }
+
+                if let Some(max_bytes) = self.cfg.max_clip_bytes {
+                    if writer.total_bytes() >= max_bytes {
+                        info!(
+                            max_clip_bytes = max_bytes,
+                            current_bytes = writer.total_bytes(),
+                            "Clip size limit reached, stopping recording"
+                        );
+                        self.stop_recording().await?;
+                    }
                 }
                 Ok(())
             }
@@ -576,7 +594,8 @@ impl ClipRecorder {
             .output_dir
             .join(format!("{ts}_{camera_id}_{event_id}_{safe_rule}.h264.part"));
 
-        let writer = ClipWriter::create(part_path, file_path.clone()).await?;
+        let writer =
+            ClipWriter::create(part_path, file_path.clone(), self.cfg.write_batch_bytes).await?;
         Ok((writer, file_path))
     }
 

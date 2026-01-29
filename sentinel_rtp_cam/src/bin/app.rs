@@ -127,6 +127,10 @@ async fn main() -> Result<()> {
                     .and_then(|v| v.parse().ok())
                     .unwrap_or(24 * 60 * 60),
             ),
+            write_batch_bytes: std::env::var("CLIP_WRITE_BATCH_BYTES")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(256 * 1024),
             max_files: std::env::var("CLIP_MAX_FILES")
                 .ok()
                 .and_then(|v| v.parse().ok()),
@@ -134,6 +138,9 @@ async fn main() -> Result<()> {
                 .ok()
                 .and_then(|v| v.parse().ok()),
             max_total_bytes: std::env::var("CLIP_MAX_TOTAL_BYTES")
+                .ok()
+                .and_then(|v| v.parse().ok()),
+            max_clip_bytes: std::env::var("CLIP_MAX_BYTES")
                 .ok()
                 .and_then(|v| v.parse().ok()),
             max_clip_secs: std::env::var("CLIP_MAX_SECS")
