@@ -47,6 +47,11 @@ pub mod config;
 // Core protocol & codec implementation
 pub mod core;
 
+// Pi <-> server protocol + uplink
+pub mod proto;
+pub mod agent_uplink;
+pub mod server_pipeline;
+
 // RTSP streaming
 pub mod rtsp;
 

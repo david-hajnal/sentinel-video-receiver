@@ -7,7 +7,7 @@ A Rust library for receiving RTSP/RTP video streams with ONVIF motion detection 
 - RTSP client with TCP interleaved and UDP transport modes
 - RTP packet parsing and H.264 video depacketization
 - ONVIF motion event detection via WS-Security authenticated SOAP
-- Motion-triggered video clip recording with FFmpeg
+- Motion-triggered video clip recording (raw Annex-B .h264)
 - Event-driven architecture with pub-sub pattern
 
 ## Quick Start
@@ -67,6 +67,45 @@ Run ONVIF motion detection only:
 cargo run --bin app -- --onvif-only
 ```
 
+### Agent → Server forwarding
+
+#### Agent (Pi)
+Environment:
+```
+SERVER_ADDR=cloud.example.com:9000
+AGENT_TOKEN=secret
+AGENT_ID=pi-cam-001
+
+CAM1_RTSP_URL=rtsp://user:pass@camera/stream1
+CAM1_STREAM_ID=1
+CAM1_TRANSPORT=tcp   # or udp
+CAM1_RTP_PORT=5004   # only for udp
+CAM1_RTCP_PORT=5005  # only for udp
+CAM1_CAMERA_ID=pi-cam-001
+```
+
+Run:
+```bash
+cargo run --bin agent_forward
+```
+
+#### Server (cloud ingest)
+Environment:
+```
+SERVER_BIND=0.0.0.0:9000
+SERVER_TOKEN=secret
+CLIP_DIR=clips
+CLIP_PREROLL_SECS=3
+CLIP_POST_ROLL_SECS=5
+CLIP_WRITE_BATCH_BYTES=262144
+CLIP_MAX_SECS=10
+```
+
+Run:
+```bash
+cargo run --bin server_ingest
+```
+
 ## Architecture
 
 - **RTSP Client**: Handles RTSP protocol communication (OPTIONS, DESCRIBE, SETUP, PLAY, TEARDOWN)
@@ -99,7 +138,6 @@ src/
 ## Requirements
 
 - Rust 2021 edition
-- FFmpeg (for video recording)
 - ONVIF-compatible IP camera
 
 ## Development
