@@ -39,6 +39,17 @@ fn arg_flag(name: &str) -> bool {
     std::env::args().any(|a| a == name)
 }
 
+fn env_bool(name: &str, default: bool) -> bool {
+    std::env::var(name)
+        .ok()
+        .and_then(|v| match v.as_str() {
+            "1" | "true" | "TRUE" | "yes" | "YES" => Some(true),
+            "0" | "false" | "FALSE" | "no" | "NO" => Some(false),
+            _ => None,
+        })
+        .unwrap_or(default)
+}
+
 #[tokio::main(flavor = "multi_thread", worker_threads = 2)]
 async fn main() -> Result<()> {
     // Initialize tracing subscriber
@@ -58,6 +69,9 @@ async fn main() -> Result<()> {
     }
 
     let onvif_only = arg_flag("--onvif-only");
+    let local_clip_enabled = env_bool("LOCAL_CLIP_ENABLED", true);
+    let rtsp_receiver_enabled =
+        !onvif_only && local_clip_enabled && env_bool("RTSP_RECEIVER_ENABLED", true);
 
     // Load agent configuration
     let agent_config = AgentConfig::from_env();
@@ -79,23 +93,29 @@ async fn main() -> Result<()> {
     // Logger subscriber
     spawn_logger(bus.subscribe().await);
 
-    // NAL channel from receiver to recorder
-    let (nal_tx, video_nal_rx) = mpsc::channel::<VideoNal>(2048);
-    let (h264_tx, h264_rx) = mpsc::channel::<Vec<u8>>(2048);
+    // Optional local clip pipeline
+    let mut nal_tx_opt = None;
+    let mut clip_meta_rx_opt = None;
 
-    // ClipMeta channel from recorder to server
-    let (clip_meta_tx, clip_meta_rx) = mpsc::channel(128);
+    if local_clip_enabled {
+        // NAL channel from receiver to recorder
+        let (nal_tx, video_nal_rx) = mpsc::channel::<VideoNal>(2048);
+        let (h264_tx, h264_rx) = mpsc::channel::<Vec<u8>>(2048);
 
-    // Convert VideoNal -> Vec<u8> for recorder
-    tokio::spawn(async move {
-        let mut rx = video_nal_rx;
-        while let Some(vnal) = rx.recv().await {
-            let _ = h264_tx.try_send(vnal.data);
-        }
-    });
+        // ClipMeta channel from recorder to server
+        let (clip_meta_tx, clip_meta_rx) = mpsc::channel(128);
+        nal_tx_opt = Some(nal_tx);
+        clip_meta_rx_opt = Some(clip_meta_rx);
 
-    // Recorder task
-    {
+        // Convert VideoNal -> Vec<u8> for recorder
+        tokio::spawn(async move {
+            let mut rx = video_nal_rx;
+            while let Some(vnal) = rx.recv().await {
+                let _ = h264_tx.try_send(vnal.data);
+            }
+        });
+
+        // Recorder task
         let motion_rx = motion_state.subscribe();
         let rec_cfg = ClipRecorderConfig {
             output_dir: std::env::var("OUTPUT_DIR")
@@ -154,6 +174,8 @@ async fn main() -> Result<()> {
                 error!(error = %e, "Clip recorder error");
             }
         });
+    } else {
+        info!("Local clip recording disabled (LOCAL_CLIP_ENABLED=0)");
     }
 
     // ONVIF poller task (DO NOT bubble errors to main)
@@ -214,13 +236,17 @@ async fn main() -> Result<()> {
             }
         });
 
-        // Clip metadata poster
-        let server_cfg_clone = server_cfg.clone();
-        tokio::spawn(async move {
-            if let Err(e) = run_clip_meta_poster(clip_meta_rx, server_cfg_clone).await {
-                error!(error = %e, "Clip metadata poster error");
-            }
-        });
+        // Clip metadata poster (local clips only)
+        if let Some(clip_meta_rx) = clip_meta_rx_opt {
+            let server_cfg_clone = server_cfg.clone();
+            tokio::spawn(async move {
+                if let Err(e) = run_clip_meta_poster(clip_meta_rx, server_cfg_clone).await {
+                    error!(error = %e, "Clip metadata poster error");
+                }
+            });
+        } else {
+            info!("Clip metadata poster disabled (local clips disabled)");
+        }
 
         // Heartbeat poster
         let camera_id = agent_config.camera_id.clone();
@@ -256,46 +282,59 @@ async fn main() -> Result<()> {
     });
 
     // RTSP receiver task (optional, and should NOT kill the process)
-    if !onvif_only {
-        let recv_cfg = UdpReceiverConfig::from_env();
-        let recv_cancel = cancel.clone();
-        let nal_tx2 = nal_tx.clone();
+    if rtsp_receiver_enabled {
+        if let Some(nal_tx) = nal_tx_opt {
+            let recv_cfg = UdpReceiverConfig::from_env();
+            let recv_cancel = cancel.clone();
+            let nal_tx2 = nal_tx.clone();
 
-        tokio::spawn(async move {
-            // Keep trying unless cancelled. This prevents a transient RTSP failure
-            // from terminating the whole program.
-            let mut attempt: u64 = 0;
-            loop {
-                if recv_cancel.is_cancelled() {
-                    break;
-                }
-                attempt += 1;
-
-                // Log connection attempt with context
-                info!(
-                    attempt = attempt,
-                    host = %recv_cfg.host,
-                    port = recv_cfg.port,
-                    url = %recv_cfg.rtsp_url(),
-                    "Starting RTSP receiver"
-                );
-
-                match run_udp_receiver(recv_cfg.clone(), nal_tx2.clone(), recv_cancel.clone()).await
-                {
-                    Ok(_) => {
-                        warn!("RTSP receiver ended normally");
+            tokio::spawn(async move {
+                // Keep trying unless cancelled. This prevents a transient RTSP failure
+                // from terminating the whole program.
+                let mut attempt: u64 = 0;
+                loop {
+                    if recv_cancel.is_cancelled() {
                         break;
                     }
-                    Err(e) => {
-                        error!(error = %e, "RTSP receiver error, retrying in 2s");
-                        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-                        continue;
+                    attempt += 1;
+
+                    // Log connection attempt with context
+                    info!(
+                        attempt = attempt,
+                        host = %recv_cfg.host,
+                        port = recv_cfg.port,
+                        url = %recv_cfg.rtsp_url(),
+                        "Starting RTSP receiver"
+                    );
+
+                    match run_udp_receiver(
+                        recv_cfg.clone(),
+                        nal_tx2.clone(),
+                        recv_cancel.clone(),
+                    )
+                    .await
+                    {
+                        Ok(_) => {
+                            warn!("RTSP receiver ended normally");
+                            break;
+                        }
+                        Err(e) => {
+                            error!(error = %e, "RTSP receiver error, retrying in 2s");
+                            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                            continue;
+                        }
                     }
                 }
-            }
-        });
-    } else {
+            });
+        } else {
+            warn!("RTSP receiver enabled but local clips are disabled");
+        }
+    } else if onvif_only {
         info!("RTSP receiver disabled (--onvif-only flag set)");
+    } else if !local_clip_enabled {
+        info!("RTSP receiver disabled (local clips disabled)");
+    } else {
+        info!("RTSP receiver disabled (RTSP_RECEIVER_ENABLED=0)");
     }
 
     // Keep the process alive until Ctrl-C
