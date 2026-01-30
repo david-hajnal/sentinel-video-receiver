@@ -29,14 +29,13 @@ pub struct StreamConfig {
     pub stale_part_secs: u64,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct AccessUnit {
     ts: Instant,
     nals: Vec<Vec<u8>>,
     has_idr: bool,
 }
 
-#[derive(Debug)]
 struct ClipState {
     writer: ClipWriter,
     started_at: DateTime<Utc>,
@@ -164,7 +163,7 @@ pub async fn run_stream(cfg: StreamConfig, mut rx: mpsc::Receiver<StreamMsg>) ->
                             prune_ring(&mut ring, cfg.ring_secs);
 
                             if clip_pending && clip.is_none() {
-                                if let Some(mut start) = try_start_clip(&cfg, &pending_rule, &pending_ring_snapshot, sps.as_ref(), pps.as_ref()).await? {
+                                if let Some(start) = try_start_clip(&cfg, &pending_rule, &pending_ring_snapshot, sps.as_ref(), pps.as_ref()).await? {
                                     clip = Some(start);
                                     clip_pending = false;
                                     pending_ring_snapshot = None;
@@ -287,7 +286,7 @@ async fn try_start_clip(
 }
 
 async fn finalize_clip(stream_id: u32, clip: Option<ClipState>) -> Result<()> {
-    let Some(mut cs) = clip else { return Ok(()); };
+    let Some(cs) = clip else { return Ok(()); };
 
     let part_path = cs.writer.part_path().clone();
     let final_path = cs.writer.finalize().await?;

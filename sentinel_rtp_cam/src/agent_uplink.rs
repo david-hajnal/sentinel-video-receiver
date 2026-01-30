@@ -1,4 +1,3 @@
-use anyhow::Result;
 use serde::Serialize;
 use std::collections::HashMap;
 use std::time::Duration;
@@ -7,7 +6,7 @@ use tokio::sync::mpsc;
 use tokio::time::{interval, sleep};
 use tracing::{debug, info, warn};
 
-use crate::proto::{encode_gap, write_msg, Msg, MSG_GAP, MSG_HELLO, MSG_MOTION, MSG_PING, MSG_RTP};
+use crate::proto::{encode_gap, write_msg, Msg, GAP, HELLO, MOTION, PING, RTP};
 
 #[derive(Clone)]
 pub struct Uplink {
@@ -64,7 +63,7 @@ impl Uplink {
                             }
                         };
                         let hello_msg = Msg {
-                            msg_type: MSG_HELLO,
+                            msg_type: HELLO,
                             stream_id: 0,
                             payload,
                         };
@@ -90,7 +89,7 @@ impl Uplink {
                                         "sent": sent,
                                     });
                                     let payload = serde_json::to_vec(&stats).unwrap_or_default();
-                                    let ping_msg = Msg { msg_type: MSG_PING, stream_id: 0, payload };
+                                    let ping_msg = Msg { msg_type: PING, stream_id: 0, payload };
                                     if let Err(e) = write_msg(&mut stream, &ping_msg).await {
                                         warn!(error = %e, "Uplink ping failed, reconnecting");
                                         break;
@@ -116,7 +115,7 @@ impl Uplink {
 
     pub fn send_rtp(&self, stream_id: u32, rtp_bytes: Vec<u8>) {
         let msg = Msg {
-            msg_type: MSG_RTP,
+            msg_type: RTP,
             stream_id,
             payload: rtp_bytes,
         };
@@ -125,7 +124,7 @@ impl Uplink {
 
     pub fn send_gap(&self, stream_id: u32, last_seq: u16, new_seq: u16) {
         let msg = Msg {
-            msg_type: MSG_GAP,
+            msg_type: GAP,
             stream_id,
             payload: encode_gap(last_seq, new_seq),
         };
@@ -139,7 +138,7 @@ impl Uplink {
             "ts": ts,
         });
         let msg = Msg {
-            msg_type: MSG_MOTION,
+            msg_type: MOTION,
             stream_id,
             payload: serde_json::to_vec(&payload).unwrap_or_default(),
         };

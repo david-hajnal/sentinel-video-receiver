@@ -31,7 +31,7 @@ fn env_string(key: &str) -> Option<String> {
 fn load_cameras() -> Result<Vec<CamConfig>> {
     let mut cams = Vec::new();
     for i in 1..=4 {
-        let prefix = format!("CAM{}_{}", i);
+        let prefix = format!("CAM{}_", i);
         let rtsp = match env_string(&format!("{prefix}RTSP_URL")) {
             Some(v) => v,
             None => continue,
@@ -117,22 +117,22 @@ async fn main() -> Result<()> {
 
     let uplink_motion = uplink.clone();
     let cam_map = camera_to_stream.clone();
+    let bus_sub = bus.clone();
     tokio::spawn(async move {
-        let mut rx = bus.subscribe().await;
+        let mut rx = bus_sub.subscribe().await;
         while let Some(ev) = rx.recv().await {
-            if let Event::Motion(m) = ev {
-                let stream_id = cam_map
-                    .get(&m.camera_id)
-                    .copied()
-                    .or_else(|| cam_map.values().next().copied())
-                    .unwrap_or(1);
-                uplink_motion.send_motion(
-                    stream_id,
-                    m.rule.clone(),
-                    m.active,
-                    m.ts.to_rfc3339(),
-                );
-            }
+            let Event::Motion(m) = ev;
+            let stream_id = cam_map
+                .get(&m.camera_id)
+                .copied()
+                .or_else(|| cam_map.values().next().copied())
+                .unwrap_or(1);
+            uplink_motion.send_motion(
+                stream_id,
+                m.rule.clone(),
+                m.active,
+                m.ts.to_rfc3339(),
+            );
         }
     });
 

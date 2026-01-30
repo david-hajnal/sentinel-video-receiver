@@ -4,13 +4,12 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc;
 use tracing::{info, warn};
 
-use sentinel_rtp_cam::proto::{parse_gap, read_msg, Msg, MSG_GAP, MSG_HELLO, MSG_MOTION, MSG_RTP};
-use sentinel_rtp_cam::server_pipeline::{run_stream_pipeline, StreamConfig, StreamMsg};
+use sentinel_rtp_cam::proto::{decode_gap, read_msg, Msg, GAP, HELLO, MOTION, RTP};
+use sentinel_rtp_cam::server_pipeline::{run_stream, StreamConfig, StreamMsg};
 
 #[derive(Debug, Deserialize)]
 struct HelloPayload {
@@ -38,11 +37,12 @@ async fn main() -> Result<()> {
     let token = std::env::var("SERVER_TOKEN").unwrap_or_else(|_| "devtoken".to_string());
 
     let clip_dir = PathBuf::from(std::env::var("CLIP_DIR").unwrap_or_else(|_| "clips".to_string()));
-    let preroll_secs: u64 = std::env::var("CLIP_PREROLL_SECS").ok().and_then(|v| v.parse().ok()).unwrap_or(3);
-    let post_roll_secs: u64 = std::env::var("CLIP_POST_ROLL_SECS").ok().and_then(|v| v.parse().ok()).unwrap_or(5);
+    let pre_secs: u64 = std::env::var("CLIP_PRE_SECS").ok().and_then(|v| v.parse().ok()).unwrap_or(3);
+    let post_secs: u64 = std::env::var("CLIP_POST_SECS").ok().and_then(|v| v.parse().ok()).unwrap_or(5);
+    let ring_secs: u64 = std::env::var("CLIP_RING_SECS").ok().and_then(|v| v.parse().ok()).unwrap_or(pre_secs);
     let stale_part_secs: u64 = std::env::var("CLIP_STALE_PART_SECS").ok().and_then(|v| v.parse().ok()).unwrap_or(24 * 60 * 60);
-    let write_batch_bytes: usize = std::env::var("CLIP_WRITE_BATCH_BYTES").ok().and_then(|v| v.parse().ok()).unwrap_or(256 * 1024);
-    let max_clip_secs: Option<u64> = std::env::var("CLIP_MAX_SECS").ok().and_then(|v| v.parse().ok());
+    let _write_batch_bytes: usize = std::env::var("CLIP_WRITE_BATCH_BYTES").ok().and_then(|v| v.parse().ok()).unwrap_or(256 * 1024);
+    let _max_clip_secs: Option<u64> = std::env::var("CLIP_MAX_SECS").ok().and_then(|v| v.parse().ok());
 
     let listener = TcpListener::bind(&bind).await?;
     info!(bind = %bind, "Server ingest listening");
@@ -55,7 +55,7 @@ async fn main() -> Result<()> {
         let streams = streams.clone();
         let clip_dir = clip_dir.clone();
         tokio::spawn(async move {
-            if let Err(e) = handle_conn(sock, addr, token, streams, clip_dir, preroll_secs, post_roll_secs, stale_part_secs, write_batch_bytes, max_clip_secs).await {
+            if let Err(e) = handle_conn(sock, addr, token, streams, clip_dir, ring_secs, pre_secs, post_secs, stale_part_secs).await {
                 warn!(error = %e, "Connection ended");
             }
         });
@@ -68,14 +68,13 @@ async fn handle_conn(
     token: String,
     streams: Arc<Mutex<HashMap<u32, mpsc::Sender<StreamMsg>>>>,
     clip_dir: PathBuf,
-    preroll_secs: u64,
-    post_roll_secs: u64,
+    ring_secs: u64,
+    pre_secs: u64,
+    post_secs: u64,
     stale_part_secs: u64,
-    write_batch_bytes: usize,
-    max_clip_secs: Option<u64>,
 ) -> Result<()> {
     let hello = read_msg(&mut sock).await?;
-    if hello.msg_type != MSG_HELLO {
+    if hello.msg_type != HELLO {
         return Err(anyhow!("first msg not HELLO"));
     }
     let hello: HelloPayload = serde_json::from_slice(&hello.payload)?;
@@ -90,11 +89,10 @@ async fn handle_conn(
             s.stream_id,
             s.name.clone(),
             clip_dir.clone(),
-            preroll_secs,
-            post_roll_secs,
+            ring_secs,
+            pre_secs,
+            post_secs,
             stale_part_secs,
-            write_batch_bytes,
-            max_clip_secs,
         );
     }
 
@@ -105,23 +103,22 @@ async fn handle_conn(
             stream_id,
             format!("stream{}", stream_id),
             clip_dir.clone(),
-            preroll_secs,
-            post_roll_secs,
+            ring_secs,
+            pre_secs,
+            post_secs,
             stale_part_secs,
-            write_batch_bytes,
-            max_clip_secs,
         );
 
         match msg_type {
-            MSG_RTP => {
+            RTP => {
                 let _ = tx.try_send(StreamMsg::Rtp(payload));
             }
-            MSG_GAP => {
-                if let Ok((last, new)) = parse_gap(&payload) {
+            GAP => {
+                if let Ok((last, new)) = decode_gap(&payload) {
                     let _ = tx.try_send(StreamMsg::Gap { last, new });
                 }
             }
-            MSG_MOTION => {
+            MOTION => {
                 let v: serde_json::Value = serde_json::from_slice(&payload).unwrap_or_default();
                 let rule = v.get("rule").and_then(|v| v.as_str()).unwrap_or("motion").to_string();
                 let active = v.get("active").and_then(|v| v.as_bool()).unwrap_or(false);
@@ -136,13 +133,12 @@ async fn handle_conn(
 fn ensure_stream(
     streams: &Arc<Mutex<HashMap<u32, mpsc::Sender<StreamMsg>>>>,
     stream_id: u32,
-    stream_name: String,
+    _stream_name: String,
     clip_dir: PathBuf,
-    preroll_secs: u64,
-    post_roll_secs: u64,
+    ring_secs: u64,
+    pre_secs: u64,
+    post_secs: u64,
     stale_part_secs: u64,
-    write_batch_bytes: usize,
-    max_clip_secs: Option<u64>,
 ) -> mpsc::Sender<StreamMsg> {
     let mut guard = streams.lock().unwrap();
     if let Some(tx) = guard.get(&stream_id) {
@@ -152,17 +148,15 @@ fn ensure_stream(
     let (tx, rx) = mpsc::channel::<StreamMsg>(4096);
     let cfg = StreamConfig {
         stream_id,
-        stream_name,
         clip_dir,
-        preroll: Duration::from_secs(preroll_secs),
-        post_roll: Duration::from_secs(post_roll_secs),
-        stale_part: Duration::from_secs(stale_part_secs),
-        write_batch_bytes,
-        max_clip_secs,
+        ring_secs,
+        pre_secs,
+        post_secs,
+        stale_part_secs,
     };
 
     tokio::spawn(async move {
-        if let Err(e) = run_stream_pipeline(cfg, rx).await {
+        if let Err(e) = run_stream(cfg, rx).await {
             warn!(error = %e, stream_id = stream_id, "Stream pipeline ended");
         }
     });
