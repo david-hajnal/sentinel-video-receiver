@@ -132,6 +132,8 @@ async fn main() -> Result<()> {
                 m.rule.clone(),
                 m.active,
                 m.ts.to_rfc3339(),
+                m.camera_id.clone(),
+                m.event_id.clone(),
             );
         }
     });

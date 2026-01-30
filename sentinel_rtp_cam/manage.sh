@@ -4,7 +4,8 @@
 
 set -e
 
-SERVICE_NAME="sentinel_rtp_cam"
+SERVICE_NAME_LEGACY="sentinel_rtp_cam"
+SERVICE_NAME_FORWARD="sentinel_rtp_cam_forward"
 CONFIG_FILE="/etc/sentinel_rtp_cam/env"
 CLIPS_DIR="/var/lib/sentinel_rtp_cam/clips"
 
@@ -23,7 +24,7 @@ show_usage() {
     echo "  clips        List clips in storage directory"
     echo "  restart      Restart the service"
     echo "  stop         Stop the service"
-    echo "  start        Start the service"
+    echo "  start        Start the service (defaults to forward mode)"
     echo "  status       Show service status"
     echo "  logs         Follow live logs"
     echo "  logs-recent  Show recent logs (last 50 lines)"
@@ -32,13 +33,67 @@ show_usage() {
     echo "Examples:"
     echo "  $0 config"
     echo "  $0 restart"
+    echo "  $0 start forward"
+    echo "  $0 start legacy"
     echo "  $0 logs"
+    echo ""
+    echo "Mode selection:"
+    echo "  - If no mode is passed, the script defaults to forward mode."
+    echo "  - Set AGENT_MODE=forward|legacy in $CONFIG_FILE to pin the mode."
 }
 
 check_root() {
     if [[ $EUID -ne 0 ]]; then
         echo -e "${YELLOW}This command requires sudo. Re-running with sudo...${NC}"
         exec sudo "$0" "$@"
+    fi
+}
+
+systemd_service_exists() {
+    local service="$1"
+    systemctl cat "${service}.service" >/dev/null 2>&1
+}
+
+resolve_mode() {
+    local mode="${1:-}"
+    if [[ -z "$mode" && -f "$CONFIG_FILE" ]]; then
+        mode=$(grep -E '^AGENT_MODE=' "$CONFIG_FILE" | tail -n 1 | cut -d= -f2-)
+        case "$mode" in
+            forward|legacy) ;;
+            *) mode="" ;;
+        esac
+        if [[ -z "$mode" ]]; then
+            if grep -Eq '^SERVER_ADDR=' "$CONFIG_FILE"; then
+                mode="forward"
+            fi
+        fi
+    fi
+    if [[ -z "$mode" ]]; then
+        mode="forward"
+    fi
+    echo "$mode"
+}
+
+resolve_service() {
+    local mode
+    mode=$(resolve_mode "${1:-}")
+
+    if [[ "$mode" == "forward" ]]; then
+        ACTIVE_SERVICE="$SERVICE_NAME_FORWARD"
+        ACTIVE_MODE="forward"
+        if ! systemd_service_exists "$ACTIVE_SERVICE"; then
+            echo -e "${YELLOW}Forward service not installed; falling back to legacy (${SERVICE_NAME_LEGACY})${NC}"
+            ACTIVE_SERVICE="$SERVICE_NAME_LEGACY"
+            ACTIVE_MODE="legacy"
+        fi
+    else
+        ACTIVE_SERVICE="$SERVICE_NAME_LEGACY"
+        ACTIVE_MODE="legacy"
+        if ! systemd_service_exists "$ACTIVE_SERVICE" && systemd_service_exists "$SERVICE_NAME_FORWARD"; then
+            echo -e "${YELLOW}Legacy service not installed; using forward (${SERVICE_NAME_FORWARD})${NC}"
+            ACTIVE_SERVICE="$SERVICE_NAME_FORWARD"
+            ACTIVE_MODE="forward"
+        fi
     fi
 }
 
@@ -59,42 +114,48 @@ cmd_clips() {
 
 cmd_restart() {
     check_root
-    echo -e "${YELLOW}Restarting $SERVICE_NAME...${NC}"
-    systemctl restart "$SERVICE_NAME"
+    resolve_service "${2:-}"
+    echo -e "${YELLOW}Restarting $ACTIVE_SERVICE ($ACTIVE_MODE)...${NC}"
+    systemctl restart "$ACTIVE_SERVICE"
     sleep 2
-    systemctl status "$SERVICE_NAME" --no-pager
+    systemctl status "$ACTIVE_SERVICE" --no-pager
 }
 
 cmd_stop() {
     check_root
-    echo -e "${YELLOW}Stopping $SERVICE_NAME...${NC}"
-    systemctl stop "$SERVICE_NAME"
-    systemctl status "$SERVICE_NAME" --no-pager
+    resolve_service "${2:-}"
+    echo -e "${YELLOW}Stopping $ACTIVE_SERVICE ($ACTIVE_MODE)...${NC}"
+    systemctl stop "$ACTIVE_SERVICE"
+    systemctl status "$ACTIVE_SERVICE" --no-pager
 }
 
 cmd_start() {
     check_root
-    echo -e "${GREEN}Starting $SERVICE_NAME...${NC}"
-    systemctl start "$SERVICE_NAME"
+    resolve_service "${2:-}"
+    echo -e "${GREEN}Starting $ACTIVE_SERVICE ($ACTIVE_MODE)...${NC}"
+    systemctl start "$ACTIVE_SERVICE"
     sleep 2
-    systemctl status "$SERVICE_NAME" --no-pager
+    systemctl status "$ACTIVE_SERVICE" --no-pager
 }
 
 cmd_status() {
     check_root
-    systemctl status "$SERVICE_NAME" --no-pager
+    resolve_service "${2:-}"
+    systemctl status "$ACTIVE_SERVICE" --no-pager
 }
 
 cmd_logs() {
     check_root
-    echo -e "${GREEN}Following logs for $SERVICE_NAME (Ctrl+C to exit)...${NC}"
-    journalctl -u "$SERVICE_NAME" -f
+    resolve_service "${2:-}"
+    echo -e "${GREEN}Following logs for $ACTIVE_SERVICE ($ACTIVE_MODE) (Ctrl+C to exit)...${NC}"
+    journalctl -u "$ACTIVE_SERVICE" -f
 }
 
 cmd_logs_recent() {
     check_root
-    echo -e "${GREEN}Recent logs for $SERVICE_NAME:${NC}"
-    journalctl -u "$SERVICE_NAME" -n 50 --no-pager
+    resolve_service "${2:-}"
+    echo -e "${GREEN}Recent logs for $ACTIVE_SERVICE ($ACTIVE_MODE):${NC}"
+    journalctl -u "$ACTIVE_SERVICE" -n 50 --no-pager
 }
 
 cmd_clean() {
@@ -119,22 +180,22 @@ case "${1:-}" in
         cmd_clips
         ;;
     restart)
-        cmd_restart
+        cmd_restart "$@"
         ;;
     stop)
-        cmd_stop
+        cmd_stop "$@"
         ;;
     start)
-        cmd_start
+        cmd_start "$@"
         ;;
     status)
-        cmd_status
+        cmd_status "$@"
         ;;
     logs)
-        cmd_logs
+        cmd_logs "$@"
         ;;
     logs-recent|recent)
-        cmd_logs_recent
+        cmd_logs_recent "$@"
         ;;
     clean)
         cmd_clean

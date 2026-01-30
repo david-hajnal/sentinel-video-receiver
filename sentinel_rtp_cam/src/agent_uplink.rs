@@ -131,11 +131,21 @@ impl Uplink {
         let _ = self.tx.try_send(msg);
     }
 
-    pub fn send_motion(&self, stream_id: u32, rule: String, active: bool, ts: String) {
+    pub fn send_motion(
+        &self,
+        stream_id: u32,
+        rule: String,
+        active: bool,
+        ts: String,
+        camera_id: String,
+        event_id: String,
+    ) {
         let payload = serde_json::json!({
             "rule": rule,
             "active": active,
             "ts": ts,
+            "camera_id": camera_id,
+            "event_id": event_id,
         });
         let msg = Msg {
             msg_type: MOTION,
