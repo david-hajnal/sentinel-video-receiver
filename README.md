@@ -70,13 +70,13 @@ sudo /usr/local/bin/sentinel_rtp_cam_status.sh
 
 Update to latest version:
 ```bash
-curl -fsSL https://raw.githubusercontent.com/david-hajnal/sentinel-video-receiver/main/sentinel_rtp_cam/update.sh | sudo bash
+curl -fsSL https://raw.githubusercontent.com/david-hajnal/sentinel-tooling/main/scripts/update.sh | sudo bash
 ```
 
 ## Build from Source
 
 We do not build on Raspberry Pi. Use GitHub workflows to produce releases and update the device
-with `update.sh`.
+with `update.sh` from https://github.com/david-hajnal/sentinel-tooling.
 
 ## Features
 

@@ -53,7 +53,7 @@ sudo nano /etc/sentinel_rtp_cam/env
 ### Method 2: Build from Source (Not supported on Pi)
 
 We do **not** build on Raspberry Pi. If you need a new version, build it on GitHub
-(via workflows) and update the Pi using `update.sh`.
+(via workflows) and update the Pi using `update.sh` from https://github.com/david-hajnal/sentinel-tooling.
 
 ### Custom Version Installation
 
@@ -187,7 +187,9 @@ sudo journalctl -u sentinel_rtp_cam --since "2026-01-20" > logs.txt
 ### Update to Latest Version
 
 ```bash
-sudo ./update.sh
+curl -fsSL https://raw.githubusercontent.com/david-hajnal/sentinel-tooling/main/scripts/update.sh -o /tmp/sentinel-update.sh
+chmod +x /tmp/sentinel-update.sh
+sudo /tmp/sentinel-update.sh
 ```
 
 The update script will:
@@ -204,15 +206,17 @@ The update script will:
 Use `manage.sh` to start/stop/restart and view logs:
 
 ```bash
-sudo ./manage.sh start
-sudo ./manage.sh restart
-sudo ./manage.sh logs
+curl -fsSL https://raw.githubusercontent.com/david-hajnal/sentinel-tooling/main/scripts/manage.sh -o /usr/local/bin/sentinel_rtp_cam_manage.sh
+chmod +x /usr/local/bin/sentinel_rtp_cam_manage.sh
+sudo /usr/local/bin/sentinel_rtp_cam_manage.sh start
+sudo /usr/local/bin/sentinel_rtp_cam_manage.sh restart
+sudo /usr/local/bin/sentinel_rtp_cam_manage.sh logs
 ```
 
 ### Update to Specific Version
 
 ```bash
-sudo SENTINEL_VERSION=1.2.3 ./update.sh
+sudo SENTINEL_VERSION=1.2.3 /tmp/sentinel-update.sh
 ```
 
 ### Dry-Run Mode
@@ -220,7 +224,7 @@ sudo SENTINEL_VERSION=1.2.3 ./update.sh
 Test update without making changes:
 
 ```bash
-sudo ./update.sh --dry-run
+sudo /tmp/sentinel-update.sh --dry-run
 ```
 
 ### Update Configuration
@@ -233,7 +237,7 @@ export SENTINEL_BASE_URL=https://your-releases.com/sentinel_rtp_cam
 export SENTINEL_SHA256_URL=https://your-releases.com/checksums
 
 # Run update
-sudo -E ./update.sh
+sudo -E /tmp/sentinel-update.sh
 ```
 
 ## Rollback
@@ -454,7 +458,7 @@ For air-gapped or private deployments:
 export SENTINEL_BASE_URL=https://internal-releases.company.com/sentinel
 export SENTINEL_SHA256_URL=https://internal-releases.company.com/checksums
 
-sudo -E ./update.sh
+sudo -E /tmp/sentinel-update.sh
 ```
 
 ### Multiple Instances

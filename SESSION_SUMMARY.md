@@ -50,7 +50,7 @@ CLIP_MIN_FREE_BYTES=1000000000 # 1GB threshold
 - **Benefit:** Binaries work on any Linux system without dynamic linker dependencies
 
 #### Enhanced Update Script
-**File:** `sentinel-video-receiver/sentinel_rtp_cam/update.sh`
+**File:** `sentinel-tooling/scripts/update.sh`
 
 **Improvements:**
 - ✅ Fixed version string handling (strip 'v' prefix)
@@ -66,7 +66,7 @@ CLIP_MIN_FREE_BYTES=1000000000 # 1GB threshold
 ### 4. Documentation Created
 - `RASPBERRY_PI_OPTIMIZATION.md` - Performance tuning guide
 - `UPDATE_GUIDE.md` - Deployment instructions
-- `manage.sh` - Service management convenience script
+- `sentinel-tooling/scripts/manage.sh` - Service management convenience script
 
 ## Technical Issues Resolved
 
@@ -102,15 +102,15 @@ https://github.com/david-hajnal/sentinel-video-receiver/releases/tag/v0.2.2
 
 ```bash
 # Update to latest
-sudo ./update.sh latest
+sudo /tmp/sentinel-update.sh latest
 
 # Update to specific version
-sudo ./update.sh v0.2.2
+sudo SENTINEL_VERSION=v0.2.2 /tmp/sentinel-update.sh
 
 # Service management
-sudo ./manage.sh status
-sudo ./manage.sh restart
-sudo ./manage.sh logs
+sudo /usr/local/bin/sentinel_rtp_cam_manage.sh status
+sudo /usr/local/bin/sentinel_rtp_cam_manage.sh restart
+sudo /usr/local/bin/sentinel_rtp_cam_manage.sh logs
 
 # View config
 sudo cat /etc/sentinel_rtp_cam/env

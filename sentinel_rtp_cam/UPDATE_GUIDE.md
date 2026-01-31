@@ -11,11 +11,12 @@ The easiest way to update:
 # SSH into your Raspberry Pi
 ssh dietpi@agentsmith
 
-# Navigate to the installation directory
-cd ~/sentinel-video-receiver/sentinel_rtp_cam
+# Download the update script
+curl -fsSL https://raw.githubusercontent.com/david-hajnal/sentinel-tooling/main/scripts/update.sh -o /tmp/sentinel-update.sh
+chmod +x /tmp/sentinel-update.sh
 
 # Run the update script
-sudo ./update.sh
+sudo /tmp/sentinel-update.sh
 ```
 
 The script will:
@@ -31,7 +32,7 @@ The script will:
 If you need a new version, trigger the GitHub workflow to build a release, then update the Pi:
 
 ```bash
-sudo SENTINEL_VERSION=1.2.3 ./update.sh
+sudo SENTINEL_VERSION=1.2.3 /tmp/sentinel-update.sh
 ```
 
 ## Option 3: Update Configuration Only
@@ -41,10 +42,6 @@ If only .env changed (like adding CLIP_AUDIO_ENABLED):
 ```bash
 # SSH into Raspberry Pi
 ssh dietpi@agentsmith
-
-# Pull latest changes
-cd ~/sentinel-video-receiver
-git pull
 
 # Update the service configuration
 sudo nano /etc/sentinel_rtp_cam/env
@@ -69,7 +66,7 @@ After updating, use `manage.sh` to start/restart and follow logs:
 
 ```bash
 # Copy manage script to home directory (optional)
-cp ~/sentinel-video-receiver/sentinel_rtp_cam/manage.sh ~/manage-sentinel.sh
+curl -fsSL https://raw.githubusercontent.com/david-hajnal/sentinel-tooling/main/scripts/manage.sh -o ~/manage-sentinel.sh
 chmod +x ~/manage-sentinel.sh
 
 # Common commands
