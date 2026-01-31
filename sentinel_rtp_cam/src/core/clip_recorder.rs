@@ -37,6 +37,13 @@ struct ClipSidecar {
 }
 
 #[derive(Clone, Debug)]
+struct StickyMotion {
+    rule: String,
+    camera_id: String,
+    event_id: String,
+}
+
+#[derive(Clone, Debug)]
 pub struct ClipRecorderConfig {
     pub output_dir: PathBuf,
     pub post_roll: Duration,
@@ -105,6 +112,8 @@ pub struct ClipRecorder {
     // cached parameter sets (Annex-B NALs)
     last_sps: Option<Vec<u8>>,
     last_pps: Option<Vec<u8>>,
+    last_motion_state: MotionState,
+    sticky_motion: Option<StickyMotion>,
     // Optional channel to send clip metadata when recording completes
     clip_meta_tx: Option<mpsc::Sender<ClipMeta>>,
 }
@@ -116,6 +125,8 @@ impl ClipRecorder {
             state: State::Idle,
             last_sps: None,
             last_pps: None,
+            last_motion_state: MotionState::new(),
+            sticky_motion: None,
             clip_meta_tx: None,
         }
     }
@@ -181,6 +192,19 @@ impl ClipRecorder {
 
     /// Handle motion state changes (watch-based)
     async fn on_motion_state_change(&mut self, state: &MotionState) -> Result<()> {
+        self.last_motion_state = state.clone();
+        let recording_active = matches!(self.state, State::Recording { .. });
+        if state.is_empty() && !recording_active {
+            self.sticky_motion = None;
+        } else if !state.is_empty() && self.sticky_motion.is_none() {
+            if let Some((rule, meta)) = state.iter().min_by_key(|(k, _)| *k) {
+                self.sticky_motion = Some(StickyMotion {
+                    rule: rule.clone(),
+                    camera_id: meta.camera_id.clone(),
+                    event_id: meta.event_id.clone(),
+                });
+            }
+        }
         let has_active_motion = !state.is_empty();
         debug!(
             active = has_active_motion,
@@ -191,8 +215,21 @@ impl ClipRecorder {
         match &mut self.state {
             State::Idle => {
                 if has_active_motion {
-                    // Transition to Armed with first rule (sorted lexicographically)
-                    if let Some((rule, meta)) = state.iter().min_by_key(|(k, _)| *k) {
+                    // Transition to Armed using the first motion event (sticky until motion ends)
+                    if let Some(sticky) = &self.sticky_motion {
+                        info!(
+                            rule = %sticky.rule,
+                            camera_id = %sticky.camera_id,
+                            event_id = %sticky.event_id,
+                            "Motion detected, arming recorder (waiting for IDR frame)"
+                        );
+                        self.state = State::Armed {
+                            rule: sticky.rule.clone(),
+                            camera_id: sticky.camera_id.clone(),
+                            event_id: sticky.event_id.clone(),
+                            armed_at: Instant::now(),
+                        };
+                    } else if let Some((rule, meta)) = state.iter().min_by_key(|(k, _)| *k) {
                         info!(
                             rule = %rule,
                             camera_id = %meta.camera_id,
@@ -210,20 +247,14 @@ impl ClipRecorder {
             }
             State::Armed { rule, camera_id, event_id, armed_at } => {
                 if has_active_motion {
-                    // New motion arrived while still armed - update to latest event
-                    if let Some((new_rule, meta)) = state.iter().min_by_key(|(k, _)| *k) {
-                        if meta.event_id != *event_id {
-                            info!(
-                                old_event_id = %event_id,
-                                new_event_id = %meta.event_id,
-                                "New motion detected while armed, updating to new event"
-                            );
-                            *rule = new_rule.clone();
-                            *camera_id = meta.camera_id.clone();
-                            *event_id = meta.event_id.clone();
-                            *armed_at = Instant::now();
-                        }
-                    }
+                    // Merge subsequent motion events into the first while armed.
+                    debug!(
+                        rule = %rule,
+                        camera_id = %camera_id,
+                        event_id = %event_id,
+                        "Motion detected while armed, keeping original event id"
+                    );
+                    *armed_at = Instant::now();
                 } else {
                     // Motion ended before IDR -> stay armed and record minimum duration when IDR arrives
                     info!("Motion ended before IDR frame received, will record minimum duration clip when IDR arrives");
@@ -390,7 +421,7 @@ impl ClipRecorder {
     }
 
     async fn maybe_stop_on_deadline(&mut self) -> Result<()> {
-        let (should_stop, stop_reason) = match &self.state {
+        let (should_stop, stop_reason, hard_due) = match &self.state {
             State::Recording {
                 stop_at,
                 hard_stop_at,
@@ -402,14 +433,18 @@ impl ClipRecorder {
                 (
                     stop_due || hard_due,
                     if hard_due { "hard_stop" } else if stop_due { "stop_at" } else { "none" },
+                    hard_due,
                 )
             }
-            _ => (false, "none"),
+            _ => (false, "none", false),
         };
 
         if should_stop {
             info!(reason = stop_reason, "Stop deadline reached, finalizing clip");
             self.stop_recording().await?;
+            if hard_due {
+                self.rearm_if_motion_active().await?;
+            }
         }
         Ok(())
     }
@@ -482,6 +517,46 @@ impl ClipRecorder {
 
             let _ = self.cleanup_old_clips().await;
         }
+        Ok(())
+    }
+
+    async fn rearm_if_motion_active(&mut self) -> Result<()> {
+        if self.last_motion_state.is_empty() {
+            return Ok(());
+        }
+
+        if let Some(sticky) = &self.sticky_motion {
+            info!(
+                rule = %sticky.rule,
+                camera_id = %sticky.camera_id,
+                event_id = %sticky.event_id,
+                "Hard stop reached with motion active, re-arming recorder"
+            );
+            self.state = State::Armed {
+                rule: sticky.rule.clone(),
+                camera_id: sticky.camera_id.clone(),
+                event_id: sticky.event_id.clone(),
+                armed_at: Instant::now(),
+            };
+        } else if let Some((rule, meta)) = self
+            .last_motion_state
+            .iter()
+            .min_by_key(|(k, _)| *k)
+        {
+            info!(
+                rule = %rule,
+                camera_id = %meta.camera_id,
+                event_id = %meta.event_id,
+                "Hard stop reached with motion active, re-arming recorder"
+            );
+            self.state = State::Armed {
+                rule: rule.clone(),
+                camera_id: meta.camera_id.clone(),
+                event_id: meta.event_id.clone(),
+                armed_at: Instant::now(),
+            };
+        }
+
         Ok(())
     }
 
