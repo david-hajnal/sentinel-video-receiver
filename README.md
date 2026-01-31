@@ -2,19 +2,30 @@
 
 RTSP/RTP video receiver and clip recorder for Raspberry Pi with ONVIF motion detection support.
 
-## Quick Install
+## Quick Install (Manual)
 
-**One-line installation** (downloads prebuilt binary):
+We build on GitHub Actions and ship prebuilt binaries. Raspberry Pi devices only download and run
+those artifacts.
 
+1) Download the latest release binary for your architecture from GitHub Releases.
+2) Install the binary:
 ```bash
-curl -fsSL https://raw.githubusercontent.com/david-hajnal/sentinel-video-receiver/main/sentinel_rtp_cam/install.sh | sudo bash
+sudo install -m 755 sentinel_rtp_cam /usr/local/bin/sentinel_rtp_cam
 ```
-
-This will:
-- Download the latest prebuilt ARM binary from GitHub Releases
-- Install to `/usr/local/bin/sentinel_rtp_cam`
-- Create systemd service for automatic startup
-- Set up configuration directory at `/etc/sentinel_rtp_cam/`
+3) Install the systemd unit:
+```bash
+sudo install -m 644 sentinel_rtp_cam/sentinel_rtp_cam.service /etc/systemd/system/sentinel_rtp_cam.service
+sudo systemctl daemon-reload
+```
+4) Create the config directory and config file:
+```bash
+sudo install -d -m 755 /etc/sentinel_rtp_cam
+sudo nano /etc/sentinel_rtp_cam/env
+```
+5) Start the service:
+```bash
+sudo systemctl enable --now sentinel_rtp_cam
+```
 
 ## Configuration
 
@@ -64,18 +75,8 @@ curl -fsSL https://raw.githubusercontent.com/david-hajnal/sentinel-video-receive
 
 ## Build from Source
 
-If prebuilt binaries aren't available for your platform:
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/david-hajnal/sentinel-video-receiver/main/sentinel_rtp_cam/install.sh | sudo BUILD_FROM_SOURCE=1 bash
-```
-
-Or clone the repository:
-```bash
-git clone https://github.com/david-hajnal/sentinel-video-receiver.git
-cd sentinel-video-receiver/sentinel_rtp_cam
-sudo BUILD_FROM_SOURCE=1 ./install.sh
-```
+We do not build on Raspberry Pi. Use GitHub workflows to produce releases and update the device
+with `update.sh`.
 
 ## Features
 

@@ -2,17 +2,24 @@
 
 Production deployment guide for Raspberry Pi OS (32-bit and 64-bit).
 
+**Builds are produced on GitHub Actions.** Raspberry Pi devices only download and run prebuilt
+artifacts. We do **not** build on the Pi (it is too slow/unreliable).
+
 ## Quick Start
 
 ```bash
-# 1. Install
-sudo ./install.sh
+# 1. Install binary + service (manual)
+# Download release from GitHub, then:
+sudo install -m 755 sentinel_rtp_cam /usr/local/bin/sentinel_rtp_cam
+sudo install -m 644 sentinel_rtp_cam.service /etc/systemd/system/sentinel_rtp_cam.service
+sudo systemctl daemon-reload
 
 # 2. Configure
+sudo install -d -m 755 /etc/sentinel_rtp_cam
 sudo nano /etc/sentinel_rtp_cam/env
 
 # 3. Start
-sudo systemctl start sentinel_rtp_cam
+sudo systemctl enable --now sentinel_rtp_cam
 
 # 4. Check status
 sudo systemctl status sentinel_rtp_cam
@@ -28,44 +35,29 @@ sudo systemctl status sentinel_rtp_cam
 
 ## Installation
 
-### Method 1: Install from Prebuilt Binary (Recommended)
+### Method 1: Install from Prebuilt Binary (Required)
 
 ```bash
-# Clone the repository
-git clone https://github.com/yourusername/sentinel-video-receiver.git
-cd sentinel-video-receiver/sentinel_rtp_cam
+# Download the correct release tarball for your architecture
+# https://github.com/david-hajnal/sentinel-video-receiver/releases
 
-# Run install script
-sudo ./install.sh
+# Extract and install
+tar xzf sentinel_rtp_cam-<version>-<arch>.tar.gz
+sudo install -m 755 sentinel_rtp_cam /usr/local/bin/sentinel_rtp_cam
+sudo install -m 644 sentinel_rtp_cam.service /etc/systemd/system/sentinel_rtp_cam.service
+sudo systemctl daemon-reload
+sudo install -d -m 755 /etc/sentinel_rtp_cam
+sudo nano /etc/sentinel_rtp_cam/env
 ```
 
-The installer will:
-- ✓ Detect your architecture (armv7 or aarch64)
-- ✓ Download the appropriate prebuilt binary
-- ✓ Create system user and directories
-- ✓ Install systemd service
-- ✓ Create configuration template
+### Method 2: Build from Source (Not supported on Pi)
 
-### Method 2: Build from Source
-
-If prebuilt binaries are not available:
-
-```bash
-# Set build flag
-sudo BUILD_FROM_SOURCE=1 ./install.sh
-```
-
-**Note:** Building on Raspberry Pi 3 takes 15-30 minutes.
+We do **not** build on Raspberry Pi. If you need a new version, build it on GitHub
+(via workflows) and update the Pi using `update.sh`.
 
 ### Custom Version Installation
 
-```bash
-# Install specific version
-sudo SENTINEL_VERSION=1.2.3 ./install.sh
-
-# Use custom artifact URL
-sudo SENTINEL_BASE_URL=https://your-server.com/releases ./install.sh
-```
+Download the desired version from GitHub Releases and install the binary/service as above.
 
 ## Configuration
 
@@ -206,6 +198,16 @@ The update script will:
 - ✓ Restart service
 - ✓ Verify service health
 - ✓ Auto-rollback on failure
+
+### Service Management Helper
+
+Use `manage.sh` to start/stop/restart and view logs:
+
+```bash
+sudo ./manage.sh start
+sudo ./manage.sh restart
+sudo ./manage.sh logs
+```
 
 ### Update to Specific Version
 
@@ -452,7 +454,6 @@ For air-gapped or private deployments:
 export SENTINEL_BASE_URL=https://internal-releases.company.com/sentinel
 export SENTINEL_SHA256_URL=https://internal-releases.company.com/checksums
 
-sudo -E ./install.sh
 sudo -E ./update.sh
 ```
 

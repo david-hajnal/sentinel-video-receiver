@@ -1,5 +1,8 @@
 # How to Update Sentinel Agent on Raspberry Pi
 
+**Important:** We do **not** build on Raspberry Pi. Builds are produced on GitHub Actions and
+the Pi only downloads prebuilt releases.
+
 ## Option 1: Using the update.sh Script (Recommended)
 
 The easiest way to update:
@@ -23,35 +26,12 @@ The script will:
 - Restart the service
 - Verify it's running
 
-## Option 2: Manual Update from Source
+## Option 2: Update from a GitHub Build (Preferred for new versions)
 
-If you need the absolute latest code (including unreleased changes):
+If you need a new version, trigger the GitHub workflow to build a release, then update the Pi:
 
 ```bash
-# SSH into your Raspberry Pi
-ssh dietpi@agentsmith
-
-# Navigate to the repo
-cd ~/sentinel-video-receiver
-
-# Pull latest changes
-git pull
-
-# Rebuild the project
-cd sentinel_rtp_cam
-cargo build --release
-
-# Stop the service
-sudo systemctl stop sentinel_rtp_cam
-
-# Copy the new binary
-sudo cp target/release/app /usr/local/bin/sentinel_rtp_cam
-
-# Start the service
-sudo systemctl start sentinel_rtp_cam
-
-# Check status
-sudo systemctl status sentinel_rtp_cam
+sudo SENTINEL_VERSION=1.2.3 ./update.sh
 ```
 
 ## Option 3: Update Configuration Only
@@ -85,7 +65,7 @@ sudo journalctl -u sentinel_rtp_cam -f
 
 ## Using the Management Script
 
-After updating, you can use the new manage.sh script:
+After updating, use `manage.sh` to start/restart and follow logs:
 
 ```bash
 # Copy manage script to home directory (optional)
@@ -94,6 +74,7 @@ chmod +x ~/manage-sentinel.sh
 
 # Common commands
 ~/manage-sentinel.sh config      # Edit configuration
+~/manage-sentinel.sh start       # Start service
 ~/manage-sentinel.sh restart     # Restart service
 ~/manage-sentinel.sh logs        # Follow live logs
 ~/manage-sentinel.sh clips       # List clips
