@@ -1,4 +1,5 @@
 use anyhow::{anyhow, bail, Result};
+use base64::Engine;
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 use tokio::net::UdpSocket;
@@ -18,6 +19,8 @@ use sentinel_rtp_cam::rtsp::rtsp::RtspClient;
 struct CamConfig {
     name: String,
     rtsp_url: String,
+    rtsp_user: Option<String>,
+    rtsp_pass: Option<String>,
     stream_id: u32,
     transport: String,
     rtp_port: u16,
@@ -37,6 +40,10 @@ fn load_cameras() -> Result<Vec<CamConfig>> {
             Some(v) => v,
             None => continue,
         };
+        let user = env_string(&format!("{prefix}RTSP_USER"))
+            .or_else(|| env_string("RTSP_USER"));
+        let pass = env_string(&format!("{prefix}RTSP_PASS"))
+            .or_else(|| env_string("RTSP_PASS"));
         let stream_id: u32 = env_string(&format!("{prefix}STREAM_ID"))
             .ok_or_else(|| anyhow!("Missing {prefix}STREAM_ID"))?
             .parse()?;
@@ -52,6 +59,8 @@ fn load_cameras() -> Result<Vec<CamConfig>> {
         cams.push(CamConfig {
             name: format!("cam{}", i),
             rtsp_url: rtsp,
+            rtsp_user: user,
+            rtsp_pass: pass,
             stream_id,
             transport: transport.to_lowercase(),
             rtp_port,
@@ -63,6 +72,12 @@ fn load_cameras() -> Result<Vec<CamConfig>> {
         bail!("No cameras configured (CAM1_RTSP_URL...)");
     }
     Ok(cams)
+}
+
+fn basic_auth_value(user: &str, pass: &str) -> String {
+    let token = format!("{user}:{pass}");
+    let b64 = base64::engine::general_purpose::STANDARD.encode(token.as_bytes());
+    format!("Basic {b64}")
 }
 
 fn parse_rtsp_url(rtsp_url: &str) -> Result<(String, u16, String)> {
@@ -191,18 +206,30 @@ async fn run_camera(cam: CamConfig, uplink: Uplink, cancel: CancellationToken) -
 
     let mut c = RtspClient::connect(&host, port).await?;
 
-    let r = c.request("OPTIONS", &cam.rtsp_url, &[], None).await?;
+    let authz = match (&cam.rtsp_user, &cam.rtsp_pass) {
+        (Some(u), Some(p)) => Some(basic_auth_value(u, p)),
+        (Some(_), None) | (None, Some(_)) => {
+            warn!("RTSP_USER/RTSP_PASS mismatch; ignoring auth");
+            None
+        }
+        _ => None,
+    };
+    let mut common_headers = Vec::new();
+    if let Some(ref a) = authz {
+        common_headers.push(("Authorization", a.as_str()));
+    }
+
+    let r = c.request("OPTIONS", &cam.rtsp_url, &common_headers, None).await?;
     if r.status != 200 {
         bail!("OPTIONS failed: {}", r.status);
     }
     info!(stream_id = cam.stream_id, "RTSP OPTIONS ok");
+    let mut describe_headers = vec![("Accept", "application/sdp")];
+    if let Some(ref a) = authz {
+        describe_headers.push(("Authorization", a.as_str()));
+    }
     let r = c
-        .request(
-            "DESCRIBE",
-            &cam.rtsp_url,
-            &[("Accept", "application/sdp")],
-            None,
-        )
+        .request("DESCRIBE", &cam.rtsp_url, &describe_headers, None)
         .await?;
     if r.status != 200 {
         bail!("DESCRIBE failed: {}", r.status);
@@ -226,14 +253,22 @@ async fn run_camera(cam: CamConfig, uplink: Uplink, cancel: CancellationToken) -
             "RTP/AVP;unicast;client_port={}-{};mode=play",
             cam.rtp_port, cam.rtcp_port
         );
-        let r = c.request("SETUP", &setup_url, &[("Transport", &transport)], None).await?;
+        let mut setup_headers = vec![("Transport", transport.as_str())];
+        if let Some(ref a) = authz {
+            setup_headers.push(("Authorization", a.as_str()));
+        }
+        let r = c.request("SETUP", &setup_url, &setup_headers, None).await?;
         if r.status != 200 {
             bail!("SETUP failed: {}", r.status);
         }
         c.set_session_from(&r);
         info!(stream_id = cam.stream_id, "RTSP SETUP ok (UDP)");
 
-        let r = c.request("PLAY", &cam.rtsp_url, &[("Range", "npt=0.000-")], None).await?;
+        let mut play_headers = vec![("Range", "npt=0.000-")];
+        if let Some(ref a) = authz {
+            play_headers.push(("Authorization", a.as_str()));
+        }
+        let r = c.request("PLAY", &cam.rtsp_url, &play_headers, None).await?;
         if r.status != 200 {
             bail!("PLAY failed: {}", r.status);
         }
@@ -304,14 +339,22 @@ async fn run_camera(cam: CamConfig, uplink: Uplink, cancel: CancellationToken) -
         }
     } else {
         let transport = "RTP/AVP/TCP;unicast;interleaved=0-1;mode=play";
-        let r = c.request("SETUP", &setup_url, &[("Transport", transport)], None).await?;
+        let mut setup_headers = vec![("Transport", transport)];
+        if let Some(ref a) = authz {
+            setup_headers.push(("Authorization", a.as_str()));
+        }
+        let r = c.request("SETUP", &setup_url, &setup_headers, None).await?;
         if r.status != 200 {
             bail!("SETUP failed: {}", r.status);
         }
         c.set_session_from(&r);
         info!(stream_id = cam.stream_id, "RTSP SETUP ok (TCP interleaved)");
 
-        let r = c.request("PLAY", &cam.rtsp_url, &[("Range", "npt=0.000-")], None).await?;
+        let mut play_headers = vec![("Range", "npt=0.000-")];
+        if let Some(ref a) = authz {
+            play_headers.push(("Authorization", a.as_str()));
+        }
+        let r = c.request("PLAY", &cam.rtsp_url, &play_headers, None).await?;
         if r.status != 200 {
             bail!("PLAY failed: {}", r.status);
         }

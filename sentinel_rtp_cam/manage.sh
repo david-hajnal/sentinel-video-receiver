@@ -8,6 +8,8 @@ SERVICE_NAME_LEGACY="sentinel_rtp_cam"
 SERVICE_NAME_FORWARD="sentinel_rtp_cam_forward"
 CONFIG_FILE="/etc/sentinel_rtp_cam/env"
 CLIPS_DIR="/var/lib/sentinel_rtp_cam/clips"
+FORWARD_BIN="/usr/local/bin/${SERVICE_NAME_FORWARD}"
+FORWARD_SERVICE_FILE="/etc/systemd/system/${SERVICE_NAME_FORWARD}.service"
 
 # Colors
 RED='\033[0;31m'
@@ -40,6 +42,7 @@ show_usage() {
     echo "Mode selection:"
     echo "  - If no mode is passed, the script defaults to forward mode."
     echo "  - Set AGENT_MODE=forward|legacy in $CONFIG_FILE to pin the mode."
+    echo "  - If forward service is missing but ${FORWARD_BIN} exists, the script will create it."
 }
 
 check_root() {
@@ -52,6 +55,72 @@ check_root() {
 systemd_service_exists() {
     local service="$1"
     systemctl cat "${service}.service" >/dev/null 2>&1
+}
+
+forward_binary_exists() {
+    [[ -x "$FORWARD_BIN" ]]
+}
+
+ensure_forward_service() {
+    if systemd_service_exists "$SERVICE_NAME_FORWARD"; then
+        return 0
+    fi
+    if ! forward_binary_exists; then
+        return 1
+    fi
+
+    echo -e "${YELLOW}Forward service not installed; creating ${SERVICE_NAME_FORWARD}.service${NC}"
+    cat > "$FORWARD_SERVICE_FILE" <<EOF
+[Unit]
+Description=Sentinel RTP Camera Agent (forward)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=sentinel
+Group=sentinel
+WorkingDirectory=/var/lib/sentinel_rtp_cam
+
+# Security hardening
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/sentinel_rtp_cam
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictRealtime=true
+RestrictNamespaces=true
+LockPersonality=true
+
+# Resource limits
+LimitNOFILE=65536
+
+# Environment
+EnvironmentFile=/etc/sentinel_rtp_cam/env
+
+# Execution
+ExecStart=$FORWARD_BIN
+
+# Restart policy
+Restart=on-failure
+RestartSec=10
+StartLimitInterval=200
+StartLimitBurst=5
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=$SERVICE_NAME_FORWARD
+
+[Install]
+WantedBy=multi-user.target
+EOF
+    chmod 644 "$FORWARD_SERVICE_FILE"
+    systemctl daemon-reload
+    return 0
 }
 
 resolve_mode() {
@@ -81,6 +150,9 @@ resolve_service() {
     if [[ "$mode" == "forward" ]]; then
         ACTIVE_SERVICE="$SERVICE_NAME_FORWARD"
         ACTIVE_MODE="forward"
+        if ! systemd_service_exists "$ACTIVE_SERVICE"; then
+            ensure_forward_service || true
+        fi
         if ! systemd_service_exists "$ACTIVE_SERVICE"; then
             echo -e "${YELLOW}Forward service not installed; falling back to legacy (${SERVICE_NAME_LEGACY})${NC}"
             ACTIVE_SERVICE="$SERVICE_NAME_LEGACY"

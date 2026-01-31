@@ -76,7 +76,9 @@ SERVER_ADDR=cloud.example.com:9000
 AGENT_TOKEN=secret
 AGENT_ID=pi-cam-001
 
-CAM1_RTSP_URL=rtsp://user:pass@camera/stream1
+CAM1_RTSP_URL=rtsp://camera/stream1
+CAM1_RTSP_USER=user
+CAM1_RTSP_PASS=pass
 CAM1_STREAM_ID=1
 CAM1_TRANSPORT=tcp   # or udp
 CAM1_RTP_PORT=5004   # only for udp
