@@ -1,5 +1,6 @@
 use anyhow::{anyhow, bail, Result};
 use std::collections::HashMap;
+use std::time::{Duration, Instant};
 use tokio::net::UdpSocket;
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
@@ -89,7 +90,27 @@ async fn main() -> Result<()> {
     let token = env_string("AGENT_TOKEN").ok_or_else(|| anyhow!("Missing AGENT_TOKEN"))?;
     let agent_id = env_string("AGENT_ID").unwrap_or_else(|| "agent-1".to_string());
 
+    let token_prefix: String = token.chars().take(6).collect();
+    info!(
+        server = %server_addr,
+        agent_id = %agent_id,
+        token_prefix = %token_prefix,
+        "Agent configured"
+    );
+
     let cams = load_cameras()?;
+    info!(camera_count = cams.len(), "Loaded camera configs");
+    for cam in &cams {
+        info!(
+            camera_id = %cam.camera_id,
+            stream_id = cam.stream_id,
+            transport = %cam.transport,
+            rtp_port = cam.rtp_port,
+            rtcp_port = cam.rtcp_port,
+            "Camera configured"
+        );
+    }
+
     let mut stream_map = HashMap::new();
     let mut camera_to_stream = HashMap::new();
     for cam in &cams {
@@ -127,6 +148,14 @@ async fn main() -> Result<()> {
                 .copied()
                 .or_else(|| cam_map.values().next().copied())
                 .unwrap_or(1);
+            info!(
+                stream_id,
+                camera_id = %m.camera_id,
+                event_id = %m.event_id,
+                active = m.active,
+                rule = %m.rule,
+                "Forwarding motion event"
+            );
             uplink_motion.send_motion(
                 stream_id,
                 m.rule.clone(),
@@ -150,20 +179,23 @@ async fn main() -> Result<()> {
 }
 
 async fn run_camera(cam: CamConfig, uplink: Uplink, cancel: CancellationToken) -> Result<()> {
+    let (host, port, path) = parse_rtsp_url(&cam.rtsp_url)?;
     info!(
         stream_id = cam.stream_id,
         transport = %cam.transport,
-        url = %cam.rtsp_url,
+        host = %host,
+        port,
+        path = %path,
         "Starting camera forwarder"
     );
 
-    let (host, port, _path) = parse_rtsp_url(&cam.rtsp_url)?;
     let mut c = RtspClient::connect(&host, port).await?;
 
     let r = c.request("OPTIONS", &cam.rtsp_url, &[], None).await?;
     if r.status != 200 {
         bail!("OPTIONS failed: {}", r.status);
     }
+    info!(stream_id = cam.stream_id, "RTSP OPTIONS ok");
     let r = c
         .request(
             "DESCRIBE",
@@ -175,6 +207,7 @@ async fn run_camera(cam: CamConfig, uplink: Uplink, cancel: CancellationToken) -
     if r.status != 200 {
         bail!("DESCRIBE failed: {}", r.status);
     }
+    info!(stream_id = cam.stream_id, "RTSP DESCRIBE ok");
     let sdp = String::from_utf8_lossy(&r.body);
     let track = parse_sdp_video_track(&sdp)?;
 
@@ -198,27 +231,53 @@ async fn run_camera(cam: CamConfig, uplink: Uplink, cancel: CancellationToken) -
             bail!("SETUP failed: {}", r.status);
         }
         c.set_session_from(&r);
+        info!(stream_id = cam.stream_id, "RTSP SETUP ok (UDP)");
 
         let r = c.request("PLAY", &cam.rtsp_url, &[("Range", "npt=0.000-")], None).await?;
         if r.status != 200 {
             bail!("PLAY failed: {}", r.status);
         }
+        info!(stream_id = cam.stream_id, "RTSP PLAY ok");
 
         let sock = UdpSocket::bind(("0.0.0.0", cam.rtp_port)).await?;
+        info!(stream_id = cam.stream_id, port = cam.rtp_port, "UDP RTP socket bound");
         let mut buf = vec![0u8; 8192];
         let mut expected_seq: Option<u16> = None;
+        let mut total_pkts: u64 = 0;
+        let mut total_bytes: u64 = 0;
+        let mut last_log = Instant::now();
+        let mut last_pkts = 0u64;
+        let mut last_bytes = 0u64;
+        let mut first_logged = false;
+        let mut gap_count: u64 = 0;
 
         loop {
             tokio::select! {
                 _ = cancel.cancelled() => break,
                 r = sock.recv_from(&mut buf) => {
                     let (n, _) = r?;
+                    total_pkts += 1;
+                    total_bytes += n as u64;
                     let pkt = match RtpPacket::parse(&buf[..n]) {
                         Ok(p) => p,
                         Err(_) => { expected_seq = None; continue; }
                     };
+                    if !first_logged {
+                        info!(stream_id = cam.stream_id, seq = pkt.sequence_number, "First RTP packet received");
+                        first_logged = true;
+                    }
                     if let Some(exp) = expected_seq {
                         if pkt.sequence_number != exp {
+                            gap_count += 1;
+                            if gap_count <= 3 || gap_count % 100 == 0 {
+                                warn!(
+                                    stream_id = cam.stream_id,
+                                    expected = exp,
+                                    got = pkt.sequence_number,
+                                    gap_count,
+                                    "RTP sequence gap detected"
+                                );
+                            }
                             uplink.send_gap(cam.stream_id, exp.wrapping_sub(1), pkt.sequence_number);
                             expected_seq = Some(pkt.sequence_number.wrapping_add(1));
                             continue;
@@ -226,6 +285,20 @@ async fn run_camera(cam: CamConfig, uplink: Uplink, cancel: CancellationToken) -
                     }
                     expected_seq = Some(pkt.sequence_number.wrapping_add(1));
                     uplink.send_rtp(cam.stream_id, buf[..n].to_vec());
+
+                    if last_log.elapsed() >= Duration::from_secs(30) {
+                        info!(
+                            stream_id = cam.stream_id,
+                            pkts_total = total_pkts,
+                            pkts_delta = total_pkts.saturating_sub(last_pkts),
+                            bytes_total = total_bytes,
+                            bytes_delta = total_bytes.saturating_sub(last_bytes),
+                            "RTP receive stats"
+                        );
+                        last_log = Instant::now();
+                        last_pkts = total_pkts;
+                        last_bytes = total_bytes;
+                    }
                 }
             }
         }
@@ -236,18 +309,49 @@ async fn run_camera(cam: CamConfig, uplink: Uplink, cancel: CancellationToken) -
             bail!("SETUP failed: {}", r.status);
         }
         c.set_session_from(&r);
+        info!(stream_id = cam.stream_id, "RTSP SETUP ok (TCP interleaved)");
 
         let r = c.request("PLAY", &cam.rtsp_url, &[("Range", "npt=0.000-")], None).await?;
         if r.status != 200 {
             bail!("PLAY failed: {}", r.status);
         }
+        info!(stream_id = cam.stream_id, "RTSP PLAY ok");
+
+        let mut total_pkts: u64 = 0;
+        let mut total_bytes: u64 = 0;
+        let mut last_log = Instant::now();
+        let mut last_pkts = 0u64;
+        let mut last_bytes = 0u64;
+        let mut first_logged = false;
 
         loop {
             tokio::select! {
                 _ = cancel.cancelled() => break,
                 frame = read_interleaved_frame(&mut c, 0, 1) => {
                     match frame? {
-                        InterleavedFrame::Rtp(bytes) => uplink.send_rtp(cam.stream_id, bytes),
+                        InterleavedFrame::Rtp(bytes) => {
+                            total_pkts += 1;
+                            total_bytes += bytes.len() as u64;
+                            if !first_logged {
+                                info!(stream_id = cam.stream_id, "First RTP frame received (TCP)");
+                                first_logged = true;
+                            }
+                            uplink.send_rtp(cam.stream_id, bytes);
+
+                            if last_log.elapsed() >= Duration::from_secs(30) {
+                                info!(
+                                    stream_id = cam.stream_id,
+                                    pkts_total = total_pkts,
+                                    pkts_delta = total_pkts.saturating_sub(last_pkts),
+                                    bytes_total = total_bytes,
+                                    bytes_delta = total_bytes.saturating_sub(last_bytes),
+                                    "RTP receive stats"
+                                );
+                                last_log = Instant::now();
+                                last_pkts = total_pkts;
+                                last_bytes = total_bytes;
+                            }
+                        }
                         InterleavedFrame::Rtcp(_) => {}
                         InterleavedFrame::Unknown(_, _) => {}
                     }

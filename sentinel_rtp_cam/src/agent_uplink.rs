@@ -1,6 +1,10 @@
 use serde::Serialize;
 use std::collections::HashMap;
-use std::time::Duration;
+use std::sync::{
+    atomic::{AtomicU64, Ordering},
+    Arc,
+};
+use std::time::{Duration, Instant};
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 use tokio::time::{interval, sleep};
@@ -11,6 +15,7 @@ use crate::proto::{encode_gap, write_msg, Msg, GAP, HELLO, MOTION, PING, RTP};
 #[derive(Clone)]
 pub struct Uplink {
     tx: mpsc::Sender<Msg>,
+    stats: Arc<UplinkStats>,
 }
 
 #[derive(Debug, Serialize)]
@@ -26,6 +31,14 @@ struct HelloStream {
     name: String,
 }
 
+#[derive(Default)]
+struct UplinkStats {
+    rtp_sent: AtomicU64,
+    gap_sent: AtomicU64,
+    motion_sent: AtomicU64,
+    dropped: AtomicU64,
+}
+
 impl Uplink {
     pub fn connect_and_run(
         server_addr: String,
@@ -34,13 +47,20 @@ impl Uplink {
         stream_map: HashMap<u32, String>,
     ) -> Self {
         let (tx, mut rx) = mpsc::channel::<Msg>(4096);
+        let stats = Arc::new(UplinkStats::default());
 
+        let stats_task = stats.clone();
         tokio::spawn(async move {
             let mut backoff = Duration::from_secs(1);
             loop {
                 match TcpStream::connect(&server_addr).await {
                     Ok(mut stream) => {
-                        info!(server = %server_addr, "Uplink connected");
+                        info!(
+                            server = %server_addr,
+                            agent_id = %agent_id,
+                            stream_count = stream_map.len(),
+                            "Uplink connected"
+                        );
                         backoff = Duration::from_secs(1);
 
                         let hello = HelloPayload {
@@ -72,9 +92,15 @@ impl Uplink {
                             sleep(backoff).await;
                             continue;
                         }
+                        info!(stream_count = stream_map.len(), "Uplink HELLO sent");
 
                         let mut ping = interval(Duration::from_secs(10));
                         let mut sent: u64 = 0;
+                        let mut last_log = Instant::now();
+                        let mut last_rtp = 0u64;
+                        let mut last_gap = 0u64;
+                        let mut last_motion = 0u64;
+                        let mut last_dropped = 0u64;
                         loop {
                             tokio::select! {
                                 Some(msg) = rx.recv() => {
@@ -83,6 +109,12 @@ impl Uplink {
                                         break;
                                     }
                                     sent += 1;
+                                    match msg.msg_type {
+                                        RTP => { stats_task.rtp_sent.fetch_add(1, Ordering::Relaxed); }
+                                        GAP => { stats_task.gap_sent.fetch_add(1, Ordering::Relaxed); }
+                                        MOTION => { stats_task.motion_sent.fetch_add(1, Ordering::Relaxed); }
+                                        _ => {}
+                                    }
                                 }
                                 _ = ping.tick() => {
                                     let stats = serde_json::json!({
@@ -95,6 +127,31 @@ impl Uplink {
                                         break;
                                     }
                                     debug!(sent = sent, "Uplink ping");
+
+                                    if last_log.elapsed() >= Duration::from_secs(30) {
+                                        let rtp = stats_task.rtp_sent.load(Ordering::Relaxed);
+                                        let gap = stats_task.gap_sent.load(Ordering::Relaxed);
+                                        let motion = stats_task.motion_sent.load(Ordering::Relaxed);
+                                        let dropped = stats_task.dropped.load(Ordering::Relaxed);
+
+                                        info!(
+                                            rtp_total = rtp,
+                                            rtp_delta = rtp.saturating_sub(last_rtp),
+                                            gap_total = gap,
+                                            gap_delta = gap.saturating_sub(last_gap),
+                                            motion_total = motion,
+                                            motion_delta = motion.saturating_sub(last_motion),
+                                            dropped_total = dropped,
+                                            dropped_delta = dropped.saturating_sub(last_dropped),
+                                            "Uplink stats"
+                                        );
+
+                                        last_log = Instant::now();
+                                        last_rtp = rtp;
+                                        last_gap = gap;
+                                        last_motion = motion;
+                                        last_dropped = dropped;
+                                    }
                                 }
                                 else => break,
                             }
@@ -110,7 +167,7 @@ impl Uplink {
             }
         });
 
-        Self { tx }
+        Self { tx, stats }
     }
 
     pub fn send_rtp(&self, stream_id: u32, rtp_bytes: Vec<u8>) {
@@ -119,7 +176,17 @@ impl Uplink {
             stream_id,
             payload: rtp_bytes,
         };
-        let _ = self.tx.try_send(msg);
+        if let Err(e) = self.tx.try_send(msg) {
+            let dropped = self.stats.dropped.fetch_add(1, Ordering::Relaxed) + 1;
+            if dropped <= 3 || dropped % 100 == 0 {
+                warn!(
+                    stream_id,
+                    dropped_total = dropped,
+                    error = %e,
+                    "Uplink channel full; dropping RTP"
+                );
+            }
+        }
     }
 
     pub fn send_gap(&self, stream_id: u32, last_seq: u16, new_seq: u16) {
@@ -128,7 +195,17 @@ impl Uplink {
             stream_id,
             payload: encode_gap(last_seq, new_seq),
         };
-        let _ = self.tx.try_send(msg);
+        if let Err(e) = self.tx.try_send(msg) {
+            let dropped = self.stats.dropped.fetch_add(1, Ordering::Relaxed) + 1;
+            if dropped <= 3 || dropped % 100 == 0 {
+                warn!(
+                    stream_id,
+                    dropped_total = dropped,
+                    error = %e,
+                    "Uplink channel full; dropping GAP"
+                );
+            }
+        }
     }
 
     pub fn send_motion(
@@ -152,6 +229,16 @@ impl Uplink {
             stream_id,
             payload: serde_json::to_vec(&payload).unwrap_or_default(),
         };
-        let _ = self.tx.try_send(msg);
+        if let Err(e) = self.tx.try_send(msg) {
+            let dropped = self.stats.dropped.fetch_add(1, Ordering::Relaxed) + 1;
+            if dropped <= 3 || dropped % 20 == 0 {
+                warn!(
+                    stream_id,
+                    dropped_total = dropped,
+                    error = %e,
+                    "Uplink channel full; dropping MOTION"
+                );
+            }
+        }
     }
 }
