@@ -2,6 +2,7 @@ use std::collections::HashMap;
 
 use crate::event::MotionEvent;
 use chrono::{DateTime, Duration, Utc};
+use tracing::debug;
 
 #[derive(Default)]
 pub struct MotionEventIdLatch {
@@ -42,19 +43,44 @@ impl MotionEventIdLatch {
         let key = (event.camera_id.clone(), event.rule.clone());
         if event.active {
             if let Some(existing) = self.active.get(&key) {
+                debug!(
+                    camera_id = %event.camera_id,
+                    rule = %event.rule,
+                    event_id = %existing,
+                    "Motion start normalized to latched event_id"
+                );
                 event.event_id = existing.clone();
             } else {
                 if let Some(ended) = self.ended.get(&key) {
                     let delta = event.ts.signed_duration_since(ended.ended_at);
                     if delta >= Duration::zero() && delta <= self.grace_window {
+                        debug!(
+                            camera_id = %event.camera_id,
+                            rule = %event.rule,
+                            event_id = %ended.event_id,
+                            delta_secs = delta.num_seconds(),
+                            "Motion start reused event_id within grace window"
+                        );
                         event.event_id = ended.event_id.clone();
                     }
                 }
                 self.ended.remove(&key);
+                debug!(
+                    camera_id = %event.camera_id,
+                    rule = %event.rule,
+                    event_id = %event.event_id,
+                    "Motion start latched new event_id"
+                );
                 self.active.insert(key, event.event_id.clone());
             }
         } else {
             if let Some(existing) = self.active.remove(&key) {
+                debug!(
+                    camera_id = %event.camera_id,
+                    rule = %event.rule,
+                    event_id = %existing,
+                    "Motion end normalized to latched event_id"
+                );
                 event.event_id = existing;
             }
             self.ended.insert(

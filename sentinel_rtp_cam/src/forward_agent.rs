@@ -24,6 +24,7 @@ fn env_string(key: &str) -> Option<String> {
 }
 
 pub fn load_cameras_from_env() -> Result<Vec<CamConfig>> {
+    let default_camera_id = env_string("CAMERA_ID");
     let mut cams = Vec::new();
     for i in 1..=4 {
         let prefix = format!("CAM{}_", i);
@@ -45,7 +46,15 @@ pub fn load_cameras_from_env() -> Result<Vec<CamConfig>> {
         let rtcp_port: u16 = env_string(&format!("{prefix}RTCP_PORT"))
             .and_then(|v| v.parse().ok())
             .unwrap_or(rtp_port + 1);
-        let camera_id = env_string(&format!("{prefix}CAMERA_ID")).unwrap_or_else(|| format!("cam-{}", i));
+        let camera_id = env_string(&format!("{prefix}CAMERA_ID"))
+            .or_else(|| {
+                if i == 1 {
+                    default_camera_id.clone()
+                } else {
+                    None
+                }
+            })
+            .unwrap_or_else(|| format!("cam-{}", i));
 
         cams.push(CamConfig {
             name: format!("cam{}", i),

@@ -112,6 +112,21 @@ fn load_cameras_from_env_uses_per_camera_override() {
 }
 
 #[test]
+fn load_cameras_from_env_falls_back_to_global_camera_id() {
+    // Scenario: when CAM1_CAMERA_ID is missing, CAMERA_ID should be used for the first camera.
+    let _guard = EnvGuard::new(&[
+        ("CAM1_RTSP_URL", "rtsp://example.com/stream"),
+        ("CAM1_STREAM_ID", "7"),
+        ("CAM1_TRANSPORT", "tcp"),
+        ("CAMERA_ID", "cam-global"),
+    ]);
+
+    let cams = load_cameras_from_env().unwrap();
+    assert_eq!(cams.len(), 1);
+    assert_eq!(cams[0].camera_id, "cam-global");
+}
+
+#[test]
 fn build_stream_maps_sets_camera_mapping() {
     // Scenario: camera_id and stream_id should map in both directions.
     let cams = vec![

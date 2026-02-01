@@ -463,8 +463,9 @@ pub async fn run_onvif_motion_poller(bus: EventBus, motion_state: MotionStateBus
     // Track event_id per rule (ULID generated on motion start, reused for motion end)
     let mut event_ids: HashMap<String, String> = HashMap::new();
 
-    // Get camera_id from environment (fallback to ONVIF_HOST)
+    // Get camera_id from environment (fallback to CAM1_CAMERA_ID, then ONVIF_HOST)
     let camera_id = std::env::var("CAMERA_ID")
+        .or_else(|_| std::env::var("CAM1_CAMERA_ID"))
         .or_else(|_| std::env::var("ONVIF_HOST"))
         .unwrap_or_else(|_| "unknown-camera".to_string());
 
