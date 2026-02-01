@@ -1,91 +1,20 @@
 use anyhow::{anyhow, bail, Result};
-use base64::Engine;
-use std::collections::HashMap;
 use std::time::{Duration, Instant};
 use tokio::net::UdpSocket;
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
-use url::Url;
 
 use sentinel_rtp_cam::agent_uplink::Uplink;
 use sentinel_rtp_cam::core::rtp::RtpPacket;
 use sentinel_rtp_cam::core::sdp::parse_sdp_video_track;
 use sentinel_rtp_cam::event::{Event, EventBus, MotionStateBus};
+use sentinel_rtp_cam::forward_agent::{
+    basic_auth_value, build_stream_maps, forward_motion_event, load_cameras_from_env,
+    parse_rtsp_url, CamConfig, MotionEventIdLatch,
+};
 use sentinel_rtp_cam::onvif::run_onvif_motion_poller;
 use sentinel_rtp_cam::rtsp::interleaved::{read_interleaved_frame, InterleavedFrame};
 use sentinel_rtp_cam::rtsp::rtsp::RtspClient;
-
-#[derive(Debug, Clone)]
-struct CamConfig {
-    name: String,
-    rtsp_url: String,
-    rtsp_user: Option<String>,
-    rtsp_pass: Option<String>,
-    stream_id: u32,
-    transport: String,
-    rtp_port: u16,
-    rtcp_port: u16,
-    camera_id: String,
-}
-
-fn env_string(key: &str) -> Option<String> {
-    std::env::var(key).ok()
-}
-
-fn load_cameras() -> Result<Vec<CamConfig>> {
-    let mut cams = Vec::new();
-    for i in 1..=4 {
-        let prefix = format!("CAM{}_", i);
-        let rtsp = match env_string(&format!("{prefix}RTSP_URL")) {
-            Some(v) => v,
-            None => continue,
-        };
-        let user = env_string(&format!("{prefix}RTSP_USER"))
-            .or_else(|| env_string("RTSP_USER"));
-        let pass = env_string(&format!("{prefix}RTSP_PASS"))
-            .or_else(|| env_string("RTSP_PASS"));
-        let stream_id: u32 = env_string(&format!("{prefix}STREAM_ID"))
-            .ok_or_else(|| anyhow!("Missing {prefix}STREAM_ID"))?
-            .parse()?;
-        let transport = env_string(&format!("{prefix}TRANSPORT")).unwrap_or_else(|| "tcp".to_string());
-        let rtp_port: u16 = env_string(&format!("{prefix}RTP_PORT"))
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(5004 + (i as u16 - 1) * 2);
-        let rtcp_port: u16 = env_string(&format!("{prefix}RTCP_PORT"))
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(rtp_port + 1);
-        let camera_id = env_string(&format!("{prefix}CAMERA_ID")).unwrap_or_else(|| format!("cam-{}", i));
-
-        cams.push(CamConfig {
-            name: format!("cam{}", i),
-            rtsp_url: rtsp,
-            rtsp_user: user,
-            rtsp_pass: pass,
-            stream_id,
-            transport: transport.to_lowercase(),
-            rtp_port,
-            rtcp_port,
-            camera_id,
-        });
-    }
-    if cams.is_empty() {
-        bail!("No cameras configured (CAM1_RTSP_URL...)");
-    }
-    Ok(cams)
-}
-
-fn basic_auth_value(user: &str, pass: &str) -> String {
-    let token = format!("{user}:{pass}");
-    let b64 = base64::engine::general_purpose::STANDARD.encode(token.as_bytes());
-    format!("Basic {b64}")
-}
-
-fn parse_rtsp_url(rtsp_url: &str) -> Result<(String, u16, String)> {
-    let url = Url::parse(rtsp_url)?;
-    let host = url.host_str().ok_or_else(|| anyhow!("RTSP URL missing host"))?;
-    let port = url.port().unwrap_or(554);
-    Ok((host.to_string(), port, url.path().to_string()))
-}
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -101,9 +30,9 @@ async fn main() -> Result<()> {
     }
 
     let server_addr =
-        env_string("SERVER_ADDR").ok_or_else(|| anyhow!("Missing SERVER_ADDR"))?;
-    let token = env_string("AGENT_TOKEN").ok_or_else(|| anyhow!("Missing AGENT_TOKEN"))?;
-    let agent_id = env_string("AGENT_ID").unwrap_or_else(|| "agent-1".to_string());
+        std::env::var("SERVER_ADDR").map_err(|_| anyhow!("Missing SERVER_ADDR"))?;
+    let token = std::env::var("AGENT_TOKEN").map_err(|_| anyhow!("Missing AGENT_TOKEN"))?;
+    let agent_id = std::env::var("AGENT_ID").unwrap_or_else(|_| "agent-1".to_string());
 
     let token_prefix: String = token.chars().take(6).collect();
     info!(
@@ -113,7 +42,7 @@ async fn main() -> Result<()> {
         "Agent configured"
     );
 
-    let cams = load_cameras()?;
+    let cams = load_cameras_from_env()?;
     info!(camera_count = cams.len(), "Loaded camera configs");
     for cam in &cams {
         info!(
@@ -126,12 +55,7 @@ async fn main() -> Result<()> {
         );
     }
 
-    let mut stream_map = HashMap::new();
-    let mut camera_to_stream = HashMap::new();
-    for cam in &cams {
-        stream_map.insert(cam.stream_id, cam.name.clone());
-        camera_to_stream.insert(cam.camera_id.clone(), cam.stream_id);
-    }
+    let (stream_map, camera_to_stream) = build_stream_maps(&cams);
 
     let uplink = Uplink::connect_and_run(server_addr, token, agent_id, stream_map);
 
@@ -153,32 +77,26 @@ async fn main() -> Result<()> {
 
     let uplink_motion = uplink.clone();
     let cam_map = camera_to_stream.clone();
+    let motion_merge_secs = std::env::var("MOTION_MERGE_SECS")
+        .ok()
+        .and_then(|v| v.parse::<i64>().ok())
+        .or_else(|| {
+            std::env::var("CLIP_POST_SECS")
+                .ok()
+                .and_then(|v| v.parse::<i64>().ok())
+        })
+        .unwrap_or(0)
+        .max(0);
+    let motion_merge_window = chrono::Duration::seconds(motion_merge_secs);
     let bus_sub = bus.clone();
     tokio::spawn(async move {
         let mut rx = bus_sub.subscribe().await;
+        let mut latch = MotionEventIdLatch::new_with_grace(motion_merge_window);
         while let Some(ev) = rx.recv().await {
-            let Event::Motion(m) = ev;
-            let stream_id = cam_map
-                .get(&m.camera_id)
-                .copied()
-                .or_else(|| cam_map.values().next().copied())
-                .unwrap_or(1);
-            info!(
-                stream_id,
-                camera_id = %m.camera_id,
-                event_id = %m.event_id,
-                active = m.active,
-                rule = %m.rule,
-                "Forwarding motion event"
-            );
-            uplink_motion.send_motion(
-                stream_id,
-                m.rule.clone(),
-                m.active,
-                m.ts.to_rfc3339(),
-                m.camera_id.clone(),
-                m.event_id.clone(),
-            );
+            let Event::Motion(motion_event) = ev;
+            let motion_event = latch.normalize(motion_event);
+            let stream_id = forward_motion_event(&uplink_motion, &cam_map, &motion_event);
+            info!(stream_id, motion_event = %motion_event, "Forwarding motion event");
         }
     });
 

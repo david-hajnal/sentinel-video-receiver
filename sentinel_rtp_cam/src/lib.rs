@@ -67,6 +67,10 @@ pub mod server;
 // Utilities
 pub mod utils;
 
+// Forward agent helpers
+pub mod forward_agent;
+pub mod motion_event_latch;
+
 // ============================================================================
 // Public API Re-exports
 // ============================================================================

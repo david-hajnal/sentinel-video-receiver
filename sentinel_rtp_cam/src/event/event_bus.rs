@@ -1,4 +1,5 @@
 use chrono::{DateTime, Utc};
+use std::fmt;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::Mutex;
@@ -16,6 +17,20 @@ pub struct MotionEvent {
     pub ts: DateTime<Utc>,
     pub camera_id: String,
     pub event_id: String, // ULID generated on motion start, reused for motion end
+}
+
+impl fmt::Display for MotionEvent {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "camera_id={} rule={} event_id={} active={} ts={}",
+            self.camera_id,
+            self.rule,
+            self.event_id,
+            self.active,
+            self.ts.to_rfc3339()
+        )
+    }
 }
 
 #[derive(Clone)]
