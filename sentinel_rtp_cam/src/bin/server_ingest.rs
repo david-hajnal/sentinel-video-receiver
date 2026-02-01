@@ -10,6 +10,7 @@ use tracing::{info, warn};
 
 use sentinel_rtp_cam::proto::{decode_gap, read_msg, Msg, GAP, HELLO, MOTION, RTP};
 use sentinel_rtp_cam::server_pipeline::{run_stream, StreamConfig, StreamMsg};
+use sentinel_rtp_cam::AgentConfig;
 
 #[derive(Debug, Deserialize)]
 struct HelloPayload {
@@ -26,12 +27,32 @@ struct HelloStream {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    let config_path = std::env::var("AGENT_CONFIG_JSON")
+        .or_else(|_| std::env::var("CONFIG_JSON_PATH"))
+        .unwrap_or_else(|_| "/etc/sentinel_rtp_cam/config.json".to_string());
+    let config_path = std::path::PathBuf::from(config_path);
+    let mut config_error: Option<String> = None;
+    match AgentConfig::load_json_value(&config_path) {
+        Ok(value) => AgentConfig::apply_json_env_overrides(&value),
+        Err(e) => {
+            config_error = Some(e.to_string());
+        }
+    }
+
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
         )
         .init();
+
+    if let Some(error) = config_error {
+        warn!(
+            error = %error,
+            path = %config_path.display(),
+            "Failed to load config JSON, using defaults"
+        );
+    }
 
     let bind = std::env::var("SERVER_BIND").unwrap_or_else(|_| "0.0.0.0:9000".to_string());
     let token = std::env::var("SERVER_TOKEN").unwrap_or_else(|_| "devtoken".to_string());

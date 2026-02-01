@@ -52,6 +52,27 @@ fn env_bool(name: &str, default: bool) -> bool {
 
 #[tokio::main(flavor = "multi_thread", worker_threads = 2)]
 async fn main() -> Result<()> {
+    // .env support
+    if dotenvy::dotenv().is_err() {
+        dotenvy::from_filename("../.env").ok();
+    }
+
+    let config_path = std::env::var("AGENT_CONFIG_JSON")
+        .or_else(|_| std::env::var("CONFIG_JSON_PATH"))
+        .unwrap_or_else(|_| "/etc/sentinel_rtp_cam/config.json".to_string());
+    let config_path = std::path::PathBuf::from(config_path);
+
+    // Load JSON config and apply env overrides before reading env-based settings.
+    let mut config_error: Option<String> = None;
+    let config_value = match AgentConfig::load_json_value(&config_path) {
+        Ok(value) => value,
+        Err(e) => {
+            config_error = Some(e.to_string());
+            serde_json::Value::Object(Default::default())
+        }
+    };
+    AgentConfig::apply_json_env_overrides(&config_value);
+
     // Initialize tracing subscriber
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -63,9 +84,12 @@ async fn main() -> Result<()> {
         .with_line_number(true)
         .init();
 
-    // .env support
-    if dotenvy::dotenv().is_err() {
-        dotenvy::from_filename("../.env").ok();
+    if let Some(error) = config_error {
+        warn!(
+            error = %error,
+            path = %config_path.display(),
+            "Failed to load config JSON, using defaults"
+        );
     }
 
     let onvif_only = arg_flag("--onvif-only");
@@ -73,9 +97,10 @@ async fn main() -> Result<()> {
     let rtsp_receiver_enabled =
         !onvif_only && local_clip_enabled && env_bool("RTSP_RECEIVER_ENABLED", true);
 
-    // Load agent configuration
-    let agent_config = AgentConfig::from_env();
+    // Build agent configuration from JSON
+    let agent_config = AgentConfig::from_json_value(config_value.clone());
     info!(
+        config_path = %config_path.display(),
         camera_id = %agent_config.camera_id,
         motion_enabled = agent_config.motion.enabled,
         server_enabled = agent_config.server.enabled,
@@ -198,6 +223,7 @@ async fn main() -> Result<()> {
         // SSE config listener
         let camera_id_clone = agent_config.camera_id.clone();
         let server_cfg_clone = server_cfg.clone();
+        let config_path = config_path.clone();
         tokio::spawn(async move {
             match run_sse_config_listener(server_cfg_clone, camera_id_clone).await {
                 Ok(mut config_rx) => {
@@ -209,6 +235,18 @@ async fn main() -> Result<()> {
                             config = %serde_json::to_string(&new_config).unwrap_or_default(),
                             "Received config update from server"
                         );
+                        if let Err(e) = AgentConfig::merge_json_file(&config_path, &new_config) {
+                            error!(
+                                error = %e,
+                                path = %config_path.display(),
+                                "Failed to persist config update"
+                            );
+                        } else {
+                            info!(
+                                path = %config_path.display(),
+                                "Persisted config update to JSON"
+                            );
+                        }
                     }
                 }
                 Err(e) => {

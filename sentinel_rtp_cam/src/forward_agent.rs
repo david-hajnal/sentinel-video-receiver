@@ -17,6 +17,8 @@ pub struct CamConfig {
     pub rtp_port: u16,
     pub rtcp_port: u16,
     pub camera_id: String,
+    pub agent_id: String,
+    pub agent_token: String,
 }
 
 fn env_string(key: &str) -> Option<String> {
@@ -55,6 +57,10 @@ pub fn load_cameras_from_env() -> Result<Vec<CamConfig>> {
                 }
             })
             .unwrap_or_else(|| format!("cam-{}", i));
+        let agent_id = env_string(&format!("{prefix}AGENT_ID")).unwrap_or_else(|| camera_id.clone());
+        let agent_token = env_string(&format!("{prefix}AGENT_TOKEN"))
+            .or_else(|| env_string("AGENT_TOKEN"))
+            .ok_or_else(|| anyhow!("Missing {prefix}AGENT_TOKEN"))?;
 
         cams.push(CamConfig {
             name: format!("cam{}", i),
@@ -66,6 +72,8 @@ pub fn load_cameras_from_env() -> Result<Vec<CamConfig>> {
             rtp_port,
             rtcp_port,
             camera_id,
+            agent_id,
+            agent_token,
         });
     }
     if cams.is_empty() {

@@ -54,6 +54,25 @@ fn env_string(key: &str, default: &str) -> String {
     std::env::var(key).unwrap_or_else(|_| default.to_string())
 }
 
+#[derive(Clone)]
+struct OnvifSettings {
+    sub_termination: String,
+    renew_every_secs: u64,
+    pull_timeout: String,
+    pull_limit: u32,
+    resub_after: u32,
+    min_poll_gap: Duration,
+}
+
+#[derive(Clone)]
+struct OnvifCameraConfig {
+    camera_id: String,
+    host: String,
+    port: u16,
+    user: String,
+    pass: String,
+}
+
 fn debug_enabled() -> bool {
     env_bool("ONVIF_DEBUG")
 }
@@ -413,35 +432,111 @@ async fn renew_subscription(
 
 // ---------- Public entrypoint used by app.rs ----------
 pub async fn run_onvif_motion_poller(bus: EventBus, motion_state: MotionStateBus) -> Result<()> {
+    let cameras = load_onvif_cameras_from_env()?;
+    let settings = OnvifSettings {
+        sub_termination: env_string("ONVIF_SUB_TERMINATION", DEFAULT_SUB_TERMINATION),
+        renew_every_secs: env_u64("ONVIF_RENEW_EVERY_SECS", DEFAULT_RENEW_EVERY_SECS),
+        pull_timeout: env_string("ONVIF_PULL_TIMEOUT", DEFAULT_PULL_TIMEOUT),
+        pull_limit: env_u32("ONVIF_PULL_LIMIT", DEFAULT_PULL_LIMIT),
+        resub_after: env_u32(
+            "ONVIF_RESUBSCRIBE_AFTER_ERRORS",
+            DEFAULT_RESUBSCRIBE_AFTER_ERRORS,
+        ),
+        min_poll_gap: Duration::from_millis(env_u64("ONVIF_MIN_POLL_GAP_MS", DEFAULT_MIN_POLL_GAP_MS)),
+    };
+
+    let mut handles = Vec::new();
+    for cam in cameras {
+        let bus = bus.clone();
+        let motion_state = motion_state.clone();
+        let settings = settings.clone();
+        handles.push(tokio::spawn(async move {
+            run_onvif_motion_poller_for_camera(bus, motion_state, cam, settings).await
+        }));
+    }
+
+    for handle in handles {
+        match handle.await {
+            Ok(Ok(_)) => {}
+            Ok(Err(e)) => {
+                warn!(error = %e, "ONVIF motion poller ended");
+            }
+            Err(e) => {
+                warn!(error = %e, "ONVIF motion poller task join failed");
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn load_onvif_cameras_from_env() -> Result<Vec<OnvifCameraConfig>> {
+    let mut cams = Vec::new();
+    for i in 1..=4 {
+        let prefix = format!("CAM{}_ONVIF_", i);
+        let host = match std::env::var(format!("{prefix}HOST")) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        let port: u16 = std::env::var(format!("{prefix}PORT"))
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(2020);
+        let user = std::env::var(format!("{prefix}USER"))
+            .map_err(|_| anyhow!("Missing CAM{}_ONVIF_USER", i))?;
+        let pass = std::env::var(format!("{prefix}PASS"))
+            .map_err(|_| anyhow!("Missing CAM{}_ONVIF_PASS", i))?;
+        let camera_id = std::env::var(format!("CAM{}_CAMERA_ID", i))
+            .unwrap_or_else(|_| format!("cam-{}", i));
+        cams.push(OnvifCameraConfig {
+            camera_id,
+            host,
+            port,
+            user,
+            pass,
+        });
+    }
+
+    if !cams.is_empty() {
+        return Ok(cams);
+    }
+
     let host = env_string("ONVIF_HOST", "192.168.1.187");
     let port: u16 = std::env::var("ONVIF_PORT")
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(2020);
-
     let user = std::env::var("ONVIF_USER").map_err(|_| anyhow!("Missing ONVIF_USER"))?;
     let pass = std::env::var("ONVIF_PASS").map_err(|_| anyhow!("Missing ONVIF_PASS"))?;
+    let camera_id = std::env::var("CAMERA_ID")
+        .or_else(|_| std::env::var("CAM1_CAMERA_ID"))
+        .or_else(|_| std::env::var("ONVIF_HOST"))
+        .unwrap_or_else(|_| "unknown-camera".to_string());
+    Ok(vec![OnvifCameraConfig {
+        camera_id,
+        host,
+        port,
+        user,
+        pass,
+    }])
+}
 
-    let sub_termination = env_string("ONVIF_SUB_TERMINATION", DEFAULT_SUB_TERMINATION);
-    let renew_every_secs = env_u64("ONVIF_RENEW_EVERY_SECS", DEFAULT_RENEW_EVERY_SECS);
-    let pull_timeout = env_string("ONVIF_PULL_TIMEOUT", DEFAULT_PULL_TIMEOUT);
-    let pull_limit = env_u32("ONVIF_PULL_LIMIT", DEFAULT_PULL_LIMIT);
-    let resub_after = env_u32(
-        "ONVIF_RESUBSCRIBE_AFTER_ERRORS",
-        DEFAULT_RESUBSCRIBE_AFTER_ERRORS,
-    );
-    let min_poll_gap =
-        Duration::from_millis(env_u64("ONVIF_MIN_POLL_GAP_MS", DEFAULT_MIN_POLL_GAP_MS));
-
-    let onvif_service = format!("http://{}:{}/onvif/service", host, port);
+async fn run_onvif_motion_poller_for_camera(
+    bus: EventBus,
+    motion_state: MotionStateBus,
+    cam: OnvifCameraConfig,
+    settings: OnvifSettings,
+) -> Result<()> {
+    let onvif_service = format!("http://{}:{}/onvif/service", cam.host, cam.port);
 
     info!(
         service = %onvif_service,
+        camera_id = %cam.camera_id,
         debug = debug_enabled(),
         dump = dump_enabled(),
-        min_poll_gap_ms = min_poll_gap.as_millis(),
-        pull_timeout = %pull_timeout,
-        pull_limit = pull_limit,
+        min_poll_gap_ms = settings.min_poll_gap.as_millis(),
+        pull_timeout = %settings.pull_timeout,
+        pull_limit = settings.pull_limit,
         "ONVIF motion poller starting"
     );
 
@@ -463,23 +558,24 @@ pub async fn run_onvif_motion_poller(bus: EventBus, motion_state: MotionStateBus
     // Track event_id per rule (ULID generated on motion start, reused for motion end)
     let mut event_ids: HashMap<String, String> = HashMap::new();
 
-    // Get camera_id from environment (fallback to CAM1_CAMERA_ID, then ONVIF_HOST)
-    let camera_id = std::env::var("CAMERA_ID")
-        .or_else(|_| std::env::var("CAM1_CAMERA_ID"))
-        .or_else(|_| std::env::var("ONVIF_HOST"))
-        .unwrap_or_else(|_| "unknown-camera".to_string());
-
     // Create subscription
-    let (mut sub_addr, mut sub_id) =
-        create_subscription(&client, &onvif_service, &user, &pass, &sub_termination).await?;
+    let (mut sub_addr, mut sub_id) = create_subscription(
+        &client,
+        &onvif_service,
+        &cam.user,
+        &cam.pass,
+        &settings.sub_termination,
+    )
+    .await?;
 
     info!(
         address = %sub_addr,
         subscription_id = ?sub_id,
+        camera_id = %cam.camera_id,
         "PullPoint subscription created, starting event polling"
     );
 
-    let mut renew_tick = interval(Duration::from_secs(renew_every_secs));
+    let mut renew_tick = interval(Duration::from_secs(settings.renew_every_secs));
     let mut consecutive_errors: u32 = 0;
 
     let mut last_pull_done: Option<Instant> = None;
@@ -488,12 +584,13 @@ pub async fn run_onvif_motion_poller(bus: EventBus, motion_state: MotionStateBus
     loop {
         tokio::select! {
             _ = renew_tick.tick() => {
-                if let Err(e) = renew_subscription(&client, &sub_addr, &sub_id, &user, &pass, &sub_termination).await {
-                    warn!(error = %e, "Subscription renewal failed, recreating PullPoint");
-                    (sub_addr, sub_id) = create_subscription(&client, &onvif_service, &user, &pass, &sub_termination).await?;
+                if let Err(e) = renew_subscription(&client, &sub_addr, &sub_id, &cam.user, &cam.pass, &settings.sub_termination).await {
+                    warn!(error = %e, camera_id = %cam.camera_id, "Subscription renewal failed, recreating PullPoint");
+                    (sub_addr, sub_id) = create_subscription(&client, &onvif_service, &cam.user, &cam.pass, &settings.sub_termination).await?;
                     info!(
                         address = %sub_addr,
                         subscription_id = ?sub_id,
+                        camera_id = %cam.camera_id,
                         "PullPoint subscription recreated"
                     );
                     consecutive_errors = 0;
@@ -507,15 +604,15 @@ pub async fn run_onvif_motion_poller(bus: EventBus, motion_state: MotionStateBus
                 // Min gap between polls to avoid hammering the camera when responses return fast (motion storms).
                 if let Some(t) = last_pull_done {
                     let elapsed = t.elapsed();
-                    if elapsed < min_poll_gap {
-                        sleep(min_poll_gap - elapsed).await;
+                    if elapsed < settings.min_poll_gap {
+                        sleep(settings.min_poll_gap - elapsed).await;
                     }
                 }
 
                 pull_attempt += 1;
 
-                let sec = wsse_header(&user, &pass);
-                let body = pull_messages_body(&pull_timeout, pull_limit);
+                let sec = wsse_header(&cam.user, &cam.pass);
+                let body = pull_messages_body(&settings.pull_timeout, settings.pull_limit);
                 let extra_hdr = subscription_id_header(&sub_id);
                 let req_xml = soap_envelope(&sub_addr, ACTION_PULLMESSAGES_REQ, &sec, &body, &extra_hdr);
 
@@ -549,7 +646,7 @@ pub async fn run_onvif_motion_poller(bus: EventBus, motion_state: MotionStateBus
                             // Update motion state (for recorder) with metadata
                             let metadata = if is_motion {
                                 Some(crate::event::MotionMetadata {
-                                    camera_id: camera_id.clone(),
+                                    camera_id: cam.camera_id.clone(),
                                     event_id: event_id.clone(),
                                 })
                             } else {
@@ -562,7 +659,7 @@ pub async fn run_onvif_motion_poller(bus: EventBus, motion_state: MotionStateBus
                                 rule,
                                 active: is_motion,
                                 ts: Utc::now(),
-                                camera_id: camera_id.clone(),
+                                camera_id: cam.camera_id.clone(),
                                 event_id,
                             };
                             bus.publish(Event::Motion(ev)).await;
@@ -587,16 +684,24 @@ pub async fn run_onvif_motion_poller(bus: EventBus, motion_state: MotionStateBus
                         warn!(
                             error = %e,
                             consecutive = consecutive_errors,
-                            threshold = resub_after,
+                            threshold = settings.resub_after,
                             "PullMessages error"
                         );
 
-                        if is_connectish || consecutive_errors >= resub_after {
+                        if is_connectish || consecutive_errors >= settings.resub_after {
                             warn!("Subscription endpoint dropped, recreating PullPoint");
-                            (sub_addr, sub_id) = create_subscription(&client, &onvif_service, &user, &pass, &sub_termination).await?;
+                            (sub_addr, sub_id) = create_subscription(
+                                &client,
+                                &onvif_service,
+                                &cam.user,
+                                &cam.pass,
+                                &settings.sub_termination,
+                            )
+                            .await?;
                             info!(
                                 address = %sub_addr,
                                 subscription_id = ?sub_id,
+                                camera_id = %cam.camera_id,
                                 "PullPoint subscription recreated"
                             );
                             consecutive_errors = 0;

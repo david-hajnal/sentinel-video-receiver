@@ -15,9 +15,26 @@ use sentinel_rtp_cam::forward_agent::{
 use sentinel_rtp_cam::onvif::run_onvif_motion_poller;
 use sentinel_rtp_cam::rtsp::interleaved::{read_interleaved_frame, InterleavedFrame};
 use sentinel_rtp_cam::rtsp::rtsp::RtspClient;
+use sentinel_rtp_cam::AgentConfig;
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    if dotenvy::dotenv().is_err() {
+        dotenvy::from_filename("../.env").ok();
+    }
+
+    let config_path = std::env::var("AGENT_CONFIG_JSON")
+        .or_else(|_| std::env::var("CONFIG_JSON_PATH"))
+        .unwrap_or_else(|_| "/etc/sentinel_rtp_cam/config.json".to_string());
+    let config_path = std::path::PathBuf::from(config_path);
+    let mut config_error: Option<String> = None;
+    match AgentConfig::load_json_value(&config_path) {
+        Ok(value) => AgentConfig::apply_json_env_overrides(&value),
+        Err(e) => {
+            config_error = Some(e.to_string());
+        }
+    }
+
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -25,22 +42,16 @@ async fn main() -> Result<()> {
         )
         .init();
 
-    if dotenvy::dotenv().is_err() {
-        dotenvy::from_filename("../.env").ok();
+    if let Some(error) = config_error {
+        warn!(
+            error = %error,
+            path = %config_path.display(),
+            "Failed to load config JSON, using defaults"
+        );
     }
 
     let server_addr =
         std::env::var("SERVER_ADDR").map_err(|_| anyhow!("Missing SERVER_ADDR"))?;
-    let token = std::env::var("AGENT_TOKEN").map_err(|_| anyhow!("Missing AGENT_TOKEN"))?;
-    let agent_id = std::env::var("AGENT_ID").unwrap_or_else(|_| "agent-1".to_string());
-
-    let token_prefix: String = token.chars().take(6).collect();
-    info!(
-        server = %server_addr,
-        agent_id = %agent_id,
-        token_prefix = %token_prefix,
-        "Agent configured"
-    );
 
     let cams = load_cameras_from_env()?;
     info!(camera_count = cams.len(), "Loaded camera configs");
@@ -56,8 +67,27 @@ async fn main() -> Result<()> {
     }
 
     let (stream_map, camera_to_stream) = build_stream_maps(&cams);
-
-    let uplink = Uplink::connect_and_run(server_addr, token, agent_id, stream_map);
+    let agent_token = cams
+        .first()
+        .map(|cam| cam.agent_token.clone())
+        .ok_or_else(|| anyhow!("No cameras configured"))?;
+    let agent_id = cams
+        .first()
+        .map(|cam| cam.agent_id.clone())
+        .unwrap_or_else(|| "agent-1".to_string());
+    let token_mismatch = cams.iter().any(|cam| cam.agent_token != agent_token);
+    if token_mismatch {
+        bail!("Multiple agent tokens found; single uplink requires a shared token");
+    }
+    let token_prefix: String = agent_token.chars().take(6).collect();
+    info!(
+        server = %server_addr,
+        agent_id = %agent_id,
+        token_prefix = %token_prefix,
+        stream_count = stream_map.len(),
+        "Agent uplink configured"
+    );
+    let uplink = Uplink::connect_and_run(server_addr, agent_token, agent_id, stream_map);
 
     let cancel = CancellationToken::new();
 
@@ -75,8 +105,8 @@ async fn main() -> Result<()> {
     let bus = EventBus::new(128);
     let (motion_state, _rx) = MotionStateBus::new();
 
-    let uplink_motion = uplink.clone();
     let cam_map = camera_to_stream.clone();
+    let uplink_motion = uplink.clone();
     let motion_merge_secs = std::env::var("MOTION_MERGE_SECS")
         .ok()
         .and_then(|v| v.parse::<i64>().ok())

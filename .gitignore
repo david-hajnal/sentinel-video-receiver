@@ -20,6 +20,7 @@ Cargo.lock
 # Local config / secrets
 .env
 config.toml
+config.json
 
 # Generated media outputs (from this project)
 *.h264
