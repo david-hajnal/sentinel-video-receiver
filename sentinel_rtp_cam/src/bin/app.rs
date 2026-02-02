@@ -3,6 +3,8 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 
+use std::path::PathBuf;
+
 use sentinel_rtp_cam::{
     run_clip_meta_poster, run_disk_cleanup, run_heartbeat_poster, run_motion_event_poster,
     run_onvif_motion_poller, run_sse_config_listener, run_udp_receiver, AgentConfig, ClipRecorder,
@@ -50,6 +52,16 @@ fn env_bool(name: &str, default: bool) -> bool {
         .unwrap_or(default)
 }
 
+fn paths_resolve_to_same_file(a: &std::path::Path, b: &std::path::Path) -> bool {
+    if a == b {
+        return true;
+    }
+    match (std::fs::canonicalize(a), std::fs::canonicalize(b)) {
+        (Ok(a_canon), Ok(b_canon)) => a_canon == b_canon,
+        _ => false,
+    }
+}
+
 #[tokio::main(flavor = "multi_thread", worker_threads = 2)]
 async fn main() -> Result<()> {
     // .env support
@@ -57,20 +69,47 @@ async fn main() -> Result<()> {
         dotenvy::from_filename("../.env").ok();
     }
 
-    let config_path = std::env::var("AGENT_CONFIG_JSON")
+    let legacy_config_path = std::env::var("AGENT_CONFIG_JSON")
         .or_else(|_| std::env::var("CONFIG_JSON_PATH"))
-        .unwrap_or_else(|_| "/etc/sentinel_rtp_cam/config.json".to_string());
-    let config_path = std::path::PathBuf::from(config_path);
+        .ok();
+    let server_config_path = std::env::var("SERVER_CONFIG_JSON")
+        .unwrap_or_else(|_| "/etc/sentinel_rtp_cam/server.json".to_string());
+    let server_config_path = PathBuf::from(server_config_path);
+    let camera_config_path = std::env::var("CAMERA_CONFIG_JSON")
+        .ok()
+        .or_else(|| legacy_config_path.clone())
+        .unwrap_or_else(|| "/etc/sentinel_rtp_cam/camera.json".to_string());
+    let camera_config_path = PathBuf::from(camera_config_path);
 
     // Load JSON config and apply env overrides before reading env-based settings.
-    let mut config_error: Option<String> = None;
-    let config_value = match AgentConfig::load_json_value(&config_path) {
+    let mut server_error: Option<String> = None;
+    let mut camera_error: Option<String> = None;
+    let use_legacy_server = std::env::var("SERVER_CONFIG_JSON").is_err()
+        && !server_config_path.exists()
+        && legacy_config_path.is_some();
+    let use_legacy_camera =
+        std::env::var("CAMERA_CONFIG_JSON").is_err() && legacy_config_path.is_some();
+    let server_source_path = if use_legacy_server {
+        PathBuf::from(legacy_config_path.clone().unwrap())
+    } else {
+        server_config_path.clone()
+    };
+
+    let server_value = match AgentConfig::load_server_json(&server_source_path) {
         Ok(value) => value,
         Err(e) => {
-            config_error = Some(e.to_string());
+            server_error = Some(e.to_string());
             serde_json::Value::Object(Default::default())
         }
     };
+    let camera_value = match AgentConfig::load_camera_json(&camera_config_path) {
+        Ok(value) => value,
+        Err(e) => {
+            camera_error = Some(e.to_string());
+            serde_json::Value::Object(Default::default())
+        }
+    };
+    let config_value = AgentConfig::merge_server_camera_configs(&camera_value, &server_value);
     AgentConfig::apply_json_env_overrides(&config_value);
 
     // Initialize tracing subscriber
@@ -84,11 +123,30 @@ async fn main() -> Result<()> {
         .with_line_number(true)
         .init();
 
-    if let Some(error) = config_error {
+    if let Some(error) = server_error {
         warn!(
             error = %error,
-            path = %config_path.display(),
-            "Failed to load config JSON, using defaults"
+            path = %server_source_path.display(),
+            "Failed to load server config JSON, using defaults"
+        );
+    }
+    if let Some(error) = camera_error {
+        warn!(
+            error = %error,
+            path = %camera_config_path.display(),
+            "Failed to load camera config JSON, using defaults"
+        );
+    }
+    if use_legacy_server {
+        warn!(
+            path = %server_source_path.display(),
+            "SERVER_CONFIG_JSON unset; using legacy config for server settings"
+        );
+    }
+    if use_legacy_camera {
+        warn!(
+            path = %camera_config_path.display(),
+            "CAMERA_CONFIG_JSON unset; using legacy config path for camera settings"
         );
     }
 
@@ -100,7 +158,8 @@ async fn main() -> Result<()> {
     // Build agent configuration from JSON
     let agent_config = AgentConfig::from_json_value(config_value.clone());
     info!(
-        config_path = %config_path.display(),
+        server_config_path = %server_source_path.display(),
+        camera_config_path = %camera_config_path.display(),
         camera_id = %agent_config.camera_id,
         motion_enabled = agent_config.motion.enabled,
         server_enabled = agent_config.server.enabled,
@@ -222,10 +281,16 @@ async fn main() -> Result<()> {
 
         // SSE config listener
         let camera_id_clone = agent_config.camera_id.clone();
+        let stream_id = std::env::var("CAM1_STREAM_ID")
+            .ok()
+            .and_then(|v| v.parse::<u32>().ok());
         let server_cfg_clone = server_cfg.clone();
-        let config_path = config_path.clone();
+        let server_config_path = server_source_path.clone();
+        let camera_config_path = camera_config_path.clone();
+        let uses_single_config_file =
+            paths_resolve_to_same_file(&server_config_path, &camera_config_path);
         tokio::spawn(async move {
-            match run_sse_config_listener(server_cfg_clone, camera_id_clone).await {
+            match run_sse_config_listener(server_cfg_clone, camera_id_clone, stream_id).await {
                 Ok(mut config_rx) => {
                     info!("SSE config listener started, waiting for updates");
                     loop {
@@ -235,16 +300,62 @@ async fn main() -> Result<()> {
                             config = %serde_json::to_string(&new_config).unwrap_or_default(),
                             "Received config update from server"
                         );
-                        if let Err(e) = AgentConfig::merge_json_file(&config_path, &new_config) {
+                        if uses_single_config_file {
+                            if let Err(e) =
+                                AgentConfig::merge_json_file(&camera_config_path, &new_config)
+                            {
+                                error!(
+                                    error = %e,
+                                    path = %camera_config_path.display(),
+                                    "Failed to persist config update"
+                                );
+                            } else {
+                                info!(
+                                    path = %camera_config_path.display(),
+                                    "Persisted config update to JSON"
+                                );
+                            }
+                            continue;
+                        }
+
+                        if let Some(server_update) = new_config.get("server") {
+                            let server_payload = serde_json::json!({ "server": server_update });
+                            if let Err(e) = AgentConfig::merge_json_file_with_default(
+                                &server_config_path,
+                                &server_payload,
+                                AgentConfig::default_server_json(),
+                            ) {
+                                error!(
+                                    error = %e,
+                                    path = %server_config_path.display(),
+                                    "Failed to persist server config update"
+                                );
+                            } else {
+                                info!(
+                                    path = %server_config_path.display(),
+                                    "Persisted server config update to JSON"
+                                );
+                            }
+                        }
+
+                        let mut camera_update = new_config.clone();
+                        if let Some(obj) = camera_update.as_object_mut() {
+                            obj.remove("server");
+                        }
+                        if let Err(e) = AgentConfig::merge_json_file_with_default(
+                            &camera_config_path,
+                            &camera_update,
+                            AgentConfig::default_camera_json(),
+                        ) {
                             error!(
                                 error = %e,
-                                path = %config_path.display(),
-                                "Failed to persist config update"
+                                path = %camera_config_path.display(),
+                                "Failed to persist camera config update"
                             );
                         } else {
                             info!(
-                                path = %config_path.display(),
-                                "Persisted config update to JSON"
+                                path = %camera_config_path.display(),
+                                "Persisted camera config update to JSON"
                             );
                         }
                     }
@@ -345,12 +456,8 @@ async fn main() -> Result<()> {
                         "Starting RTSP receiver"
                     );
 
-                    match run_udp_receiver(
-                        recv_cfg.clone(),
-                        nal_tx2.clone(),
-                        recv_cancel.clone(),
-                    )
-                    .await
+                    match run_udp_receiver(recv_cfg.clone(), nal_tx2.clone(), recv_cancel.clone())
+                        .await
                     {
                         Ok(_) => {
                             warn!("RTSP receiver ended normally");

@@ -488,6 +488,8 @@ pub async fn run_sse_config_listener(
 }
 
 fn normalize_config_update(value: Value, camera_id: &str, stream_id: Option<u32>) -> Value {
+    let value = unwrap_sse_payload(value);
+
     if let Some(cameras) = value.get("cameras").and_then(|v| v.as_array()) {
         let selected = select_camera(cameras, camera_id, stream_id);
         let mut out = serde_json::Map::new();
@@ -508,6 +510,30 @@ fn normalize_config_update(value: Value, camera_id: &str, stream_id: Option<u32>
     }
 
     normalize_legacy_config(value, camera_id, stream_id)
+}
+
+fn unwrap_sse_payload(value: Value) -> Value {
+    let Some(config) = value.get("config") else {
+        return value;
+    };
+    if !config.is_object() {
+        return value;
+    }
+
+    let mut unwrapped = config.clone();
+    if let Some(obj) = unwrapped.as_object_mut() {
+        if !obj.contains_key("camera_id") {
+            if let Some(camera_id) = value.get("camera_id").and_then(|v| v.as_str()) {
+                if !camera_id.trim().is_empty() {
+                    obj.insert(
+                        "camera_id".to_string(),
+                        Value::String(camera_id.to_string()),
+                    );
+                }
+            }
+        }
+    }
+    unwrapped
 }
 
 fn select_camera(cameras: &[Value], camera_id: &str, stream_id: Option<u32>) -> Value {
@@ -760,5 +786,48 @@ mod tests {
         assert_eq!(camera["rtsp"]["stream_id"], 7);
         assert_eq!(camera["onvif"]["url"], "http://10.0.0.2:2020/onvif/service");
         assert_eq!(camera["motion"]["enabled"], false);
+    }
+
+    #[test]
+    fn normalize_config_unwraps_sse_envelope() {
+        let input = json!({
+            "camera_id": "cam-2",
+            "version": 3,
+            "config": {
+                "cameras": [
+                    { "id": "cam-1", "rtsp": { "url": "rtsp://10.0.0.1/live", "stream_id": 1 } },
+                    { "id": "cam-2", "rtsp": { "url": "rtsp://10.0.0.2/live", "stream_id": 2 } }
+                ],
+                "cleanup": { "min_free_bytes": 1234 }
+            }
+        });
+
+        let out = normalize_config_update(input, "cam-2", None);
+        let cameras = out["cameras"].as_array().unwrap();
+        assert_eq!(cameras.len(), 1);
+        assert_eq!(cameras[0]["id"], "cam-2");
+        assert_eq!(out["cleanup"]["min_free_bytes"], 1234);
+    }
+
+    #[test]
+    fn normalize_legacy_config_unwraps_sse_envelope() {
+        let input = json!({
+            "camera_id": "legacy-cam",
+            "version": 2,
+            "config": {
+                "rtsp_url": "rtsp://10.0.0.1/stream",
+                "onvif_host": "10.0.0.2",
+                "onvif_port": 2020,
+                "motion_enabled": true
+            }
+        });
+
+        let out = normalize_config_update(input, "legacy-cam", Some(7));
+        let camera = &out["cameras"][0];
+        assert_eq!(camera["id"], "legacy-cam");
+        assert_eq!(camera["rtsp"]["url"], "rtsp://10.0.0.1/stream");
+        assert_eq!(camera["rtsp"]["stream_id"], 7);
+        assert_eq!(camera["onvif"]["url"], "http://10.0.0.2:2020/onvif/service");
+        assert_eq!(camera["motion"]["enabled"], true);
     }
 }
