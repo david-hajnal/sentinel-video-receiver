@@ -27,7 +27,8 @@ LockPersonality=true
 LimitNOFILE=65536
 
 # Environment
-EnvironmentFile=/etc/sentinel_rtp_cam/env
+Environment=SERVER_CONFIG_JSON=/etc/sentinel_rtp_cam/server.json
+Environment=CAMERA_CONFIG_JSON=/etc/sentinel_rtp_cam/camera.json
 
 # Execution
 ExecStart=/usr/local/bin/sentinel_rtp_cam

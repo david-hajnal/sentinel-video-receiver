@@ -1,4 +1,5 @@
 use anyhow::{anyhow, bail, Result};
+use std::path::PathBuf;
 use std::time::{Duration, Instant};
 use tokio::net::UdpSocket;
 use tokio_util::sync::CancellationToken;
@@ -23,17 +24,46 @@ async fn main() -> Result<()> {
         dotenvy::from_filename("../.env").ok();
     }
 
-    let config_path = std::env::var("AGENT_CONFIG_JSON")
+    let legacy_config_path = std::env::var("AGENT_CONFIG_JSON")
         .or_else(|_| std::env::var("CONFIG_JSON_PATH"))
-        .unwrap_or_else(|_| "/etc/sentinel_rtp_cam/config.json".to_string());
-    let config_path = std::path::PathBuf::from(config_path);
-    let mut config_error: Option<String> = None;
-    match AgentConfig::load_json_value(&config_path) {
-        Ok(value) => AgentConfig::apply_json_env_overrides(&value),
+        .ok();
+    let server_config_path = std::env::var("SERVER_CONFIG_JSON")
+        .unwrap_or_else(|_| "/etc/sentinel_rtp_cam/server.json".to_string());
+    let server_config_path = PathBuf::from(server_config_path);
+    let camera_config_path = std::env::var("CAMERA_CONFIG_JSON")
+        .ok()
+        .or_else(|| legacy_config_path.clone())
+        .unwrap_or_else(|| "/etc/sentinel_rtp_cam/camera.json".to_string());
+    let camera_config_path = PathBuf::from(camera_config_path);
+    let mut server_error: Option<String> = None;
+    let mut camera_error: Option<String> = None;
+    let use_legacy_server = std::env::var("SERVER_CONFIG_JSON").is_err()
+        && !server_config_path.exists()
+        && legacy_config_path.is_some();
+    let use_legacy_camera =
+        std::env::var("CAMERA_CONFIG_JSON").is_err() && legacy_config_path.is_some();
+    let server_source_path = if use_legacy_server {
+        PathBuf::from(legacy_config_path.clone().unwrap())
+    } else {
+        server_config_path.clone()
+    };
+
+    let server_value = match AgentConfig::load_server_json(&server_source_path) {
+        Ok(value) => value,
         Err(e) => {
-            config_error = Some(e.to_string());
+            server_error = Some(e.to_string());
+            serde_json::Value::Object(Default::default())
         }
-    }
+    };
+    let camera_value = match AgentConfig::load_camera_json(&camera_config_path) {
+        Ok(value) => value,
+        Err(e) => {
+            camera_error = Some(e.to_string());
+            serde_json::Value::Object(Default::default())
+        }
+    };
+    let config_value = AgentConfig::merge_server_camera_configs(&camera_value, &server_value);
+    AgentConfig::apply_json_env_overrides(&config_value);
 
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -42,16 +72,34 @@ async fn main() -> Result<()> {
         )
         .init();
 
-    if let Some(error) = config_error {
+    if let Some(error) = server_error {
         warn!(
             error = %error,
-            path = %config_path.display(),
-            "Failed to load config JSON, using defaults"
+            path = %server_source_path.display(),
+            "Failed to load server config JSON, using defaults"
+        );
+    }
+    if let Some(error) = camera_error {
+        warn!(
+            error = %error,
+            path = %camera_config_path.display(),
+            "Failed to load camera config JSON, using defaults"
+        );
+    }
+    if use_legacy_server {
+        warn!(
+            path = %server_source_path.display(),
+            "SERVER_CONFIG_JSON unset; using legacy config for server settings"
+        );
+    }
+    if use_legacy_camera {
+        warn!(
+            path = %camera_config_path.display(),
+            "CAMERA_CONFIG_JSON unset; using legacy config path for camera settings"
         );
     }
 
-    let server_addr =
-        std::env::var("SERVER_ADDR").map_err(|_| anyhow!("Missing SERVER_ADDR"))?;
+    let server_addr = std::env::var("SERVER_ADDR").map_err(|_| anyhow!("Missing SERVER_ADDR"))?;
 
     let cams = load_cameras_from_env()?;
     info!(camera_count = cams.len(), "Loaded camera configs");
@@ -167,7 +215,9 @@ async fn run_camera(cam: CamConfig, uplink: Uplink, cancel: CancellationToken) -
         common_headers.push(("Authorization", a.as_str()));
     }
 
-    let r = c.request("OPTIONS", &cam.rtsp_url, &common_headers, None).await?;
+    let r = c
+        .request("OPTIONS", &cam.rtsp_url, &common_headers, None)
+        .await?;
     if r.status != 200 {
         bail!("OPTIONS failed: {}", r.status);
     }
@@ -216,14 +266,20 @@ async fn run_camera(cam: CamConfig, uplink: Uplink, cancel: CancellationToken) -
         if let Some(ref a) = authz {
             play_headers.push(("Authorization", a.as_str()));
         }
-        let r = c.request("PLAY", &cam.rtsp_url, &play_headers, None).await?;
+        let r = c
+            .request("PLAY", &cam.rtsp_url, &play_headers, None)
+            .await?;
         if r.status != 200 {
             bail!("PLAY failed: {}", r.status);
         }
         info!(stream_id = cam.stream_id, "RTSP PLAY ok");
 
         let sock = UdpSocket::bind(("0.0.0.0", cam.rtp_port)).await?;
-        info!(stream_id = cam.stream_id, port = cam.rtp_port, "UDP RTP socket bound");
+        info!(
+            stream_id = cam.stream_id,
+            port = cam.rtp_port,
+            "UDP RTP socket bound"
+        );
         let mut buf = vec![0u8; 8192];
         let mut expected_seq: Option<u16> = None;
         let mut total_pkts: u64 = 0;
@@ -302,7 +358,9 @@ async fn run_camera(cam: CamConfig, uplink: Uplink, cancel: CancellationToken) -
         if let Some(ref a) = authz {
             play_headers.push(("Authorization", a.as_str()));
         }
-        let r = c.request("PLAY", &cam.rtsp_url, &play_headers, None).await?;
+        let r = c
+            .request("PLAY", &cam.rtsp_url, &play_headers, None)
+            .await?;
         if r.status != 200 {
             bail!("PLAY failed: {}", r.status);
         }

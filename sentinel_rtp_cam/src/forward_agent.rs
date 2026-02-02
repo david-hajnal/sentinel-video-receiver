@@ -59,8 +59,8 @@ pub fn load_cameras_from_env() -> Result<Vec<CamConfig>> {
         let agent_id =
             env_string(&format!("{prefix}AGENT_ID")).unwrap_or_else(|| camera_id.clone());
         let agent_token = env_string(&format!("{prefix}AGENT_TOKEN"))
-            .or_else(|| env_string("AGENT_TOKEN"))
             .or_else(|| env_string("SERVER_BEARER_TOKEN"))
+            .or_else(|| env_string("AGENT_TOKEN"))
             .or_else(|| env_string("SERVER_TOKEN"))
             .ok_or_else(|| anyhow!("Missing AGENT_TOKEN/SERVER_BEARER_TOKEN for {prefix}"))?;
 
