@@ -3,6 +3,7 @@ use serde_json::Value;
 use std::fs;
 use std::path::Path;
 use std::time::Duration;
+use url::Url;
 
 /// Agent configuration that can be updated dynamically via server SSE
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -95,12 +96,17 @@ impl AgentConfig {
 
     /// Load the raw JSON value from disk, creating a default empty file if missing.
     pub fn load_json_value(path: &Path) -> std::io::Result<Value> {
+        Self::load_json_value_with_default(path, default_empty_json())
+    }
+
+    /// Load the raw JSON value from disk, creating a file from the provided default if missing.
+    pub fn load_json_value_with_default(path: &Path, default: Value) -> std::io::Result<Value> {
         if !path.exists() {
             if let Some(parent) = path.parent() {
                 fs::create_dir_all(parent)?;
             }
-            let empty = default_empty_json();
-            let pretty = serde_json::to_string_pretty(&empty).unwrap_or_else(|_| "{}".to_string());
+            let pretty =
+                serde_json::to_string_pretty(&default).unwrap_or_else(|_| "{}".to_string());
             fs::write(path, pretty)?;
         }
 
@@ -108,6 +114,16 @@ impl AgentConfig {
         let value: Value =
             serde_json::from_str(&raw).unwrap_or_else(|_| Value::Object(Default::default()));
         Ok(value)
+    }
+
+    /// Load the server config JSON, creating the default if missing.
+    pub fn load_server_json(path: &Path) -> std::io::Result<Value> {
+        Self::load_json_value_with_default(path, Self::default_server_json())
+    }
+
+    /// Load the camera config JSON, creating the default if missing.
+    pub fn load_camera_json(path: &Path) -> std::io::Result<Value> {
+        Self::load_json_value_with_default(path, Self::default_camera_json())
     }
 
     /// Build the agent config from a JSON value (merging with defaults).
@@ -126,7 +142,16 @@ impl AgentConfig {
 
     /// Merge an update into the existing JSON file and persist it.
     pub fn merge_json_file(path: &Path, update: &Value) -> std::io::Result<()> {
-        let mut current = Self::load_json_value(path)?;
+        Self::merge_json_file_with_default(path, update, default_empty_json())
+    }
+
+    /// Merge an update into the existing JSON file using a provided default and persist it.
+    pub fn merge_json_file_with_default(
+        path: &Path,
+        update: &Value,
+        default: Value,
+    ) -> std::io::Result<()> {
+        let mut current = Self::load_json_value_with_default(path, default)?;
         merge_value(&mut current, update);
         Self::write_json_file(path, &current)
     }
@@ -139,30 +164,17 @@ impl AgentConfig {
         set_env_if_value("SERVER_ENABLED", server.get("enabled"));
         set_env_if_value("SERVER_BASE_URL", server.get("base_url"));
         set_env_if_value("SERVER_BEARER_TOKEN", server.get("bearer_token"));
-        set_env_if_value("SERVER_RETRY_INTERVAL_SECS", server.get("retry_interval_secs"));
+        set_env_if_unset("AGENT_TOKEN", server.get("bearer_token"));
+        set_env_if_unset("SERVER_TOKEN", server.get("bearer_token"));
+        set_env_if_value(
+            "SERVER_RETRY_INTERVAL_SECS",
+            server.get("retry_interval_secs"),
+        );
         set_env_if_value("SERVER_MAX_RETRIES", server.get("max_retries"));
 
         let cleanup = value.get("cleanup").unwrap_or(&Value::Null);
         set_env_if_value("CLIP_CLEANUP_INTERVAL_SECS", cleanup.get("interval_secs"));
         set_env_if_value("CLIP_MIN_FREE_BYTES", cleanup.get("min_free_bytes"));
-
-        let local_clip = value.get("local_clip").unwrap_or(&Value::Null);
-        set_env_if_value("CLIP_DIR", local_clip.get("dir"));
-        set_env_if_value("OUTPUT_DIR", local_clip.get("dir"));
-        set_env_if_value("CLIP_PRE_ROLL_SECS", local_clip.get("pre_roll_secs"));
-        set_env_if_value("CLIP_POST_ROLL_SECS", local_clip.get("post_roll_secs"));
-        set_env_if_value("CLIP_MIN_DURATION_SECS", local_clip.get("min_duration_secs"));
-        set_env_if_value("CLIP_FLUSH_SECS", local_clip.get("flush_secs"));
-        set_env_if_value("CLIP_STALE_PART_SECS", local_clip.get("stale_part_secs"));
-        set_env_if_value("CLIP_WRITE_BATCH_BYTES", local_clip.get("write_batch_bytes"));
-        set_env_if_value("CLIP_MAX_FILES", local_clip.get("max_files"));
-        set_env_if_value("CLIP_MAX_AGE_SECS", local_clip.get("max_age_secs"));
-        set_env_if_value("CLIP_MAX_TOTAL_BYTES", local_clip.get("max_total_bytes"));
-        set_env_if_value("CLIP_MAX_BYTES", local_clip.get("max_bytes"));
-        set_env_if_value("CLIP_MAX_SECS", local_clip.get("max_secs"));
-        set_env_if_value("CLIP_FPS", local_clip.get("fps"));
-        set_env_if_value("CLIP_STREAM_COPY", local_clip.get("stream_copy"));
-        set_env_if_value("CLIP_AUDIO_ENABLED", local_clip.get("audio_enabled"));
 
         let ingest = value.get("ingest").unwrap_or(&Value::Null);
         set_env_if_unset("CLIP_DIR", ingest.get("clip_dir"));
@@ -196,16 +208,24 @@ impl AgentConfig {
 
                 set_env_if_value(&format!("{prefix}CAMERA_ID"), cam.get("id"));
                 set_env_if_value(&format!("{prefix}AGENT_ID"), cam.get("id"));
-                set_env_if_value(&format!("{prefix}AGENT_TOKEN"), cam.get("token"));
-                set_env_if_value(&format!("{prefix}STREAM_ID"), cam.get("stream_id"));
-                set_env_if_value(&format!("{prefix}TRANSPORT"), cam.get("transport"));
+                set_env_if_value(
+                    &format!("{prefix}STREAM_ID"),
+                    rtsp.get("stream_id").or_else(|| cam.get("stream_id")),
+                );
+                set_env_if_value(
+                    &format!("{prefix}TRANSPORT"),
+                    cam.get("transport").or_else(|| rtsp.get("transport")),
+                );
 
                 set_env_if_string(&format!("{prefix}RTSP_URL"), build_rtsp_url(rtsp));
+                set_env_if_string(&format!("{prefix}RTSP_HOST"), rtsp_host(rtsp));
+                set_env_if_string(&format!("{prefix}RTSP_PORT"), rtsp_port(rtsp));
+                set_env_if_string(&format!("{prefix}RTSP_PATH"), rtsp_path(rtsp));
                 set_env_if_value(&format!("{prefix}RTSP_USER"), user);
                 set_env_if_value(&format!("{prefix}RTSP_PASS"), pass);
 
-                set_env_if_value(&format!("{prefix}ONVIF_HOST"), onvif.get("host"));
-                set_env_if_value(&format!("{prefix}ONVIF_PORT"), onvif.get("port"));
+                set_env_if_string(&format!("{prefix}ONVIF_HOST"), onvif_host(onvif));
+                set_env_if_string(&format!("{prefix}ONVIF_PORT"), onvif_port(onvif));
                 set_env_if_value(&format!("{prefix}ONVIF_USER"), user);
                 set_env_if_value(&format!("{prefix}ONVIF_PASS"), pass);
                 set_env_if_value(&format!("{prefix}ONVIF_DEBUG"), onvif.get("debug"));
@@ -222,7 +242,10 @@ impl AgentConfig {
                     &format!("{prefix}ONVIF_PULL_TIMEOUT"),
                     onvif.get("pull_timeout"),
                 );
-                set_env_if_value(&format!("{prefix}ONVIF_PULL_LIMIT"), onvif.get("pull_limit"));
+                set_env_if_value(
+                    &format!("{prefix}ONVIF_PULL_LIMIT"),
+                    onvif.get("pull_limit"),
+                );
                 set_env_if_value(
                     &format!("{prefix}ONVIF_RESUBSCRIBE_AFTER_ERRORS"),
                     onvif.get("resubscribe_after_errors"),
@@ -264,7 +287,6 @@ impl AgentConfig {
 
                 set_env_if_unset("CAMERA_ID", first.get("id"));
                 set_env_if_unset("AGENT_ID", first.get("id"));
-                set_env_if_unset("AGENT_TOKEN", first.get("token"));
                 set_env_if_unset("MOTION_ENABLED", motion.get("enabled"));
                 set_env_if_unset("LOCAL_CLIP_ENABLED", features.get("local_clip_enabled"));
                 set_env_if_unset(
@@ -272,13 +294,14 @@ impl AgentConfig {
                     features.get("rtsp_receiver_enabled"),
                 );
                 set_env_if_unset_string("RTSP_URL", build_rtsp_url(rtsp));
-                set_env_if_unset("RTSP_HOST", rtsp.get("host"));
-                set_env_if_unset("RTSP_PORT", rtsp.get("port"));
-                set_env_if_unset("RTSP_PATH", rtsp.get("path"));
+                set_env_if_unset_string("RTSP_HOST", rtsp_host(rtsp));
+                set_env_if_unset_string("RTSP_PORT", rtsp_port(rtsp));
+                set_env_if_unset_string("RTSP_PATH", rtsp_path(rtsp));
+                set_env_if_unset("CAM1_STREAM_ID", rtsp.get("stream_id"));
                 set_env_if_unset("RTSP_USER", user);
                 set_env_if_unset("RTSP_PASS", pass);
-                set_env_if_unset("ONVIF_HOST", onvif.get("host"));
-                set_env_if_unset("ONVIF_PORT", onvif.get("port"));
+                set_env_if_unset_string("ONVIF_HOST", onvif_host(onvif));
+                set_env_if_unset_string("ONVIF_PORT", onvif_port(onvif));
                 set_env_if_unset("ONVIF_USER", user);
                 set_env_if_unset("ONVIF_PASS", pass);
                 set_env_if_unset("ONVIF_DEBUG", onvif.get("debug"));
@@ -293,13 +316,105 @@ impl AgentConfig {
                 );
                 set_env_if_unset("ONVIF_MIN_POLL_GAP_MS", onvif.get("min_poll_gap_ms"));
                 set_env_if_unset("ONVIF_AFTER_SUB_DELAY_MS", onvif.get("after_sub_delay_ms"));
-                set_env_if_unset("ONVIF_CONNREFUSED_RETRIES", onvif.get("connrefused_retries"));
+                set_env_if_unset(
+                    "ONVIF_CONNREFUSED_RETRIES",
+                    onvif.get("connrefused_retries"),
+                );
                 set_env_if_unset(
                     "ONVIF_CONNREFUSED_BACKOFF_MS",
                     onvif.get("connrefused_backoff_ms"),
                 );
             }
         }
+    }
+
+    pub fn merge_json_values(base: &mut Value, update: &Value) {
+        merge_value(base, update);
+    }
+
+    pub fn merge_server_camera_configs(camera_value: &Value, server_value: &Value) -> Value {
+        let mut merged = camera_value.clone();
+        if let Some(server_section) = server_value.get("server") {
+            if has_non_null(server_section) {
+                if let Some(obj) = merged.as_object_mut() {
+                    obj.insert("server".to_string(), server_section.clone());
+                }
+            }
+        }
+        merged
+    }
+
+    pub fn default_server_json() -> Value {
+        serde_json::json!({
+            "server": {
+                "enabled": null,
+                "base_url": null,
+                "bearer_token": null,
+                "retry_interval_secs": null,
+                "max_retries": null
+            }
+        })
+    }
+
+    pub fn default_camera_json() -> Value {
+        serde_json::json!({
+            "cameras": [
+                {
+                    "id": null,
+                    "user": null,
+                    "pass": null,
+                    "transport": null,
+                    "motion": {
+                        "enabled": null
+                    },
+                    "features": {
+                        "local_clip_enabled": null,
+                        "rtsp_receiver_enabled": null
+                    },
+                    "rtsp": {
+                        "url": null,
+                        "stream_id": null
+                    },
+                    "onvif": {
+                        "url": null,
+                        "debug": null,
+                        "dump_xml": null,
+                        "sub_termination": null,
+                        "renew_every_secs": null,
+                        "pull_timeout": null,
+                        "pull_limit": null,
+                        "resubscribe_after_errors": null,
+                        "min_poll_gap_ms": null,
+                        "after_sub_delay_ms": null,
+                        "connrefused_retries": null,
+                        "connrefused_backoff_ms": null
+                    }
+                }
+            ],
+            "cleanup": {
+                "interval_secs": null,
+                "min_free_bytes": null
+            },
+            "ingest": {
+                "clip_dir": null,
+                "clip_pre_secs": null,
+                "clip_post_secs": null,
+                "clip_ring_secs": null,
+                "clip_stale_part_secs": null,
+                "clip_max_secs": null
+            },
+            "forward_agent": {
+                "mode": null,
+                "server_addr": null,
+                "motion_merge_secs": null
+            },
+            "logging": {
+                "rust_log": null
+            },
+            "version": {
+                "sentinel_version": null
+            }
+        })
     }
 
     /// Get retry interval as Duration
@@ -326,23 +441,6 @@ fn default_empty_json() -> Value {
             "interval_secs": null,
             "min_free_bytes": null
         },
-        "local_clip": {
-            "dir": null,
-            "pre_roll_secs": null,
-            "post_roll_secs": null,
-            "min_duration_secs": null,
-            "flush_secs": null,
-            "stale_part_secs": null,
-            "write_batch_bytes": null,
-            "max_files": null,
-            "max_age_secs": null,
-            "max_total_bytes": null,
-            "max_bytes": null,
-            "max_secs": null,
-            "fps": null,
-            "stream_copy": null,
-            "audio_enabled": null
-        },
         "ingest": {
             "clip_dir": null,
             "clip_pre_secs": null,
@@ -359,10 +457,8 @@ fn default_empty_json() -> Value {
         "cameras": [
             {
                 "id": null,
-                "token": null,
                 "user": null,
                 "pass": null,
-                "stream_id": null,
                 "transport": null,
                 "motion": {
                     "enabled": null
@@ -373,13 +469,10 @@ fn default_empty_json() -> Value {
                 },
                 "rtsp": {
                     "url": null,
-                    "host": null,
-                    "port": null,
-                    "path": null
+                    "stream_id": null
                 },
                 "onvif": {
-                    "host": null,
-                    "port": null,
+                    "url": null,
                     "debug": null,
                     "dump_xml": null,
                     "sub_termination": null,
@@ -479,10 +572,7 @@ fn build_rtsp_url(rtsp: &Value) -> Option<String> {
         return None;
     }
     let port = rtsp.get("port").and_then(|v| v.as_u64()).unwrap_or(554);
-    let path = rtsp
-        .get("path")
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
+    let path = rtsp.get("path").and_then(|v| v.as_str()).unwrap_or("");
     let path = if path.is_empty() {
         String::new()
     } else if path.starts_with('/') {
@@ -491,6 +581,66 @@ fn build_rtsp_url(rtsp: &Value) -> Option<String> {
         format!("/{}", path)
     };
     Some(format!("rtsp://{}:{}{}", host, port, path))
+}
+
+fn rtsp_host(rtsp: &Value) -> Option<String> {
+    if let Some(host) = rtsp.get("host").and_then(|v| v.as_str()) {
+        if !host.trim().is_empty() {
+            return Some(host.to_string());
+        }
+    }
+    let url = build_rtsp_url(rtsp)?;
+    Url::parse(&url)
+        .ok()
+        .and_then(|parsed| parsed.host_str().map(|host| host.to_string()))
+}
+
+fn rtsp_port(rtsp: &Value) -> Option<String> {
+    if let Some(port) = rtsp.get("port").and_then(value_to_string) {
+        return Some(port);
+    }
+    let url = build_rtsp_url(rtsp)?;
+    Url::parse(&url)
+        .ok()
+        .map(|parsed| parsed.port().unwrap_or(554).to_string())
+}
+
+fn rtsp_path(rtsp: &Value) -> Option<String> {
+    if let Some(path) = rtsp.get("path").and_then(|v| v.as_str()) {
+        if !path.trim().is_empty() {
+            return Some(path.to_string());
+        }
+    }
+    let url = build_rtsp_url(rtsp)?;
+    let parsed = Url::parse(&url).ok()?;
+    let path = parsed.path();
+    if path.trim().is_empty() {
+        None
+    } else {
+        Some(path.to_string())
+    }
+}
+
+fn onvif_host(onvif: &Value) -> Option<String> {
+    if let Some(host) = onvif.get("host").and_then(|v| v.as_str()) {
+        if !host.trim().is_empty() {
+            return Some(host.to_string());
+        }
+    }
+    let url = onvif.get("url").and_then(|v| v.as_str())?;
+    Url::parse(url)
+        .ok()
+        .and_then(|parsed| parsed.host_str().map(|host| host.to_string()))
+}
+
+fn onvif_port(onvif: &Value) -> Option<String> {
+    if let Some(port) = onvif.get("port").and_then(value_to_string) {
+        return Some(port);
+    }
+    let url = onvif.get("url").and_then(|v| v.as_str())?;
+    Url::parse(url)
+        .ok()
+        .map(|parsed| parsed.port_or_known_default().unwrap_or(2020).to_string())
 }
 
 fn merge_value(base: &mut Value, update: &Value) {
@@ -508,6 +658,15 @@ fn merge_value(base: &mut Value, update: &Value) {
         (base_val, update_val) => {
             *base_val = update_val.clone();
         }
+    }
+}
+
+fn has_non_null(value: &Value) -> bool {
+    match value {
+        Value::Null => false,
+        Value::Array(items) => items.iter().any(has_non_null),
+        Value::Object(map) => map.values().any(has_non_null),
+        _ => true,
     }
 }
 
@@ -579,8 +738,11 @@ impl AgentConfig {
                     "retry_interval_secs",
                     defaults.server.retry_interval_secs,
                 ),
-                max_retries: merge_u64(server_val, "max_retries", defaults.server.max_retries as u64)
-                    as u32,
+                max_retries: merge_u64(
+                    server_val,
+                    "max_retries",
+                    defaults.server.max_retries as u64,
+                ) as u32,
             },
             cleanup: CleanupConfig {
                 interval_secs: merge_u64(

@@ -34,14 +34,13 @@ pub fn load_cameras_from_env() -> Result<Vec<CamConfig>> {
             Some(v) => v,
             None => continue,
         };
-        let user = env_string(&format!("{prefix}RTSP_USER"))
-            .or_else(|| env_string("RTSP_USER"));
-        let pass = env_string(&format!("{prefix}RTSP_PASS"))
-            .or_else(|| env_string("RTSP_PASS"));
+        let user = env_string(&format!("{prefix}RTSP_USER")).or_else(|| env_string("RTSP_USER"));
+        let pass = env_string(&format!("{prefix}RTSP_PASS")).or_else(|| env_string("RTSP_PASS"));
         let stream_id: u32 = env_string(&format!("{prefix}STREAM_ID"))
             .ok_or_else(|| anyhow!("Missing {prefix}STREAM_ID"))?
             .parse()?;
-        let transport = env_string(&format!("{prefix}TRANSPORT")).unwrap_or_else(|| "tcp".to_string());
+        let transport =
+            env_string(&format!("{prefix}TRANSPORT")).unwrap_or_else(|| "tcp".to_string());
         let rtp_port: u16 = env_string(&format!("{prefix}RTP_PORT"))
             .and_then(|v| v.parse().ok())
             .unwrap_or(5004 + (i as u16 - 1) * 2);
@@ -57,10 +56,13 @@ pub fn load_cameras_from_env() -> Result<Vec<CamConfig>> {
                 }
             })
             .unwrap_or_else(|| format!("cam-{}", i));
-        let agent_id = env_string(&format!("{prefix}AGENT_ID")).unwrap_or_else(|| camera_id.clone());
+        let agent_id =
+            env_string(&format!("{prefix}AGENT_ID")).unwrap_or_else(|| camera_id.clone());
         let agent_token = env_string(&format!("{prefix}AGENT_TOKEN"))
             .or_else(|| env_string("AGENT_TOKEN"))
-            .ok_or_else(|| anyhow!("Missing {prefix}AGENT_TOKEN"))?;
+            .or_else(|| env_string("SERVER_BEARER_TOKEN"))
+            .or_else(|| env_string("SERVER_TOKEN"))
+            .ok_or_else(|| anyhow!("Missing AGENT_TOKEN/SERVER_BEARER_TOKEN for {prefix}"))?;
 
         cams.push(CamConfig {
             name: format!("cam{}", i),
@@ -90,14 +92,14 @@ pub fn basic_auth_value(user: &str, pass: &str) -> String {
 
 pub fn parse_rtsp_url(rtsp_url: &str) -> Result<(String, u16, String)> {
     let url = Url::parse(rtsp_url)?;
-    let host = url.host_str().ok_or_else(|| anyhow!("RTSP URL missing host"))?;
+    let host = url
+        .host_str()
+        .ok_or_else(|| anyhow!("RTSP URL missing host"))?;
     let port = url.port().unwrap_or(554);
     Ok((host.to_string(), port, url.path().to_string()))
 }
 
-pub fn build_stream_maps(
-    cams: &[CamConfig],
-) -> (HashMap<u32, String>, HashMap<String, u32>) {
+pub fn build_stream_maps(cams: &[CamConfig]) -> (HashMap<u32, String>, HashMap<String, u32>) {
     let mut stream_map = HashMap::new();
     let mut camera_to_stream = HashMap::new();
     for cam in cams {

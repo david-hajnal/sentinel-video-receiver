@@ -21,6 +21,8 @@ Cargo.lock
 .env
 config.toml
 config.json
+server.json
+camera.json
 
 # Generated media outputs (from this project)
 *.h264

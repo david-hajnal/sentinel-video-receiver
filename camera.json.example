@@ -2,10 +2,8 @@
   "cameras": [
     {
       "id": null,
-      "token": null,
       "user": null,
       "pass": null,
-      "stream_id": null,
       "transport": null,
       "motion": {
         "enabled": null
@@ -16,13 +14,10 @@
       },
       "rtsp": {
         "url": null,
-        "host": null,
-        "port": null,
-        "path": null
+        "stream_id": null
       },
       "onvif": {
-        "host": null,
-        "port": null,
+        "url": null,
         "debug": null,
         "dump_xml": null,
         "sub_termination": null,
@@ -37,33 +32,9 @@
       }
     }
   ],
-  "server": {
-    "enabled": null,
-    "base_url": null,
-    "bearer_token": null,
-    "retry_interval_secs": null,
-    "max_retries": null
-  },
   "cleanup": {
     "interval_secs": null,
     "min_free_bytes": null
-  },
-  "local_clip": {
-    "dir": null,
-    "pre_roll_secs": null,
-    "post_roll_secs": null,
-    "min_duration_secs": null,
-    "flush_secs": null,
-    "stale_part_secs": null,
-    "write_batch_bytes": null,
-    "max_files": null,
-    "max_age_secs": null,
-    "max_total_bytes": null,
-    "max_bytes": null,
-    "max_secs": null,
-    "fps": null,
-    "stream_copy": null,
-    "audio_enabled": null
   },
   "ingest": {
     "clip_dir": null,

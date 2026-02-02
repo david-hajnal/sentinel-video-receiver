@@ -1,0 +1,9 @@
+{
+  "server": {
+    "enabled": null,
+    "base_url": null,
+    "bearer_token": null,
+    "retry_interval_secs": null,
+    "max_retries": null
+  }
+}

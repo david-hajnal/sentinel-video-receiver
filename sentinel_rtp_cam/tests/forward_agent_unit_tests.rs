@@ -99,6 +99,7 @@ fn load_cameras_from_env_uses_per_camera_override() {
         ("CAM1_STREAM_ID", "7"),
         ("CAM1_TRANSPORT", "tcp"),
         ("CAM1_CAMERA_ID", "cam-test-1"),
+        ("AGENT_TOKEN", "test-token"),
         ("RTSP_USER", "global_user"),
         ("RTSP_PASS", "global_pass"),
         ("CAM1_RTSP_USER", "cam_user"),
@@ -118,6 +119,7 @@ fn load_cameras_from_env_falls_back_to_global_camera_id() {
         ("CAM1_RTSP_URL", "rtsp://example.com/stream"),
         ("CAM1_STREAM_ID", "7"),
         ("CAM1_TRANSPORT", "tcp"),
+        ("AGENT_TOKEN", "test-token"),
         ("CAMERA_ID", "cam-global"),
     ]);
 
@@ -140,6 +142,8 @@ fn build_stream_maps_sets_camera_mapping() {
             rtp_port: 5004,
             rtcp_port: 5005,
             camera_id: "cam-a".to_string(),
+            agent_id: "agent-a".to_string(),
+            agent_token: "token-a".to_string(),
         },
         CamConfig {
             name: "cam2".to_string(),
@@ -151,6 +155,8 @@ fn build_stream_maps_sets_camera_mapping() {
             rtp_port: 5006,
             rtcp_port: 5007,
             camera_id: "cam-b".to_string(),
+            agent_id: "agent-b".to_string(),
+            agent_token: "token-b".to_string(),
         },
     ];
 
