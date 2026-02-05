@@ -27,12 +27,16 @@ struct HelloStream {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let config_path = std::env::var("AGENT_CONFIG_JSON")
+    let legacy_config_path = std::env::var("AGENT_CONFIG_JSON")
         .or_else(|_| std::env::var("CONFIG_JSON_PATH"))
-        .unwrap_or_else(|_| "/etc/sentinel_rtp_cam/config.json".to_string());
-    let config_path = std::path::PathBuf::from(config_path);
+        .ok();
+    let camera_config_path = std::env::var("CAMERA_CONFIG_JSON")
+        .ok()
+        .or_else(|| legacy_config_path.clone())
+        .unwrap_or_else(|| "/etc/sentinel_rtp_cam/camera.json".to_string());
+    let camera_config_path = std::path::PathBuf::from(camera_config_path);
     let mut config_error: Option<String> = None;
-    match AgentConfig::load_json_value(&config_path) {
+    match AgentConfig::load_camera_json(&camera_config_path) {
         Ok(value) => AgentConfig::apply_json_env_overrides(&value),
         Err(e) => {
             config_error = Some(e.to_string());
@@ -49,8 +53,14 @@ async fn main() -> Result<()> {
     if let Some(error) = config_error {
         warn!(
             error = %error,
-            path = %config_path.display(),
-            "Failed to load config JSON, using defaults"
+            path = %camera_config_path.display(),
+            "Failed to load camera config JSON, using defaults"
+        );
+    }
+    if std::env::var("CAMERA_CONFIG_JSON").is_err() && legacy_config_path.is_some() {
+        warn!(
+            path = %camera_config_path.display(),
+            "CAMERA_CONFIG_JSON unset; using legacy config path for camera settings"
         );
     }
 
@@ -58,17 +68,35 @@ async fn main() -> Result<()> {
     let token = std::env::var("SERVER_TOKEN").unwrap_or_else(|_| "devtoken".to_string());
 
     let clip_dir = PathBuf::from(std::env::var("CLIP_DIR").unwrap_or_else(|_| "clips".to_string()));
-    let pre_secs: u64 = std::env::var("CLIP_PRE_SECS").ok().and_then(|v| v.parse().ok()).unwrap_or(3);
-    let post_secs: u64 = std::env::var("CLIP_POST_SECS").ok().and_then(|v| v.parse().ok()).unwrap_or(5);
-    let ring_secs: u64 = std::env::var("CLIP_RING_SECS").ok().and_then(|v| v.parse().ok()).unwrap_or(pre_secs);
-    let stale_part_secs: u64 = std::env::var("CLIP_STALE_PART_SECS").ok().and_then(|v| v.parse().ok()).unwrap_or(24 * 60 * 60);
-    let _write_batch_bytes: usize = std::env::var("CLIP_WRITE_BATCH_BYTES").ok().and_then(|v| v.parse().ok()).unwrap_or(256 * 1024);
-    let _max_clip_secs: Option<u64> = std::env::var("CLIP_MAX_SECS").ok().and_then(|v| v.parse().ok());
+    let pre_secs: u64 = std::env::var("CLIP_PRE_SECS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(3);
+    let post_secs: u64 = std::env::var("CLIP_POST_SECS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(5);
+    let ring_secs: u64 = std::env::var("CLIP_RING_SECS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(pre_secs);
+    let stale_part_secs: u64 = std::env::var("CLIP_STALE_PART_SECS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(24 * 60 * 60);
+    let _write_batch_bytes: usize = std::env::var("CLIP_WRITE_BATCH_BYTES")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(256 * 1024);
+    let _max_clip_secs: Option<u64> = std::env::var("CLIP_MAX_SECS")
+        .ok()
+        .and_then(|v| v.parse().ok());
 
     let listener = TcpListener::bind(&bind).await?;
     info!(bind = %bind, "Server ingest listening");
 
-    let streams: Arc<Mutex<HashMap<u32, mpsc::Sender<StreamMsg>>>> = Arc::new(Mutex::new(HashMap::new()));
+    let streams: Arc<Mutex<HashMap<u32, mpsc::Sender<StreamMsg>>>> =
+        Arc::new(Mutex::new(HashMap::new()));
 
     loop {
         let (sock, addr) = listener.accept().await?;
@@ -76,7 +104,19 @@ async fn main() -> Result<()> {
         let streams = streams.clone();
         let clip_dir = clip_dir.clone();
         tokio::spawn(async move {
-            if let Err(e) = handle_conn(sock, addr, token, streams, clip_dir, ring_secs, pre_secs, post_secs, stale_part_secs).await {
+            if let Err(e) = handle_conn(
+                sock,
+                addr,
+                token,
+                streams,
+                clip_dir,
+                ring_secs,
+                pre_secs,
+                post_secs,
+                stale_part_secs,
+            )
+            .await
+            {
                 warn!(error = %e, "Connection ended");
             }
         });
@@ -118,7 +158,11 @@ async fn handle_conn(
     }
 
     loop {
-        let Msg { msg_type, stream_id, payload } = read_msg(&mut sock).await?;
+        let Msg {
+            msg_type,
+            stream_id,
+            payload,
+        } = read_msg(&mut sock).await?;
         let tx = ensure_stream(
             &streams,
             stream_id,
@@ -141,9 +185,17 @@ async fn handle_conn(
             }
             MOTION => {
                 let v: serde_json::Value = serde_json::from_slice(&payload).unwrap_or_default();
-                let rule = v.get("rule").and_then(|v| v.as_str()).unwrap_or("motion").to_string();
+                let rule = v
+                    .get("rule")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("motion")
+                    .to_string();
                 let active = v.get("active").and_then(|v| v.as_bool()).unwrap_or(false);
-                let ts = v.get("ts").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                let ts = v
+                    .get("ts")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
                 let _ = tx.try_send(StreamMsg::Motion { rule, active, ts });
             }
             _ => {}

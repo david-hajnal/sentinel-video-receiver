@@ -148,7 +148,7 @@ async fn admin_page(State(state): State<AppState>) -> Html<String> {
     </form>
     <div class="info" style="margin-top: 20px;">
         <strong>Endpoints:</strong><br>
-        • SSE: GET /api/config/stream?camera_id=CAM_ID<br>
+        • SSE: GET /api/v1/config/stream?camera_id=CAM_ID<br>
         • Motion: POST /api/events/motion<br>
         • Heartbeat: POST /api/heartbeat<br>
         • Clips: POST /api/clips<br>
@@ -179,18 +179,18 @@ async fn admin_update_config(
     let config_json = form.config;
 
     // Validate JSON and parse
-    let config_value: serde_json::Value = serde_json::from_str(&config_json)
-        .map_err(|_| StatusCode::BAD_REQUEST)?;
+    let config_value: serde_json::Value =
+        serde_json::from_str(&config_json).map_err(|_| StatusCode::BAD_REQUEST)?;
 
     info!("Config updated via admin");
 
     // Create pretty version for admin UI
     let pretty_json = serde_json::to_string_pretty(&config_value)
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    
+
     // Create compact version for SSE (no newlines)
-    let compact_json = serde_json::to_string(&config_value)
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let compact_json =
+        serde_json::to_string(&config_value).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
     // Update stored configs
     *state.config_json_pretty.write().await = pretty_json;
@@ -333,7 +333,7 @@ async fn main() -> anyhow::Result<()> {
     };
 
     let app = Router::new()
-        .route("/api/config/stream", get(sse_config_stream))
+        .route("/api/v1/config/stream", get(sse_config_stream))
         .route("/api/events/motion", post(handle_motion_event))
         .route("/api/heartbeat", post(handle_heartbeat))
         .route("/api/clips", post(handle_clip_meta))
@@ -351,7 +351,7 @@ async fn main() -> anyhow::Result<()> {
     info!("Bearer token: {}", bearer_token);
     info!("");
     info!("Admin UI:        http://{}/admin", bind_addr);
-    info!("SSE config:      http://{}/api/config/stream", bind_addr);
+    info!("SSE config:      http://{}/api/v1/config/stream", bind_addr);
     info!(
         "Motion events:   POST http://{}/api/events/motion",
         bind_addr

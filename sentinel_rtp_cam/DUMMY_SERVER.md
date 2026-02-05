@@ -69,7 +69,7 @@ Open http://127.0.0.1:8080/admin in your browser to:
 
 ### API Endpoints (Require Bearer Token)
 
-**`GET /api/config/stream?camera_id=CAM_ID`** - SSE config stream
+**`GET /api/v1/config/stream?camera_id=CAM_ID`** - SSE config stream
 - Sends current config immediately on connect
 - Broadcasts config updates as they happen
 - Keeps connection alive with periodic keepalive messages
@@ -163,7 +163,7 @@ Duplicate: `Duplicate motion event ignored`
 │    ↓                                    │
 │  Broadcast Channel                      │
 │    ↓                                    │
-│  SSE Stream (/api/config/stream)        │
+│  SSE Stream (/api/v1/config/stream)        │
 │    ↓                                    │
 │  Connected Agents (multiple)            │
 │                                         │
@@ -230,7 +230,7 @@ RUST_LOG=debug cargo run --bin dummy_server
 
 ```bash
 curl -N -H "Accept: text/event-stream" \
-  "http://127.0.0.1:8080/api/config/stream?camera_id=cam-001"
+  "http://127.0.0.1:8080/api/v1/config/stream?camera_id=cam-001"
 ```
 
 ### Manual Event Posting
