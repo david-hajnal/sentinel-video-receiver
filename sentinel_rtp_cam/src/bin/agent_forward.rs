@@ -17,7 +17,7 @@ use sentinel_rtp_cam::forward_agent::{
 use sentinel_rtp_cam::onvif::run_onvif_motion_poller;
 use sentinel_rtp_cam::rtsp::interleaved::{read_interleaved_frame, InterleavedFrame};
 use sentinel_rtp_cam::rtsp::rtsp::RtspClient;
-use sentinel_rtp_cam::AgentConfig;
+use sentinel_rtp_cam::{run_agent_heartbeat_poster, AgentConfig};
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -101,6 +101,7 @@ async fn main() -> Result<()> {
     }
 
     let mut last_status = Instant::now() - Duration::from_secs(120);
+    let mut heartbeat_started = false;
     let (server_addr, cams) = loop {
         let server_value = match AgentConfig::load_server_json(&server_source_path) {
             Ok(value) => value,
@@ -144,6 +145,31 @@ async fn main() -> Result<()> {
                 Vec::new()
             }
         };
+
+        if !heartbeat_started {
+            let server_base_url = std::env::var("SERVER_BASE_URL")
+                .ok()
+                .map(|v| v.trim().to_string())
+                .filter(|v| !v.is_empty());
+            let server_bearer = std::env::var("SERVER_BEARER_TOKEN")
+                .ok()
+                .map(|v| v.trim().to_string())
+                .filter(|v| !v.is_empty());
+            if server_base_url.is_some() && server_bearer.is_some() {
+                let agent_id = std::env::var("AGENT_ID")
+                    .ok()
+                    .filter(|v| !v.trim().is_empty())
+                    .or_else(|| std::env::var("HOSTNAME").ok())
+                    .unwrap_or_else(|| "agent".to_string());
+                let server_cfg = AgentConfig::from_env().server;
+                tokio::spawn(async move {
+                    if let Err(e) = run_agent_heartbeat_poster(server_cfg, agent_id).await {
+                        warn!(error = %e, "Agent heartbeat task ended");
+                    }
+                });
+                heartbeat_started = true;
+            }
+        }
 
         let ready = server_addr.is_some() && !cams.is_empty();
         if ready {

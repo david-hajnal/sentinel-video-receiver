@@ -400,6 +400,54 @@ pub async fn run_heartbeat_poster(config: ServerConfig, camera_id: String) -> Re
     }
 }
 
+/// Sends periodic heartbeat to server using agent token (no camera required)
+pub async fn run_agent_heartbeat_poster(config: ServerConfig, agent_id: String) -> Result<()> {
+    info!(
+        server_url = %config.base_url,
+        agent_id = %agent_id,
+        "Starting agent heartbeat poster"
+    );
+
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .build()?;
+
+    let url = format!("{}/api/heartbeat", config.base_url);
+    let heartbeat_interval = Duration::from_secs(30);
+
+    loop {
+        sleep(heartbeat_interval).await;
+
+        let payload = json!({
+            "agent_id": agent_id,
+            "timestamp": chrono::Utc::now().to_rfc3339(),
+        });
+
+        let config_clone = config.clone();
+        let client_clone = client.clone();
+        let url_clone = url.clone();
+        let payload_clone = payload.clone();
+
+        tokio::spawn(async move {
+            retry_forever(
+                || async {
+                    client_clone
+                        .post(&url_clone)
+                        .bearer_auth(&config_clone.bearer_token)
+                        .json(&payload_clone)
+                        .send()
+                        .await?
+                        .error_for_status()?;
+                    Ok(())
+                },
+                Duration::from_secs(config_clone.retry_interval_secs),
+                "post_agent_heartbeat",
+            )
+            .await
+        });
+    }
+}
+
 /// Listens to Server-Sent Events (SSE) for configuration updates
 /// Returns a watch channel that broadcasts config changes
 pub async fn run_sse_config_listener(
