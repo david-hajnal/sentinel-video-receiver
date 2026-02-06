@@ -2,6 +2,7 @@ use anyhow::{anyhow, bail, Result};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 use tokio::net::UdpSocket;
+use tokio::time::sleep;
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
@@ -99,9 +100,72 @@ async fn main() -> Result<()> {
         );
     }
 
-    let server_addr = std::env::var("SERVER_ADDR").map_err(|_| anyhow!("Missing SERVER_ADDR"))?;
+    let mut last_status = Instant::now() - Duration::from_secs(120);
+    let (server_addr, cams) = loop {
+        let server_value = match AgentConfig::load_server_json(&server_source_path) {
+            Ok(value) => value,
+            Err(e) => {
+                if last_status.elapsed() > Duration::from_secs(30) {
+                    warn!(
+                        error = %e,
+                        path = %server_source_path.display(),
+                        "Failed to load server config JSON; waiting for config"
+                    );
+                }
+                serde_json::Value::Object(Default::default())
+            }
+        };
+        let camera_value = match AgentConfig::load_camera_json(&camera_config_path) {
+            Ok(value) => value,
+            Err(e) => {
+                if last_status.elapsed() > Duration::from_secs(30) {
+                    warn!(
+                        error = %e,
+                        path = %camera_config_path.display(),
+                        "Failed to load camera config JSON; waiting for config"
+                    );
+                }
+                serde_json::Value::Object(Default::default())
+            }
+        };
+        let config_value = AgentConfig::merge_server_camera_configs(&camera_value, &server_value);
+        AgentConfig::apply_json_env_overrides(&config_value);
 
-    let cams = load_cameras_from_env()?;
+        let server_addr = std::env::var("SERVER_ADDR")
+            .ok()
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty());
+        let cams = match load_cameras_from_env() {
+            Ok(cams) => cams,
+            Err(e) => {
+                if last_status.elapsed() > Duration::from_secs(30) {
+                    warn!(error = %e, "Camera config incomplete; waiting for config");
+                }
+                Vec::new()
+            }
+        };
+
+        let ready = server_addr.is_some() && !cams.is_empty();
+        if ready {
+            break (server_addr.unwrap(), cams);
+        }
+
+        if last_status.elapsed() > Duration::from_secs(30) {
+            let server_hint = if server_addr.is_some() {
+                "server_addr=ok"
+            } else {
+                "server_addr=missing"
+            };
+            warn!(
+                camera_count = cams.len(),
+                server_hint,
+                "Agent in standby; waiting for forward config"
+            );
+            last_status = Instant::now();
+        }
+
+        sleep(Duration::from_secs(5)).await;
+    };
     info!(camera_count = cams.len(), "Loaded camera configs");
     for cam in &cams {
         info!(

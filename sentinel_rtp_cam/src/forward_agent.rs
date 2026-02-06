@@ -1,4 +1,4 @@
-use anyhow::{anyhow, bail, Result};
+use anyhow::{anyhow, Result};
 use base64::Engine;
 use std::collections::HashMap;
 use url::Url;
@@ -77,9 +77,6 @@ pub fn load_cameras_from_env() -> Result<Vec<CamConfig>> {
             agent_id,
             agent_token,
         });
-    }
-    if cams.is_empty() {
-        bail!("No cameras configured (CAM1_RTSP_URL...)");
     }
     Ok(cams)
 }
