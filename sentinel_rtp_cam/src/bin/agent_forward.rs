@@ -1,7 +1,9 @@
 use anyhow::{anyhow, bail, Result};
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::net::UdpSocket;
+use tokio::sync::RwLock;
 use tokio::time::sleep;
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
@@ -18,7 +20,7 @@ use sentinel_rtp_cam::forward_agent::{
 use sentinel_rtp_cam::onvif::run_onvif_motion_poller;
 use sentinel_rtp_cam::rtsp::interleaved::{read_interleaved_frame, InterleavedFrame};
 use sentinel_rtp_cam::rtsp::rtsp::RtspClient;
-use sentinel_rtp_cam::{run_agent_heartbeat_poster, AgentConfig};
+use sentinel_rtp_cam::{run_agent_heartbeat_poster, AgentConfig, CameraHeartbeatTarget};
 
 async fn try_pull_remote_config(
     client: &reqwest::Client,
@@ -154,6 +156,7 @@ async fn main() -> Result<()> {
     let http_client = reqwest::Client::builder()
         .timeout(Duration::from_secs(10))
         .build()?;
+    let camera_targets: Arc<RwLock<Vec<CameraHeartbeatTarget>>> = Arc::new(RwLock::new(Vec::new()));
     let mut last_status = Instant::now() - Duration::from_secs(120);
     let mut last_pull = Instant::now() - Duration::from_secs(120);
     let mut heartbeat_started = false;
@@ -218,8 +221,11 @@ async fn main() -> Result<()> {
                     .or_else(|| std::env::var("HOSTNAME").ok())
                     .unwrap_or_else(|| "agent".to_string());
                 let server_cfg = AgentConfig::from_env().server;
+                let camera_targets = camera_targets.clone();
                 tokio::spawn(async move {
-                    if let Err(e) = run_agent_heartbeat_poster(server_cfg, agent_id).await {
+                    if let Err(e) =
+                        run_agent_heartbeat_poster(server_cfg, agent_id, camera_targets).await
+                    {
                         warn!(error = %e, "Agent heartbeat task ended");
                     }
                 });
@@ -282,6 +288,18 @@ async fn main() -> Result<()> {
 
         sleep(Duration::from_secs(5)).await;
     };
+
+    {
+        let mut guard = camera_targets.write().await;
+        *guard = cams
+            .iter()
+            .map(|cam| CameraHeartbeatTarget {
+                camera_id: cam.camera_id.clone(),
+                rtsp_url: cam.rtsp_url.clone(),
+            })
+            .collect();
+    }
+
     info!(camera_count = cams.len(), "Loaded camera configs");
     for cam in &cams {
         info!(

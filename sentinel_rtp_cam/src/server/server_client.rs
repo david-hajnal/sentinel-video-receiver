@@ -1,8 +1,11 @@
 use anyhow::Result;
 use serde_json::{json, Value};
-use tokio::sync::mpsc;
-use tokio::time::{sleep, Duration};
+use std::sync::Arc;
+use tokio::net::TcpStream;
+use tokio::sync::{mpsc, RwLock};
+use tokio::time::{sleep, timeout, Duration};
 use tracing::{debug, error, info, warn};
+use url::Url;
 
 use crate::config::agent_config::ServerConfig;
 use crate::core::clip_recorder::ClipMeta;
@@ -400,8 +403,41 @@ pub async fn run_heartbeat_poster(config: ServerConfig, camera_id: String) -> Re
     }
 }
 
-/// Sends periodic heartbeat to server using agent token (no camera required)
-pub async fn run_agent_heartbeat_poster(config: ServerConfig, agent_id: String) -> Result<()> {
+#[derive(Debug, Clone)]
+pub struct CameraHeartbeatTarget {
+    pub camera_id: String,
+    pub rtsp_url: String,
+}
+
+async fn check_rtsp_reachability(rtsp_url: &str) -> (bool, Option<i64>, Option<String>) {
+    let started = std::time::Instant::now();
+    let parsed = match Url::parse(rtsp_url) {
+        Ok(url) => url,
+        Err(e) => return (false, None, Some(format!("Invalid RTSP URL: {e}"))),
+    };
+    let host = match parsed.host_str() {
+        Some(h) => h,
+        None => return (false, None, Some("RTSP URL missing host".to_string())),
+    };
+    let port = parsed.port().unwrap_or(554);
+    let addr = format!("{host}:{port}");
+
+    match timeout(Duration::from_secs(3), TcpStream::connect(&addr)).await {
+        Ok(Ok(_)) => {
+            let ms = started.elapsed().as_millis() as i64;
+            (true, Some(ms), None)
+        }
+        Ok(Err(e)) => (false, None, Some(e.to_string())),
+        Err(_) => (false, None, Some("connect timeout".to_string())),
+    }
+}
+
+/// Sends periodic heartbeat to server using agent token (includes per-camera RTSP status if available)
+pub async fn run_agent_heartbeat_poster(
+    config: ServerConfig,
+    agent_id: String,
+    cameras: Arc<RwLock<Vec<CameraHeartbeatTarget>>>,
+) -> Result<()> {
     info!(
         server_url = %config.base_url,
         agent_id = %agent_id,
@@ -418,9 +454,22 @@ pub async fn run_agent_heartbeat_poster(config: ServerConfig, agent_id: String) 
     loop {
         sleep(heartbeat_interval).await;
 
+        let camera_snapshot = cameras.read().await.clone();
+        let mut camera_status = Vec::new();
+        for cam in camera_snapshot {
+            let (ok, latency_ms, error) = check_rtsp_reachability(&cam.rtsp_url).await;
+            camera_status.push(json!({
+                "camera_id": cam.camera_id,
+                "rtsp_ok": ok,
+                "rtsp_latency_ms": latency_ms,
+                "rtsp_error": error,
+            }));
+        }
+
         let payload = json!({
             "agent_id": agent_id,
             "timestamp": chrono::Utc::now().to_rfc3339(),
+            "cameras": camera_status,
         });
 
         let config_clone = config.clone();
