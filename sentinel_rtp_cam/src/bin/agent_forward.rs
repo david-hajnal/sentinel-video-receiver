@@ -5,6 +5,7 @@ use tokio::net::UdpSocket;
 use tokio::time::sleep;
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
+use serde_json::{json, Value};
 
 use sentinel_rtp_cam::agent_uplink::Uplink;
 use sentinel_rtp_cam::core::rtp::RtpPacket;
@@ -18,6 +19,56 @@ use sentinel_rtp_cam::onvif::run_onvif_motion_poller;
 use sentinel_rtp_cam::rtsp::interleaved::{read_interleaved_frame, InterleavedFrame};
 use sentinel_rtp_cam::rtsp::rtsp::RtspClient;
 use sentinel_rtp_cam::{run_agent_heartbeat_poster, AgentConfig};
+
+async fn try_pull_remote_config(
+    client: &reqwest::Client,
+    base_url: &str,
+    bearer_token: &str,
+    camera_hint: Option<String>,
+    server_path: &PathBuf,
+    camera_path: &PathBuf,
+) -> Result<bool> {
+    let url = format!("{}/api/v1/config", base_url.trim_end_matches('/'));
+    let mut req = client.get(&url).bearer_auth(bearer_token);
+    if let Some(hint) = camera_hint.as_deref() {
+        req = req.header("x-camera-id", hint);
+    }
+    let resp = req.send().await?;
+    if !resp.status().is_success() {
+        warn!(
+            status = %resp.status(),
+            "Config pull failed; server returned error"
+        );
+        return Ok(false);
+    }
+
+    let payload: Value = resp.json().await?;
+    let Some(config) = payload.get("config") else {
+        warn!("Config pull response missing config payload");
+        return Ok(false);
+    };
+
+    if let Some(server_update) = config.get("server") {
+        let server_payload = json!({ "server": server_update });
+        AgentConfig::merge_json_file_with_default(
+            server_path,
+            &server_payload,
+            AgentConfig::default_server_json(),
+        )?;
+    }
+
+    let mut camera_update = config.clone();
+    if let Some(obj) = camera_update.as_object_mut() {
+        obj.remove("server");
+    }
+    AgentConfig::merge_json_file_with_default(
+        camera_path,
+        &camera_update,
+        AgentConfig::default_camera_json(),
+    )?;
+
+    Ok(true)
+}
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -100,7 +151,11 @@ async fn main() -> Result<()> {
         );
     }
 
+    let http_client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .build()?;
     let mut last_status = Instant::now() - Duration::from_secs(120);
+    let mut last_pull = Instant::now() - Duration::from_secs(120);
     let mut heartbeat_started = false;
     let (server_addr, cams) = loop {
         let server_value = match AgentConfig::load_server_json(&server_source_path) {
@@ -146,15 +201,16 @@ async fn main() -> Result<()> {
             }
         };
 
+        let server_base_url = std::env::var("SERVER_BASE_URL")
+            .ok()
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty());
+        let server_bearer = std::env::var("SERVER_BEARER_TOKEN")
+            .ok()
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty());
+
         if !heartbeat_started {
-            let server_base_url = std::env::var("SERVER_BASE_URL")
-                .ok()
-                .map(|v| v.trim().to_string())
-                .filter(|v| !v.is_empty());
-            let server_bearer = std::env::var("SERVER_BEARER_TOKEN")
-                .ok()
-                .map(|v| v.trim().to_string())
-                .filter(|v| !v.is_empty());
             if server_base_url.is_some() && server_bearer.is_some() {
                 let agent_id = std::env::var("AGENT_ID")
                     .ok()
@@ -169,6 +225,40 @@ async fn main() -> Result<()> {
                 });
                 heartbeat_started = true;
             }
+        }
+
+        if last_pull.elapsed() > Duration::from_secs(30) {
+            if let (Some(base_url), Some(token)) = (&server_base_url, &server_bearer) {
+                let camera_hint = std::env::var("CAMERA_ID")
+                    .ok()
+                    .filter(|v| !v.trim().is_empty())
+                    .or_else(|| std::env::var("CAM1_CAMERA_ID").ok());
+                match try_pull_remote_config(
+                    &http_client,
+                    base_url,
+                    token,
+                    camera_hint,
+                    &server_config_path,
+                    &camera_config_path,
+                )
+                .await
+                {
+                    Ok(true) => {
+                        info!("Pulled config from server; reloading");
+                    }
+                    Ok(false) => {
+                        if last_status.elapsed() > Duration::from_secs(30) {
+                            warn!("Config pull did not return a usable config");
+                        }
+                    }
+                    Err(e) => {
+                        if last_status.elapsed() > Duration::from_secs(30) {
+                            warn!(error = %e, "Config pull failed");
+                        }
+                    }
+                }
+            }
+            last_pull = Instant::now();
         }
 
         let ready = server_addr.is_some() && !cams.is_empty();
