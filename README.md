@@ -1,98 +1,67 @@
 # Sentinel Video Receiver
 
-RTSP/RTP video receiver and clip recorder for Raspberry Pi with ONVIF motion detection support.
+RTSP/RTP receiver and forward agent for Raspberry Pi with ONVIF motion detection.
 
-## Quick Install (Manual)
+## Quick install (recommended)
 
-We build on GitHub Actions and ship prebuilt binaries. Raspberry Pi devices only download and run
-those artifacts.
+Uses the tooling repo: `david-hajnal/sentinel-tooling`.
 
-1) Download the latest release binary for your architecture from GitHub Releases.
-2) Install the binary:
 ```bash
-sudo install -m 755 sentinel_rtp_cam /usr/local/bin/sentinel_rtp_cam
+curl -fsSL https://raw.githubusercontent.com/david-hajnal/sentinel-tooling/main/init.sh -o /tmp/sentinel-init.sh
+sudo bash /tmp/sentinel-init.sh
 ```
-3) Install the systemd unit:
+
+The installer drops `sentinel-manage` and runs `sentinel-manage init`.
+When the wizard finishes, start the agent:
+
 ```bash
-sudo install -m 644 sentinel_rtp_cam/sentinel_rtp_cam.service /etc/systemd/system/sentinel_rtp_cam.service
-sudo systemctl daemon-reload
-```
-4) Create the config directory and config file:
-```bash
-sudo install -d -m 755 /etc/sentinel_rtp_cam
-sudo nano /etc/sentinel_rtp_cam/env
-```
-5) Start the service:
-```bash
-sudo systemctl enable --now sentinel_rtp_cam
+sudo sentinel-manage start
 ```
 
 ## Configuration
 
-After installation, edit the configuration file:
+The agent reads JSON config files in `/etc/sentinel_rtp_cam`:
+
+- `server.json` (admin server base URL + bearer token)
+- `camera.json` (camera + forward config)
+
+Use the manage tool (from `sentinel-tooling`) to edit them:
 
 ```bash
-sudo nano /etc/sentinel_rtp_cam/env
+sudo sentinel-manage config server
+sudo sentinel-manage config camera
 ```
 
-Required settings:
-```bash
-CAMERA_IP=192.168.1.100
-CAMERA_USER=admin
-CAMERA_PASSWORD=your_password
-ADMIN_SERVER_URL=https://your-admin-server.com
-```
+If a server is configured, the agent will pull camera config from it.
 
-Then restart the service:
+## Service management
 
 ```bash
-sudo systemctl restart sentinel_rtp_cam
-```
-
-## Usage
-
-Check service status:
-```bash
-sudo systemctl status sentinel_rtp_cam
-```
-
-View logs:
-```bash
-sudo journalctl -u sentinel_rtp_cam -f
-```
-
-Monitor with status script:
-```bash
-sudo /usr/local/bin/sentinel_rtp_cam_status.sh
+sudo sentinel-manage status
+sudo sentinel-manage logs
+sudo sentinel-manage start
+sudo sentinel-manage stop
+sudo sentinel-manage restart
 ```
 
 ## Update
 
-Update to latest version:
+Install the latest release (does not auto-start):
+
 ```bash
-curl -fsSL https://raw.githubusercontent.com/david-hajnal/sentinel-tooling/main/scripts/update.sh | sudo bash
+sudo sentinel-manage update latest
 ```
 
-## Build from Source
+If you want it to restart services:
 
-We do not build on Raspberry Pi. Use GitHub workflows to produce releases and update the device
-with `update.sh` from https://github.com/david-hajnal/sentinel-tooling.
+```bash
+sudo sentinel-manage update latest --start
+```
 
-## Features
+## Build from source
 
-- RTSP/RTP video streaming from IP cameras
-- H.264 stream depacketization
-- ONVIF motion detection integration
-- Automatic video clip recording on motion events
-- Upload to admin server
-- Systemd service with automatic restart
-- Support for Raspberry Pi (armv7/aarch64)
-
-## Documentation
-
-- [Raspberry Pi Setup Guide](sentinel_rtp_cam/RASPBIAN_SETUP.md)
-- [Deployment Documentation](sentinel_rtp_cam/README_DEPLOY.md)
-- [Release Process](RELEASE.md)
+We do not build on Raspberry Pi. Releases are built in GitHub Actions and deployed via
+`sentinel-manage update` from the `sentinel-tooling` repo.
 
 ## License
 

@@ -1,169 +1,52 @@
-# Sentinel Video Receiver
+# Sentinel RTP Camera
 
-A Rust library for receiving RTSP/RTP video streams with ONVIF motion detection integration.
+Rust library and binaries for RTSP/RTP ingest, ONVIF motion detection, and forward-agent
+streaming.
 
-## Features
+For device install/manage, use the tooling repo: `david-hajnal/sentinel-tooling`.
 
-- RTSP client with TCP interleaved and UDP transport modes
-- RTP packet parsing and H.264 video depacketization
-- ONVIF motion event detection via WS-Security authenticated SOAP
-- Motion-triggered video clip recording (raw Annex-B .h264)
-- Event-driven architecture with pub-sub pattern
+## Binaries
 
-## Quick Start
+- `agent_forward` — forward agent used in production (talks to server ingest).
+- `app` — local receiver/recorder (developer use).
+- `server_ingest` — server-side ingest for forward mode.
+- `onvif_motion_pull`, `rtsp_pull_*` — diagnostics/dev helpers.
 
-### Configuration
+## Configuration
 
-Create a `.env` file from `.env.example`
+For deployed agents, configuration is stored in:
 
-### Logging
+- `/etc/sentinel_rtp_cam/server.json`
+- `/etc/sentinel_rtp_cam/camera.json`
 
-The application uses the `tracing` crate for structured logging. Control verbosity using the `RUST_LOG` environment variable:
+Use `sentinel-manage init` and `sentinel-manage config` (from `sentinel-tooling`) to manage
+these files. Environment variables can still override values for development and testing.
+
+## Logging
+
+Use `RUST_LOG` to control verbosity:
 
 ```bash
-# Show only errors and warnings
-RUST_LOG=warn cargo run --bin app
-
-# Show info messages (default)
 RUST_LOG=info cargo run --bin app
-
-# Show debug messages for troubleshooting
 RUST_LOG=debug cargo run --bin app
-
-# Show all trace messages
-RUST_LOG=trace cargo run --bin app
-
-# Filter by module (e.g., only RTSP debug logs)
-RUST_LOG=sentinel_rtp_cam::rtsp=debug,info cargo run --bin app
-
-# Multiple filters
-RUST_LOG=sentinel_rtp_cam::onvif_motion=debug,sentinel_rtp_cam::clip_recorder=trace,info cargo run --bin app
+RUST_LOG=sentinel_rtp_cam::onvif_motion=debug,info cargo run --bin app
 ```
-
-Log output includes:
-- Thread IDs for async task tracking
-- Source file and line numbers
-- Structured fields for easy parsing (rule, timestamp, ports, etc.)
-
-Example log output:
-```
-2026-01-17T10:30:45.123Z  INFO sentinel_rtp_cam::onvif_motion: ONVIF motion poller starting service=http://192.168.1.100:2020/onvif/service
-2026-01-17T10:30:46.456Z  INFO sentinel_rtp_cam::rtsp_receiver_udp: Starting RTSP UDP receiver host=192.168.1.100 port=554
-2026-01-17T10:30:50.789Z  INFO sentinel_rtp_cam: Motion detected rule="VideoSource/MotionAlarm" timestamp=2026-01-17T10:30:50Z
-2026-01-17T10:30:51.012Z  INFO sentinel_rtp_cam::clip_recorder: Recording started rule="VideoSource/MotionAlarm"
-```
-
-### Running
-
-Start the receiver with ONVIF motion detection:
-
-```bash
-cargo run --bin app
-```
-
-Run ONVIF motion detection only:
-
-```bash
-cargo run --bin app -- --onvif-only
-```
-
-### Agent → Server forwarding
-
-#### Agent (Pi)
-Environment:
-```
-SERVER_ADDR=cloud.example.com:9000
-AGENT_TOKEN=secret
-AGENT_ID=pi-cam-001
-
-CAM1_RTSP_URL=rtsp://camera/stream1
-CAM1_RTSP_USER=user
-CAM1_RTSP_PASS=pass
-CAM1_STREAM_ID=1
-CAM1_TRANSPORT=tcp   # or udp
-CAM1_RTP_PORT=5004   # only for udp
-CAM1_RTCP_PORT=5005  # only for udp
-CAM1_CAMERA_ID=pi-cam-001
-```
-
-Run:
-```bash
-cargo run --bin agent_forward
-```
-
-#### Server (cloud ingest)
-Environment:
-```
-SERVER_BIND=0.0.0.0:9000
-SERVER_TOKEN=secret
-CLIP_DIR=clips
-CLIP_PREROLL_SECS=3
-CLIP_POST_ROLL_SECS=5
-CLIP_WRITE_BATCH_BYTES=262144
-CLIP_MAX_SECS=10
-```
-
-Run:
-```bash
-cargo run --bin server_ingest
-```
-
-## Architecture
-
-- **RTSP Client**: Handles RTSP protocol communication (OPTIONS, DESCRIBE, SETUP, PLAY, TEARDOWN)
-- **RTP Parser**: Parses RTP packets and extracts H.264 NAL units
-- **H.264 Depacketizer**: Reconstructs fragmented NAL units (FU-A) from RTP payloads
-- **ONVIF Client**: Polls motion events using SOAP PullPoint subscriptions
-- **Event Bus**: Distributes motion events to subscribers
-- **Clip Recorder**: Records video clips with pre/post-roll on motion events
-
-## Project Structure
-
-```
-src/
-├── lib.rs                  # Public API
-├── error.rs                # Typed error handling
-├── rtp.rs                  # RTP packet parsing
-├── rtsp.rs                 # RTSP client
-├── sdp.rs                  # SDP parser
-├── h264_depacketize.rs     # H.264 RTP depacketization
-├── onvif_motion.rs         # ONVIF motion detection
-├── event_bus.rs            # Event distribution
-├── clip_recorder.rs        # Video recording
-├── rtsp_receiver_tcp.rs    # TCP interleaved receiver
-├── rtsp_receiver_udp.rs    # UDP receiver
-└── bin/
-    └── app.rs              # Main application
-
-```
-
-## Requirements
-
-- Rust 2021 edition
-- ONVIF-compatible IP camera
 
 ## Development
 
-### Build
-
 ```bash
 cargo build
-```
-
-### Test
-
-```bash
 cargo test
 ```
 
-### Run specific binary
+Run specific binaries:
 
 ```bash
-cargo run --bin rtsp_pull_tcp_interleaved_to_h264
-cargo run --bin rtsp_pull_udp_to_h264
+cargo run --bin agent_forward
+cargo run --bin server_ingest
 cargo run --bin onvif_motion_pull
 ```
 
 ## License
 
-See LICENSE file for details.
+See LICENSE.
