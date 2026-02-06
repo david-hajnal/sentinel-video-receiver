@@ -31,11 +31,17 @@ async fn try_pull_remote_config(
     camera_path: &PathBuf,
 ) -> Result<bool> {
     let url = format!("{}/api/v1/config", base_url.trim_end_matches('/'));
-    let mut req = client.get(&url).bearer_auth(bearer_token);
-    if let Some(hint) = camera_hint.as_deref() {
-        req = req.header("x-camera-id", hint);
+    let mut resp = {
+        let mut req = client.get(&url).bearer_auth(bearer_token);
+        if let Some(hint) = camera_hint.as_deref() {
+            req = req.header("x-camera-id", hint);
+        }
+        req.send().await?
+    };
+    if resp.status() == reqwest::StatusCode::NOT_FOUND && camera_hint.is_some() {
+        warn!("Config pull failed for hinted camera; retrying without hint");
+        resp = client.get(&url).bearer_auth(bearer_token).send().await?;
     }
-    let resp = req.send().await?;
     if !resp.status().is_success() {
         warn!(
             status = %resp.status(),
