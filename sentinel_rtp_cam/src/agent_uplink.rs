@@ -1,5 +1,9 @@
+use anyhow::{anyhow, Result};
+use rustls::pki_types::ServerName;
 use serde::Serialize;
 use std::collections::HashMap;
+use std::net::IpAddr;
+use std::path::{Path, PathBuf};
 use std::sync::{
     atomic::{AtomicU64, Ordering},
     Arc,
@@ -8,7 +12,9 @@ use std::time::{Duration, Instant};
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 use tokio::time::{interval, sleep};
-use tracing::{debug, info, warn};
+use tokio_rustls::TlsConnector;
+use tracing::{debug, error, info, warn};
+use url::Url;
 
 use crate::proto::{encode_gap, write_msg, Msg, GAP, HELLO, MOTION, PING, RTP};
 
@@ -53,8 +59,27 @@ impl Uplink {
         tokio::spawn(async move {
             let mut backoff = Duration::from_secs(1);
             loop {
+                let (connector, server_name) = match build_tls_connector(&server_addr) {
+                    Ok(conn) => conn,
+                    Err(e) => {
+                        error!(error = %e, server = %server_addr, "Uplink TLS config failed");
+                        sleep(backoff).await;
+                        backoff = (backoff * 2).min(Duration::from_secs(30));
+                        continue;
+                    }
+                };
+
                 match TcpStream::connect(&server_addr).await {
-                    Ok(mut stream) => {
+                    Ok(stream) => {
+                        let mut stream = match connector.connect(server_name, stream).await {
+                            Ok(tls) => tls,
+                            Err(e) => {
+                                error!(error = %e, server = %server_addr, "Uplink TLS handshake failed");
+                                sleep(backoff).await;
+                                backoff = (backoff * 2).min(Duration::from_secs(30));
+                                continue;
+                            }
+                        };
                         info!(
                             server = %server_addr,
                             agent_id = %agent_id,
@@ -77,7 +102,7 @@ impl Uplink {
                         let payload = match serde_json::to_vec(&hello) {
                             Ok(p) => p,
                             Err(e) => {
-                                warn!(error = %e, "Failed to serialize HELLO");
+                                error!(error = %e, "Failed to serialize HELLO");
                                 sleep(backoff).await;
                                 continue;
                             }
@@ -88,7 +113,7 @@ impl Uplink {
                             payload,
                         };
                         if let Err(e) = write_msg(&mut stream, &hello_msg).await {
-                            warn!(error = %e, "Failed to send HELLO");
+                            error!(error = %e, "Failed to send HELLO");
                             sleep(backoff).await;
                             continue;
                         }
@@ -105,7 +130,7 @@ impl Uplink {
                             tokio::select! {
                                 Some(msg) = rx.recv() => {
                                     if let Err(e) = write_msg(&mut stream, &msg).await {
-                                        warn!(error = %e, "Uplink write failed, reconnecting");
+                                        error!(error = %e, "Uplink write failed, reconnecting");
                                         break;
                                     }
                                     sent += 1;
@@ -123,7 +148,7 @@ impl Uplink {
                                     let payload = serde_json::to_vec(&stats).unwrap_or_default();
                                     let ping_msg = Msg { msg_type: PING, stream_id: 0, payload };
                                     if let Err(e) = write_msg(&mut stream, &ping_msg).await {
-                                        warn!(error = %e, "Uplink ping failed, reconnecting");
+                                        error!(error = %e, "Uplink ping failed, reconnecting");
                                         break;
                                     }
                                     debug!(sent = sent, "Uplink ping");
@@ -158,7 +183,7 @@ impl Uplink {
                         }
                     }
                     Err(e) => {
-                        warn!(error = %e, server = %server_addr, "Uplink connect failed");
+                        error!(error = %e, server = %server_addr, "Uplink connect failed");
                     }
                 }
 
@@ -241,4 +266,58 @@ impl Uplink {
             }
         }
     }
+}
+
+fn build_tls_connector(server_addr: &str) -> Result<(TlsConnector, ServerName<'static>)> {
+    let ca_path = std::env::var("INGEST_TLS_CA")
+        .ok()
+        .filter(|v| !v.trim().is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("/etc/sentinel_rtp_cam/ca.crt"));
+    let server_name = resolve_server_name(server_addr)?;
+    let config = load_tls_config(&ca_path)?;
+    Ok((TlsConnector::from(Arc::new(config)), server_name))
+}
+
+fn load_tls_config(ca_path: &Path) -> Result<rustls::ClientConfig> {
+    let mut root_store = rustls::RootCertStore::empty();
+    let certs = load_certs(ca_path)?;
+    if certs.is_empty() {
+        return Err(anyhow!("no CA certs found in {}", ca_path.display()));
+    }
+    for cert in certs {
+        root_store
+            .add(cert)
+            .map_err(|_| anyhow!("failed to add CA cert from {}", ca_path.display()))?;
+    }
+
+    let config = rustls::ClientConfig::builder()
+        .with_root_certificates(root_store)
+        .with_no_client_auth();
+    Ok(config)
+}
+
+fn load_certs(path: &Path) -> Result<Vec<rustls::pki_types::CertificateDer<'static>>> {
+    let mut reader = std::io::BufReader::new(std::fs::File::open(path)?);
+    let certs = rustls_pemfile::certs(&mut reader)
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    Ok(certs)
+}
+
+fn resolve_server_name(server_addr: &str) -> Result<ServerName<'static>> {
+    if let Ok(name) = std::env::var("INGEST_TLS_SERVER_NAME") {
+        if let Ok(ip) = name.parse::<IpAddr>() {
+            return Ok(ServerName::IpAddress(ip.into()));
+        }
+        return Ok(ServerName::try_from(name)?);
+    }
+
+    let url = Url::parse(&format!("tcp://{server_addr}"))?;
+    let host = url
+        .host_str()
+        .ok_or_else(|| anyhow!("server host missing in {}", server_addr))?;
+    if let Ok(ip) = host.parse::<IpAddr>() {
+        return Ok(ServerName::IpAddress(ip.into()));
+    }
+    Ok(ServerName::try_from(host.to_string())?)
 }
