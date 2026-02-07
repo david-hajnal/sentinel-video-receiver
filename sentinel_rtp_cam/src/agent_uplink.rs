@@ -18,7 +18,7 @@ use tokio_rustls::TlsConnector;
 use tracing::{debug, error, info, warn};
 use url::Url;
 
-use crate::proto::{encode_gap, Msg, GAP, MOTION, RTP};
+use crate::proto::{Msg, GAP, MOTION, RTP};
 
 #[derive(Clone)]
 pub struct Uplink {
@@ -37,10 +37,13 @@ struct HelloPayload {
 
 #[derive(Debug, Deserialize)]
 struct LegacyMotionPayload {
+    #[allow(dead_code)]
     rule: Option<String>,
     active: Option<bool>,
     ts: Option<String>,
+    #[allow(dead_code)]
     camera_id: Option<String>,
+    #[allow(dead_code)]
     event_id: Option<String>,
 }
 
@@ -230,14 +233,12 @@ impl Uplink {
                                             stats_task.motion_sent.fetch_add(1, Ordering::Relaxed);
                                         }
                                         GAP => {
-                                            let dropped = stats_task.dropped.fetch_add(1, Ordering::Relaxed) + 1;
-                                            if dropped <= 3 || dropped % 100 == 0 {
-                                                warn!(
-                                                    stream_id = msg.stream_id,
-                                                    dropped_total = dropped,
-                                                    "Uplink GAP not supported by TLS ingest; dropped"
-                                                );
+                                            if let Err(e) = write_record(&mut stream, RECORD_GAP, 0, &msg.payload).await {
+                                                error!(error = %e, "Uplink write failed, reconnecting");
+                                                break;
                                             }
+                                            sent += 1;
+                                            stats_task.gap_sent.fetch_add(1, Ordering::Relaxed);
                                         }
                                         _ => {}
                                     }
@@ -314,7 +315,7 @@ impl Uplink {
         let msg = Msg {
             msg_type: GAP,
             stream_id,
-            payload: encode_gap(last_seq, new_seq),
+            payload: encode_gap_tls(stream_id, last_seq, new_seq),
         };
         if let Err(e) = self.tx.try_send(msg) {
             let dropped = self.stats.dropped.fetch_add(1, Ordering::Relaxed) + 1;
@@ -377,7 +378,9 @@ fn build_tls_connector(server_addr: &str) -> Result<(TlsConnector, ServerName<'s
 
 #[derive(Debug, Deserialize)]
 struct HelloOkPayload {
+    #[allow(dead_code)]
     session_id: String,
+    #[allow(dead_code)]
     max_payload: u32,
     ping_interval_sec: u64,
 }
@@ -396,9 +399,11 @@ const RECORD_PING: u8 = 4;
 const RECORD_CLOSE: u8 = 5;
 const RECORD_HELLO_OK: u8 = 6;
 const RECORD_ERROR: u8 = 7;
+const RECORD_GAP: u8 = 8;
 
 struct Record {
     record_type: u8,
+    #[allow(dead_code)]
     flags: u8,
     payload: Vec<u8>,
 }
@@ -448,6 +453,14 @@ fn generate_nonce() -> String {
     let mut buf = [0u8; 16];
     rand::thread_rng().fill_bytes(&mut buf);
     base64::engine::general_purpose::STANDARD.encode(&buf)
+}
+
+fn encode_gap_tls(stream_id: u32, last_seq: u16, new_seq: u16) -> Vec<u8> {
+    let mut buf = [0u8; 8];
+    buf[0..4].copy_from_slice(&stream_id.to_be_bytes());
+    buf[4..6].copy_from_slice(&last_seq.to_be_bytes());
+    buf[6..8].copy_from_slice(&new_seq.to_be_bytes());
+    buf.to_vec()
 }
 
 fn build_event_payload(msg: &Msg) -> EventPayload {
