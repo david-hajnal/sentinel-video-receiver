@@ -7,7 +7,7 @@ use tokio::sync::RwLock;
 use tokio::time::sleep;
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
-use serde_json::{json, Value};
+use serde_json::Value;
 
 use sentinel_rtp_cam::agent_uplink::Uplink;
 use sentinel_rtp_cam::core::rtp::RtpPacket;
@@ -27,7 +27,7 @@ async fn try_pull_remote_config(
     base_url: &str,
     bearer_token: &str,
     camera_hint: Option<String>,
-    server_path: &PathBuf,
+    _server_path: &PathBuf,
     camera_path: &PathBuf,
 ) -> Result<bool> {
     let url = format!("{}/api/v1/config", base_url.trim_end_matches('/'));
@@ -55,15 +55,6 @@ async fn try_pull_remote_config(
         warn!("Config pull response missing config payload");
         return Ok(false);
     };
-
-    if let Some(server_update) = config.get("server") {
-        let server_payload = json!({ "server": server_update });
-        AgentConfig::merge_json_file_with_default(
-            server_path,
-            &server_payload,
-            AgentConfig::default_server_json(),
-        )?;
-    }
 
     let mut camera_update = config.clone();
     if let Some(obj) = camera_update.as_object_mut() {
