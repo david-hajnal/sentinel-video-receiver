@@ -61,6 +61,9 @@ struct EventPayload {
     state: String,
     event_ts_unix_ms: i64,
     confidence: f64,
+    rule: Option<String>,
+    event_id: Option<String>,
+    camera_id: Option<String>,
 }
 
 #[derive(Default)]
@@ -495,6 +498,8 @@ fn build_streams_info(
 fn build_event_payload(msg: &Msg) -> EventPayload {
     let legacy = serde_json::from_slice::<LegacyMotionPayload>(&msg.payload).ok();
     let active = legacy.as_ref().and_then(|p| p.active).unwrap_or(false);
+    let rule = legacy.as_ref().and_then(|p| p.rule.clone()).unwrap_or_else(|| "motion".to_string());
+    let camera_id = legacy.as_ref().and_then(|p| p.camera_id.clone());
     let ts = legacy.as_ref().and_then(|p| p.ts.clone());
     let event_ts = ts
         .and_then(|value| chrono::DateTime::parse_from_rfc3339(&value).ok())
@@ -505,12 +510,22 @@ fn build_event_payload(msg: &Msg) -> EventPayload {
                 .map(|d| d.as_millis() as i64)
                 .unwrap_or(0)
         });
+    let event_id = legacy.as_ref().and_then(|p| p.event_id.clone()).or_else(|| {
+        if event_ts > 0 {
+            Some(format!("stream{}-{}", msg.stream_id, event_ts))
+        } else {
+            None
+        }
+    });
     EventPayload {
         stream_id: msg.stream_id.to_string(),
         event_type: "motion".to_string(),
         state: if active { "start" } else { "stop" }.to_string(),
         event_ts_unix_ms: event_ts,
         confidence: 0.0,
+        rule: Some(rule),
+        event_id,
+        camera_id,
     }
 }
 
