@@ -20,6 +20,7 @@ struct Settings {
     streams: Vec<String>,
     ca_cert: Option<PathBuf>,
     insecure: bool,
+    hello_timeout_secs: u64,
     ping_interval: u64,
     rtp_interval_ms: u64,
     event_interval_sec: u64,
@@ -72,7 +73,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     )
     .await?;
 
-    let hello_ok = wait_for_hello_ok(&mut read_half, settings.ping_interval).await?;
+    let hello_ok = wait_for_hello_ok(&mut read_half, settings.hello_timeout_secs).await?;
     info!(session_id = %hello_ok.session_id, "HELLO_OK received");
 
     let stop_flag = Arc::new(Mutex::new(false));
@@ -99,10 +100,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 async fn wait_for_hello_ok(
     read_half: &mut tokio::io::ReadHalf<tokio_rustls::client::TlsStream<TcpStream>>,
-    ping_interval: u64,
+    hello_timeout_secs: u64,
 ) -> Result<HelloOk, Box<dyn std::error::Error>> {
     let record = timeout(
-        Duration::from_secs(ping_interval * 3),
+        Duration::from_secs(hello_timeout_secs),
         read_record(read_half),
     )
     .await
@@ -435,6 +436,7 @@ fn load_settings() -> Result<Settings, Box<dyn std::error::Error>> {
     let mut streams = None;
     let mut ca_cert = None;
     let mut insecure = false;
+    let mut hello_timeout_secs = 10u64;
     let mut ping_interval = 15u64;
     let mut rtp_interval_ms = 100u64;
     let mut event_interval_sec = 10u64;
@@ -448,6 +450,11 @@ fn load_settings() -> Result<Settings, Box<dyn std::error::Error>> {
             "--streams" => streams = args.next(),
             "--ca" => ca_cert = args.next().map(PathBuf::from),
             "--insecure" => insecure = true,
+            "--hello-timeout" => {
+                if let Some(v) = args.next() {
+                    hello_timeout_secs = v.parse().unwrap_or(hello_timeout_secs)
+                }
+            }
             "--ping" => {
                 if let Some(v) = args.next() {
                     ping_interval = v.parse().unwrap_or(ping_interval)
@@ -483,6 +490,10 @@ fn load_settings() -> Result<Settings, Box<dyn std::error::Error>> {
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
         .collect::<Vec<_>>();
+    let hello_timeout_secs = std::env::var("HELLO_TIMEOUT_SECS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(hello_timeout_secs);
 
     Ok(Settings {
         server_addr,
@@ -491,6 +502,7 @@ fn load_settings() -> Result<Settings, Box<dyn std::error::Error>> {
         streams,
         ca_cert,
         insecure,
+        hello_timeout_secs,
         ping_interval,
         rtp_interval_ms,
         event_interval_sec,
