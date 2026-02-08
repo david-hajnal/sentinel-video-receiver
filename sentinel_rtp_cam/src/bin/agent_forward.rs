@@ -1,4 +1,5 @@
 use anyhow::{anyhow, bail, Result};
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -310,6 +311,10 @@ async fn main() -> Result<()> {
     }
 
     let (stream_map, camera_to_stream) = build_stream_maps(&cams);
+    let stream_to_camera: HashMap<u32, String> = camera_to_stream
+        .iter()
+        .map(|(camera_id, stream_id)| (*stream_id, camera_id.clone()))
+        .collect();
     let agent_token = cams
         .first()
         .map(|cam| cam.agent_token.clone())
@@ -330,7 +335,13 @@ async fn main() -> Result<()> {
         stream_count = stream_map.len(),
         "Agent uplink configured"
     );
-    let uplink = Uplink::connect_and_run(server_addr, agent_token, agent_id, stream_map);
+    let uplink = Uplink::connect_and_run(
+        server_addr,
+        agent_token,
+        agent_id,
+        stream_map,
+        stream_to_camera,
+    );
 
     let cancel = CancellationToken::new();
 

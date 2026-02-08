@@ -33,8 +33,15 @@ struct HelloPayload {
     streams: Vec<String>,
     timestamp_unix: i64,
     nonce: String,
+    streams_info: Vec<HelloStream>,
 }
 
+#[derive(Debug, Serialize)]
+struct HelloStream {
+    stream_id: u32,
+    name: String,
+    camera_id: String,
+}
 #[derive(Debug, Deserialize)]
 struct LegacyMotionPayload {
     #[allow(dead_code)]
@@ -70,6 +77,7 @@ impl Uplink {
         token: String,
         agent_id: String,
         stream_map: HashMap<u32, String>,
+        stream_camera_map: HashMap<u32, String>,
     ) -> Self {
         let (tx, mut rx) = mpsc::channel::<Msg>(4096);
         let stats = Arc::new(UplinkStats::default());
@@ -112,12 +120,14 @@ impl Uplink {
                             .duration_since(UNIX_EPOCH)
                             .map(|d| d.as_secs() as i64)
                             .unwrap_or(0);
+                        let streams_info = build_streams_info(&stream_map, &stream_camera_map);
                         let hello = HelloPayload {
                             agent_id: agent_id.clone(),
                             token: token.clone(),
                             streams: stream_map.values().cloned().collect(),
                             timestamp_unix: now,
                             nonce,
+                            streams_info,
                         };
                         let payload = match serde_json::to_vec(&hello) {
                             Ok(p) => p,
@@ -461,6 +471,25 @@ fn encode_gap_tls(stream_id: u32, last_seq: u16, new_seq: u16) -> Vec<u8> {
     buf[4..6].copy_from_slice(&last_seq.to_be_bytes());
     buf[6..8].copy_from_slice(&new_seq.to_be_bytes());
     buf.to_vec()
+}
+
+fn build_streams_info(
+    stream_map: &HashMap<u32, String>,
+    stream_camera_map: &HashMap<u32, String>,
+) -> Vec<HelloStream> {
+    let mut streams: Vec<HelloStream> = stream_map
+        .iter()
+        .map(|(stream_id, name)| HelloStream {
+            stream_id: *stream_id,
+            name: name.clone(),
+            camera_id: stream_camera_map
+                .get(stream_id)
+                .cloned()
+                .unwrap_or_else(|| format!("stream-{stream_id}")),
+        })
+        .collect();
+    streams.sort_by_key(|s| s.stream_id);
+    streams
 }
 
 fn build_event_payload(msg: &Msg) -> EventPayload {
