@@ -169,7 +169,7 @@ impl Uplink {
                         );
 
                         // Wait for HELLO_OK with timeout (3x the typical ping interval)
-                        let hello_ok = match timeout(Duration::from_secs(30), inbound_rx.recv()).await {
+                        let hello_ok = match timeout(Duration::from_secs(HELLO_OK_TIMEOUT_SECS), inbound_rx.recv()).await {
                             Ok(Some(Ok(rec))) if rec.record_type == RECORD_HELLO_OK => {
                                 match serde_json::from_slice::<HelloOkPayload>(&rec.payload) {
                                     Ok(ok) => ok,
@@ -440,6 +440,7 @@ struct ErrorPayload {
 }
 
 const MAX_PAYLOAD: usize = 2 * 1024 * 1024;
+const HELLO_OK_TIMEOUT_SECS: u64 = 30;
 const RECORD_HELLO: u8 = 1;
 const RECORD_RTP: u8 = 2;
 const RECORD_EVENT: u8 = 3;
