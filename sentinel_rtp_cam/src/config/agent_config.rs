@@ -159,6 +159,7 @@ impl AgentConfig {
     /// Apply JSON overrides to process environment variables.
     pub fn apply_json_env_overrides(value: &Value) {
         set_env_if_value("CAMERA_ID", value.get("camera_id"));
+        set_env_if_value("AGENT_ID", value.get("agent_id"));
 
         let server = value.get("server").unwrap_or(&Value::Null);
         set_env_if_value("SERVER_ENABLED", server.get("enabled"));
@@ -206,8 +207,10 @@ impl AgentConfig {
                 let motion = cam.get("motion").unwrap_or(&Value::Null);
                 let features = cam.get("features").unwrap_or(&Value::Null);
 
-                set_env_if_value(&format!("{prefix}CAMERA_ID"), cam.get("id"));
-                set_env_if_value(&format!("{prefix}AGENT_ID"), cam.get("id"));
+                let cam_id = cam.get("camera_id").or_else(|| cam.get("id"));
+                let cam_agent_id = cam.get("agent_id").or(cam_id);
+                set_env_if_value(&format!("{prefix}CAMERA_ID"), cam_id);
+                set_env_if_value(&format!("{prefix}AGENT_ID"), cam_agent_id);
                 set_env_if_value(
                     &format!("{prefix}STREAM_ID"),
                     rtsp.get("stream_id").or_else(|| cam.get("stream_id")),
@@ -285,8 +288,10 @@ impl AgentConfig {
                 let motion = first.get("motion").unwrap_or(&Value::Null);
                 let features = first.get("features").unwrap_or(&Value::Null);
 
-                set_env_if_unset("CAMERA_ID", first.get("id"));
-                set_env_if_unset("AGENT_ID", first.get("id"));
+                let cam_id = first.get("camera_id").or_else(|| first.get("id"));
+                let cam_agent_id = first.get("agent_id").or(cam_id);
+                set_env_if_unset("CAMERA_ID", cam_id);
+                set_env_if_unset("AGENT_ID", cam_agent_id);
                 set_env_if_unset("MOTION_ENABLED", motion.get("enabled"));
                 set_env_if_unset("LOCAL_CLIP_ENABLED", features.get("local_clip_enabled"));
                 set_env_if_unset(
