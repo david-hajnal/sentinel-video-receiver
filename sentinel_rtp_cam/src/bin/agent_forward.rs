@@ -1,4 +1,5 @@
 use anyhow::{anyhow, bail, Result};
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -7,7 +8,7 @@ use tokio::sync::RwLock;
 use tokio::time::sleep;
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
-use serde_json::{json, Value};
+use serde_json::Value;
 
 use sentinel_rtp_cam::agent_uplink::Uplink;
 use sentinel_rtp_cam::core::rtp::RtpPacket;
@@ -27,7 +28,7 @@ async fn try_pull_remote_config(
     base_url: &str,
     bearer_token: &str,
     camera_hint: Option<String>,
-    server_path: &PathBuf,
+    _server_path: &PathBuf,
     camera_path: &PathBuf,
 ) -> Result<bool> {
     let url = format!("{}/api/v1/config", base_url.trim_end_matches('/'));
@@ -55,15 +56,6 @@ async fn try_pull_remote_config(
         warn!("Config pull response missing config payload");
         return Ok(false);
     };
-
-    if let Some(server_update) = config.get("server") {
-        let server_payload = json!({ "server": server_update });
-        AgentConfig::merge_json_file_with_default(
-            server_path,
-            &server_payload,
-            AgentConfig::default_server_json(),
-        )?;
-    }
 
     let mut camera_update = config.clone();
     if let Some(obj) = camera_update.as_object_mut() {
@@ -319,6 +311,10 @@ async fn main() -> Result<()> {
     }
 
     let (stream_map, camera_to_stream) = build_stream_maps(&cams);
+    let stream_to_camera: HashMap<u32, String> = camera_to_stream
+        .iter()
+        .map(|(camera_id, stream_id)| (*stream_id, camera_id.clone()))
+        .collect();
     let agent_token = cams
         .first()
         .map(|cam| cam.agent_token.clone())
@@ -339,7 +335,13 @@ async fn main() -> Result<()> {
         stream_count = stream_map.len(),
         "Agent uplink configured"
     );
-    let uplink = Uplink::connect_and_run(server_addr, agent_token, agent_id, stream_map);
+    let uplink = Uplink::connect_and_run(
+        server_addr,
+        agent_token,
+        agent_id,
+        stream_map,
+        stream_to_camera,
+    );
 
     let cancel = CancellationToken::new();
 

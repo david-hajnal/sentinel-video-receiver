@@ -1,0 +1,17 @@
+[package]
+name = "ingest_agent"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+ingest_proto = { git = "ssh://git@github.com/david-hajnal/sentinel-admin-server.git", package = "ingest_proto", branch = "main", subdir = "tls_ingest/proto" }
+tokio = { version = "1", features = ["full"] }
+tokio-rustls = "0.26"
+rustls = "0.23"
+rustls-pemfile = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+bytes = "1"
+rand = "0.8"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }

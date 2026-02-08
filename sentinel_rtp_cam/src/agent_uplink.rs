@@ -1,16 +1,24 @@
-use serde::Serialize;
+use anyhow::{anyhow, Result};
+use base64::Engine;
+use rand::RngCore;
+use rustls::pki_types::ServerName;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::net::IpAddr;
+use std::path::{Path, PathBuf};
 use std::sync::{
     atomic::{AtomicU64, Ordering},
     Arc,
 };
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 use tokio::time::{interval, sleep};
-use tracing::{debug, info, warn};
+use tokio_rustls::TlsConnector;
+use tracing::{debug, error, info, warn};
+use url::Url;
 
-use crate::proto::{encode_gap, write_msg, Msg, GAP, HELLO, MOTION, PING, RTP};
+use crate::proto::{Msg, GAP, MOTION, RTP};
 
 #[derive(Clone)]
 pub struct Uplink {
@@ -22,13 +30,40 @@ pub struct Uplink {
 struct HelloPayload {
     agent_id: String,
     token: String,
-    streams: Vec<HelloStream>,
+    streams: Vec<String>,
+    timestamp_unix: i64,
+    nonce: String,
+    streams_info: Vec<HelloStream>,
 }
 
 #[derive(Debug, Serialize)]
 struct HelloStream {
     stream_id: u32,
     name: String,
+    camera_id: String,
+}
+#[derive(Debug, Deserialize)]
+struct LegacyMotionPayload {
+    #[allow(dead_code)]
+    rule: Option<String>,
+    active: Option<bool>,
+    ts: Option<String>,
+    #[allow(dead_code)]
+    camera_id: Option<String>,
+    #[allow(dead_code)]
+    event_id: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct EventPayload {
+    stream_id: String,
+    event_type: String,
+    state: String,
+    event_ts_unix_ms: i64,
+    confidence: f64,
+    rule: Option<String>,
+    event_id: Option<String>,
+    camera_id: Option<String>,
 }
 
 #[derive(Default)]
@@ -45,6 +80,7 @@ impl Uplink {
         token: String,
         agent_id: String,
         stream_map: HashMap<u32, String>,
+        stream_camera_map: HashMap<u32, String>,
     ) -> Self {
         let (tx, mut rx) = mpsc::channel::<Msg>(4096);
         let stats = Arc::new(UplinkStats::default());
@@ -53,8 +89,27 @@ impl Uplink {
         tokio::spawn(async move {
             let mut backoff = Duration::from_secs(1);
             loop {
+                let (connector, server_name) = match build_tls_connector(&server_addr) {
+                    Ok(conn) => conn,
+                    Err(e) => {
+                        error!(error = %e, server = %server_addr, "Uplink TLS config failed");
+                        sleep(backoff).await;
+                        backoff = (backoff * 2).min(Duration::from_secs(30));
+                        continue;
+                    }
+                };
+
                 match TcpStream::connect(&server_addr).await {
-                    Ok(mut stream) => {
+                    Ok(stream) => {
+                        let stream = match connector.connect(server_name, stream).await {
+                            Ok(tls) => tls,
+                            Err(e) => {
+                                error!(error = %e, server = %server_addr, "Uplink TLS handshake failed");
+                                sleep(backoff).await;
+                                backoff = (backoff * 2).min(Duration::from_secs(30));
+                                continue;
+                            }
+                        };
                         info!(
                             server = %server_addr,
                             agent_id = %agent_id,
@@ -63,38 +118,105 @@ impl Uplink {
                         );
                         backoff = Duration::from_secs(1);
 
+                        let nonce = generate_nonce();
+                        let now = SystemTime::now()
+                            .duration_since(UNIX_EPOCH)
+                            .map(|d| d.as_secs() as i64)
+                            .unwrap_or(0);
+                        let streams_info = build_streams_info(&stream_map, &stream_camera_map);
+                        let streams: Vec<String> =
+                            streams_info.iter().map(|s| s.name.clone()).collect();
                         let hello = HelloPayload {
                             agent_id: agent_id.clone(),
                             token: token.clone(),
-                            streams: stream_map
-                                .iter()
-                                .map(|(id, name)| HelloStream {
-                                    stream_id: *id,
-                                    name: name.clone(),
-                                })
-                                .collect(),
+                            streams,
+                            timestamp_unix: now,
+                            nonce,
+                            streams_info,
                         };
                         let payload = match serde_json::to_vec(&hello) {
                             Ok(p) => p,
                             Err(e) => {
-                                warn!(error = %e, "Failed to serialize HELLO");
+                                error!(error = %e, "Failed to serialize HELLO");
                                 sleep(backoff).await;
                                 continue;
                             }
                         };
-                        let hello_msg = Msg {
-                            msg_type: HELLO,
-                            stream_id: 0,
-                            payload,
-                        };
-                        if let Err(e) = write_msg(&mut stream, &hello_msg).await {
-                            warn!(error = %e, "Failed to send HELLO");
+                        let (mut read_half, mut write_half) = tokio::io::split(stream);
+                        if let Err(e) =
+                            write_record(&mut write_half, RECORD_HELLO, 0, &payload).await
+                        {
+                            error!(error = %e, "Failed to send HELLO");
                             sleep(backoff).await;
                             continue;
                         }
                         info!(stream_count = stream_map.len(), "Uplink HELLO sent");
 
-                        let mut ping = interval(Duration::from_secs(10));
+                        let hello_timeout_secs = std::env::var("INGEST_TLS_HELLO_TIMEOUT_SECS")
+                            .ok()
+                            .and_then(|v| v.parse::<u64>().ok())
+                            .unwrap_or(10);
+                        let hello_ok = match tokio::time::timeout(
+                            Duration::from_secs(hello_timeout_secs),
+                            read_record(&mut read_half),
+                        )
+                        .await
+                        {
+                            Ok(Ok(rec)) if rec.record_type == RECORD_HELLO_OK => {
+                                match serde_json::from_slice::<HelloOkPayload>(&rec.payload) {
+                                    Ok(ok) => ok,
+                                    Err(e) => {
+                                        error!(error = %e, "Failed to parse HELLO_OK");
+                                        sleep(backoff).await;
+                                        continue;
+                                    }
+                                }
+                            }
+                            Ok(Ok(rec)) if rec.record_type == RECORD_ERROR => {
+                                if let Ok(err) = serde_json::from_slice::<ErrorPayload>(&rec.payload)
+                                {
+                                    error!(code = %err.code, message = %err.message, "HELLO rejected");
+                                } else {
+                                    error!("HELLO rejected");
+                                }
+                                sleep(backoff).await;
+                                continue;
+                            }
+                            Ok(Ok(rec)) => {
+                                error!(record_type = rec.record_type, "Unexpected record after HELLO");
+                                sleep(backoff).await;
+                                continue;
+                            }
+                            Ok(Err(e)) => {
+                                error!(error = %e, "Failed to read HELLO_OK");
+                                sleep(backoff).await;
+                                continue;
+                            }
+                            Err(_) => {
+                                error!("Timed out waiting for HELLO_OK");
+                                sleep(backoff).await;
+                                continue;
+                            }
+                        };
+
+                        let (rec_tx, mut rec_rx) = mpsc::channel::<Result<Record>>(32);
+                        let read_task = tokio::spawn(async move {
+                            loop {
+                                match read_record(&mut read_half).await {
+                                    Ok(rec) => {
+                                        if rec_tx.send(Ok(rec)).await.is_err() {
+                                            break;
+                                        }
+                                    }
+                                    Err(e) => {
+                                        let _ = rec_tx.send(Err(e)).await;
+                                        break;
+                                    }
+                                }
+                            }
+                        });
+
+                        let mut ping = interval(Duration::from_secs(hello_ok.ping_interval_sec));
                         let mut sent: u64 = 0;
                         let mut last_log = Instant::now();
                         let mut last_rtp = 0u64;
@@ -103,27 +225,78 @@ impl Uplink {
                         let mut last_dropped = 0u64;
                         loop {
                             tokio::select! {
-                                Some(msg) = rx.recv() => {
-                                    if let Err(e) = write_msg(&mut stream, &msg).await {
-                                        warn!(error = %e, "Uplink write failed, reconnecting");
-                                        break;
+                                rec = rec_rx.recv() => {
+                                    match rec {
+                                        Some(Ok(rec)) => {
+                                            match rec.record_type {
+                                                RECORD_PING => {
+                                                    let _ = write_record(&mut write_half, RECORD_PING, 0, &[]).await;
+                                                }
+                                                RECORD_CLOSE => {
+                                                    info!("Uplink server requested close");
+                                                    break;
+                                                }
+                                                RECORD_ERROR => {
+                                                    if let Ok(err) = serde_json::from_slice::<ErrorPayload>(&rec.payload) {
+                                                        error!(code = %err.code, message = %err.message, "Uplink error");
+                                                    } else {
+                                                        error!("Uplink error");
+                                                    }
+                                                    break;
+                                                }
+                                                _ => {}
+                                            }
+                                        }
+                                        Some(Err(e)) => {
+                                            error!(error = %e, "Uplink read failed, reconnecting");
+                                            break;
+                                        }
+                                        None => {
+                                            error!("Uplink read channel closed");
+                                            break;
+                                        }
                                     }
-                                    sent += 1;
+                                }
+                                Some(msg) = rx.recv() => {
                                     match msg.msg_type {
-                                        RTP => { stats_task.rtp_sent.fetch_add(1, Ordering::Relaxed); }
-                                        GAP => { stats_task.gap_sent.fetch_add(1, Ordering::Relaxed); }
-                                        MOTION => { stats_task.motion_sent.fetch_add(1, Ordering::Relaxed); }
+                                        RTP => {
+                                            if let Err(e) = write_record(&mut write_half, RECORD_RTP, 0, &msg.payload).await {
+                                                error!(error = %e, "Uplink write failed, reconnecting");
+                                                break;
+                                            }
+                                            sent += 1;
+                                            stats_task.rtp_sent.fetch_add(1, Ordering::Relaxed);
+                                        }
+                                        MOTION => {
+                                            let event = build_event_payload(&msg);
+                                            let payload = match serde_json::to_vec(&event) {
+                                                Ok(p) => p,
+                                                Err(e) => {
+                                                    error!(error = %e, "Failed to serialize MOTION");
+                                                    continue;
+                                                }
+                                            };
+                                            if let Err(e) = write_record(&mut write_half, RECORD_EVENT, 0, &payload).await {
+                                                error!(error = %e, "Uplink write failed, reconnecting");
+                                                break;
+                                            }
+                                            sent += 1;
+                                            stats_task.motion_sent.fetch_add(1, Ordering::Relaxed);
+                                        }
+                                        GAP => {
+                                            if let Err(e) = write_record(&mut write_half, RECORD_GAP, 0, &msg.payload).await {
+                                                error!(error = %e, "Uplink write failed, reconnecting");
+                                                break;
+                                            }
+                                            sent += 1;
+                                            stats_task.gap_sent.fetch_add(1, Ordering::Relaxed);
+                                        }
                                         _ => {}
                                     }
                                 }
                                 _ = ping.tick() => {
-                                    let stats = serde_json::json!({
-                                        "sent": sent,
-                                    });
-                                    let payload = serde_json::to_vec(&stats).unwrap_or_default();
-                                    let ping_msg = Msg { msg_type: PING, stream_id: 0, payload };
-                                    if let Err(e) = write_msg(&mut stream, &ping_msg).await {
-                                        warn!(error = %e, "Uplink ping failed, reconnecting");
+                                    if let Err(e) = write_record(&mut write_half, RECORD_PING, 0, &[]).await {
+                                        error!(error = %e, "Uplink ping failed, reconnecting");
                                         break;
                                     }
                                     debug!(sent = sent, "Uplink ping");
@@ -156,9 +329,10 @@ impl Uplink {
                                 else => break,
                             }
                         }
+                        read_task.abort();
                     }
                     Err(e) => {
-                        warn!(error = %e, server = %server_addr, "Uplink connect failed");
+                        error!(error = %e, server = %server_addr, "Uplink connect failed");
                     }
                 }
 
@@ -193,7 +367,7 @@ impl Uplink {
         let msg = Msg {
             msg_type: GAP,
             stream_id,
-            payload: encode_gap(last_seq, new_seq),
+            payload: encode_gap_tls(stream_id, last_seq, new_seq),
         };
         if let Err(e) = self.tx.try_send(msg) {
             let dropped = self.stats.dropped.fetch_add(1, Ordering::Relaxed) + 1;
@@ -241,4 +415,198 @@ impl Uplink {
             }
         }
     }
+}
+
+fn build_tls_connector(server_addr: &str) -> Result<(TlsConnector, ServerName<'static>)> {
+    let ca_path = std::env::var("INGEST_TLS_CA")
+        .ok()
+        .filter(|v| !v.trim().is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("/etc/sentinel_rtp_cam/ca.crt"));
+    let server_name = resolve_server_name(server_addr)?;
+    let config = load_tls_config(&ca_path)?;
+    Ok((TlsConnector::from(Arc::new(config)), server_name))
+}
+
+#[derive(Debug, Deserialize)]
+struct HelloOkPayload {
+    #[allow(dead_code)]
+    session_id: String,
+    #[allow(dead_code)]
+    max_payload: u32,
+    ping_interval_sec: u64,
+}
+
+#[derive(Debug, Deserialize)]
+struct ErrorPayload {
+    code: String,
+    message: String,
+}
+
+const MAX_PAYLOAD: usize = 2 * 1024 * 1024;
+const RECORD_HELLO: u8 = 1;
+const RECORD_RTP: u8 = 2;
+const RECORD_EVENT: u8 = 3;
+const RECORD_PING: u8 = 4;
+const RECORD_CLOSE: u8 = 5;
+const RECORD_HELLO_OK: u8 = 6;
+const RECORD_ERROR: u8 = 7;
+const RECORD_GAP: u8 = 8;
+
+struct Record {
+    record_type: u8,
+    #[allow(dead_code)]
+    flags: u8,
+    payload: Vec<u8>,
+}
+
+async fn read_record<R: tokio::io::AsyncRead + Unpin>(reader: &mut R) -> Result<Record> {
+    let mut header = [0u8; 6];
+    tokio::io::AsyncReadExt::read_exact(reader, &mut header).await?;
+    let record_type = header[0];
+    let flags = header[1];
+    let len = u32::from_be_bytes([header[2], header[3], header[4], header[5]]) as usize;
+    if len > MAX_PAYLOAD {
+        return Err(anyhow!("record payload too large: {}", len));
+    }
+    let mut payload = vec![0u8; len];
+    if len > 0 {
+        tokio::io::AsyncReadExt::read_exact(reader, &mut payload).await?;
+    }
+    Ok(Record {
+        record_type,
+        flags,
+        payload,
+    })
+}
+
+async fn write_record<W: tokio::io::AsyncWrite + Unpin>(
+    writer: &mut W,
+    record_type: u8,
+    flags: u8,
+    payload: &[u8],
+) -> Result<()> {
+    if payload.len() > MAX_PAYLOAD {
+        return Err(anyhow!("record payload too large: {}", payload.len()));
+    }
+    let mut header = [0u8; 6];
+    header[0] = record_type;
+    header[1] = flags;
+    header[2..6].copy_from_slice(&(payload.len() as u32).to_be_bytes());
+    tokio::io::AsyncWriteExt::write_all(writer, &header).await?;
+    if !payload.is_empty() {
+        tokio::io::AsyncWriteExt::write_all(writer, payload).await?;
+    }
+    tokio::io::AsyncWriteExt::flush(writer).await?;
+    Ok(())
+}
+
+fn generate_nonce() -> String {
+    let mut buf = [0u8; 16];
+    rand::thread_rng().fill_bytes(&mut buf);
+    base64::engine::general_purpose::STANDARD.encode(&buf)
+}
+
+fn encode_gap_tls(stream_id: u32, last_seq: u16, new_seq: u16) -> Vec<u8> {
+    let mut buf = [0u8; 8];
+    buf[0..4].copy_from_slice(&stream_id.to_be_bytes());
+    buf[4..6].copy_from_slice(&last_seq.to_be_bytes());
+    buf[6..8].copy_from_slice(&new_seq.to_be_bytes());
+    buf.to_vec()
+}
+
+fn build_streams_info(
+    stream_map: &HashMap<u32, String>,
+    stream_camera_map: &HashMap<u32, String>,
+) -> Vec<HelloStream> {
+    let mut streams: Vec<HelloStream> = stream_map
+        .iter()
+        .map(|(stream_id, name)| HelloStream {
+            stream_id: *stream_id,
+            name: name.clone(),
+            camera_id: stream_camera_map
+                .get(stream_id)
+                .cloned()
+                .unwrap_or_else(|| format!("stream-{stream_id}")),
+        })
+        .collect();
+    streams.sort_by_key(|s| s.stream_id);
+    streams
+}
+
+fn build_event_payload(msg: &Msg) -> EventPayload {
+    let legacy = serde_json::from_slice::<LegacyMotionPayload>(&msg.payload).ok();
+    let active = legacy.as_ref().and_then(|p| p.active).unwrap_or(false);
+    let rule = legacy.as_ref().and_then(|p| p.rule.clone()).unwrap_or_else(|| "motion".to_string());
+    let camera_id = legacy.as_ref().and_then(|p| p.camera_id.clone());
+    let ts = legacy.as_ref().and_then(|p| p.ts.clone());
+    let event_ts = ts
+        .and_then(|value| chrono::DateTime::parse_from_rfc3339(&value).ok())
+        .map(|dt| dt.timestamp_millis())
+        .unwrap_or_else(|| {
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_millis() as i64)
+                .unwrap_or(0)
+        });
+    let event_id = legacy.as_ref().and_then(|p| p.event_id.clone()).or_else(|| {
+        if event_ts > 0 {
+            Some(format!("stream{}-{}", msg.stream_id, event_ts))
+        } else {
+            None
+        }
+    });
+    EventPayload {
+        stream_id: msg.stream_id.to_string(),
+        event_type: "motion".to_string(),
+        state: if active { "start" } else { "stop" }.to_string(),
+        event_ts_unix_ms: event_ts,
+        confidence: 0.0,
+        rule: Some(rule),
+        event_id,
+        camera_id,
+    }
+}
+
+fn load_tls_config(ca_path: &Path) -> Result<rustls::ClientConfig> {
+    let mut root_store = rustls::RootCertStore::empty();
+    let certs = load_certs(ca_path)?;
+    if certs.is_empty() {
+        return Err(anyhow!("no CA certs found in {}", ca_path.display()));
+    }
+    for cert in certs {
+        root_store
+            .add(cert)
+            .map_err(|_| anyhow!("failed to add CA cert from {}", ca_path.display()))?;
+    }
+
+    let config = rustls::ClientConfig::builder()
+        .with_root_certificates(root_store)
+        .with_no_client_auth();
+    Ok(config)
+}
+
+fn load_certs(path: &Path) -> Result<Vec<rustls::pki_types::CertificateDer<'static>>> {
+    let mut reader = std::io::BufReader::new(std::fs::File::open(path)?);
+    let certs = rustls_pemfile::certs(&mut reader)
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    Ok(certs)
+}
+
+fn resolve_server_name(server_addr: &str) -> Result<ServerName<'static>> {
+    if let Ok(name) = std::env::var("INGEST_TLS_SERVER_NAME") {
+        if let Ok(ip) = name.parse::<IpAddr>() {
+            return Ok(ServerName::IpAddress(ip.into()));
+        }
+        return Ok(ServerName::try_from(name)?);
+    }
+
+    let url = Url::parse(&format!("tcp://{server_addr}"))?;
+    let host = url
+        .host_str()
+        .ok_or_else(|| anyhow!("server host missing in {}", server_addr))?;
+    if let Ok(ip) = host.parse::<IpAddr>() {
+        return Ok(ServerName::IpAddress(ip.into()));
+    }
+    Ok(ServerName::try_from(host.to_string())?)
 }

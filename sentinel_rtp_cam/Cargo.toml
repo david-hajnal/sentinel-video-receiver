@@ -20,6 +20,9 @@ tokio = { version = "1", features = [
     "fs"
 ] }
 tokio-util = "0.7"
+tokio-rustls = "0.26"
+rustls = "0.23"
+rustls-pemfile = "2"
 
 # Zero-copy buffer management
 bytes = "1"
