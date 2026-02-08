@@ -13,7 +13,7 @@ use std::sync::{
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
-use tokio::time::{interval, sleep};
+use tokio::time::{interval, sleep, timeout};
 use tokio_rustls::TlsConnector;
 use tracing::{debug, error, info, warn};
 use url::Url;
@@ -101,7 +101,7 @@ impl Uplink {
 
                 match TcpStream::connect(&server_addr).await {
                     Ok(stream) => {
-                        let mut stream = match connector.connect(server_name, stream).await {
+                        let stream = match connector.connect(server_name, stream).await {
                             Ok(tls) => tls,
                             Err(e) => {
                                 error!(error = %e, server = %server_addr, "Uplink TLS handshake failed");
@@ -110,13 +110,24 @@ impl Uplink {
                                 continue;
                             }
                         };
-                        info!(
-                            server = %server_addr,
-                            agent_id = %agent_id,
-                            stream_count = stream_map.len(),
-                            "Uplink connected"
-                        );
-                        backoff = Duration::from_secs(1);
+
+                        // Split the stream to avoid cancellation-safety issues
+                        let (read_half, mut write_half) = tokio::io::split(stream);
+                        
+                        // Channel for inbound records from the read task
+                        let (inbound_tx, mut inbound_rx) = mpsc::channel::<Result<Record>>(16);
+                        
+                        // Spawn a dedicated task for reading to ensure read_exact is not cancelled
+                        let read_task = tokio::spawn(async move {
+                            let mut reader = read_half;
+                            loop {
+                                let record = read_record(&mut reader).await;
+                                if inbound_tx.send(record).await.is_err() {
+                                    // Main loop has dropped the receiver, exit
+                                    break;
+                                }
+                            }
+                        });
 
                         let nonce = generate_nonce();
                         let now = SystemTime::now()
@@ -124,10 +135,12 @@ impl Uplink {
                             .map(|d| d.as_secs() as i64)
                             .unwrap_or(0);
                         let streams_info = build_streams_info(&stream_map, &stream_camera_map);
+                        let mut streams: Vec<String> = stream_map.values().cloned().collect();
+                        streams.sort();
                         let hello = HelloPayload {
                             agent_id: agent_id.clone(),
                             token: token.clone(),
-                            streams: stream_map.values().cloned().collect(),
+                            streams,
                             timestamp_unix: now,
                             nonce,
                             streams_info,
@@ -141,46 +154,65 @@ impl Uplink {
                             }
                         };
                         if let Err(e) =
-                            write_record(&mut stream, RECORD_HELLO, 0, &payload).await
+                            write_record(&mut write_half, RECORD_HELLO, 0, &payload).await
                         {
                             error!(error = %e, "Failed to send HELLO");
+                            read_task.abort();
                             sleep(backoff).await;
                             continue;
                         }
-                        info!(stream_count = stream_map.len(), "Uplink HELLO sent");
+                        info!(
+                            server = %server_addr,
+                            agent_id = %agent_id,
+                            stream_count = stream_map.len(),
+                            "Uplink HELLO sent"
+                        );
 
-                        let hello_ok = match read_record(&mut stream).await {
-                            Ok(rec) if rec.record_type == RECORD_HELLO_OK => {
+                        // Wait for HELLO_OK with timeout (3x the typical ping interval)
+                        let hello_ok = match timeout(Duration::from_secs(30), inbound_rx.recv()).await {
+                            Ok(Some(Ok(rec))) if rec.record_type == RECORD_HELLO_OK => {
                                 match serde_json::from_slice::<HelloOkPayload>(&rec.payload) {
                                     Ok(ok) => ok,
                                     Err(e) => {
                                         error!(error = %e, "Failed to parse HELLO_OK");
+                                        read_task.abort();
                                         sleep(backoff).await;
                                         continue;
                                     }
                                 }
                             }
-                            Ok(rec) if rec.record_type == RECORD_ERROR => {
+                            Ok(Some(Ok(rec))) if rec.record_type == RECORD_ERROR => {
                                 if let Ok(err) = serde_json::from_slice::<ErrorPayload>(&rec.payload)
                                 {
                                     error!(code = %err.code, message = %err.message, "HELLO rejected");
                                 } else {
                                     error!("HELLO rejected");
                                 }
+                                read_task.abort();
                                 sleep(backoff).await;
                                 continue;
                             }
-                            Ok(rec) => {
+                            Ok(Some(Ok(rec))) => {
                                 error!(record_type = rec.record_type, "Unexpected record after HELLO");
+                                read_task.abort();
                                 sleep(backoff).await;
                                 continue;
                             }
-                            Err(e) => {
+                            Ok(Some(Err(e))) => {
                                 error!(error = %e, "Failed to read HELLO_OK");
+                                read_task.abort();
+                                sleep(backoff).await;
+                                continue;
+                            }
+                            Ok(None) | Err(_) => {
+                                error!("Timeout or connection closed waiting for HELLO_OK");
+                                read_task.abort();
                                 sleep(backoff).await;
                                 continue;
                             }
                         };
+
+                        backoff = Duration::from_secs(1);
 
                         let mut ping = interval(Duration::from_secs(hello_ok.ping_interval_sec));
                         let mut sent: u64 = 0;
@@ -191,12 +223,12 @@ impl Uplink {
                         let mut last_dropped = 0u64;
                         loop {
                             tokio::select! {
-                                rec = read_record(&mut stream) => {
+                                Some(rec) = inbound_rx.recv() => {
                                     match rec {
                                         Ok(rec) => {
                                             match rec.record_type {
                                                 RECORD_PING => {
-                                                    let _ = write_record(&mut stream, RECORD_PING, 0, &[]).await;
+                                                    let _ = write_record(&mut write_half, RECORD_PING, 0, &[]).await;
                                                 }
                                                 RECORD_CLOSE => {
                                                     info!("Uplink server requested close");
@@ -222,7 +254,7 @@ impl Uplink {
                                 Some(msg) = rx.recv() => {
                                     match msg.msg_type {
                                         RTP => {
-                                            if let Err(e) = write_record(&mut stream, RECORD_RTP, 0, &msg.payload).await {
+                                            if let Err(e) = write_record(&mut write_half, RECORD_RTP, 0, &msg.payload).await {
                                                 error!(error = %e, "Uplink write failed, reconnecting");
                                                 break;
                                             }
@@ -238,7 +270,7 @@ impl Uplink {
                                                     continue;
                                                 }
                                             };
-                                            if let Err(e) = write_record(&mut stream, RECORD_EVENT, 0, &payload).await {
+                                            if let Err(e) = write_record(&mut write_half, RECORD_EVENT, 0, &payload).await {
                                                 error!(error = %e, "Uplink write failed, reconnecting");
                                                 break;
                                             }
@@ -246,7 +278,7 @@ impl Uplink {
                                             stats_task.motion_sent.fetch_add(1, Ordering::Relaxed);
                                         }
                                         GAP => {
-                                            if let Err(e) = write_record(&mut stream, RECORD_GAP, 0, &msg.payload).await {
+                                            if let Err(e) = write_record(&mut write_half, RECORD_GAP, 0, &msg.payload).await {
                                                 error!(error = %e, "Uplink write failed, reconnecting");
                                                 break;
                                             }
@@ -257,7 +289,7 @@ impl Uplink {
                                     }
                                 }
                                 _ = ping.tick() => {
-                                    if let Err(e) = write_record(&mut stream, RECORD_PING, 0, &[]).await {
+                                    if let Err(e) = write_record(&mut write_half, RECORD_PING, 0, &[]).await {
                                         error!(error = %e, "Uplink ping failed, reconnecting");
                                         break;
                                     }
@@ -291,6 +323,9 @@ impl Uplink {
                                 else => break,
                             }
                         }
+                        
+                        // Clean up read task
+                        read_task.abort();
                     }
                     Err(e) => {
                         error!(error = %e, server = %server_addr, "Uplink connect failed");

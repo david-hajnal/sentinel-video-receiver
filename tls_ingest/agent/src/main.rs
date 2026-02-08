@@ -291,8 +291,10 @@ fn build_rtp_packet(state: &mut StreamState) -> Vec<u8> {
 }
 
 fn unix_millis() -> i64 {
-    let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap();
-    (now.as_secs() as i64) * 1000 + (now.subsec_millis() as i64)
+    match SystemTime::now().duration_since(UNIX_EPOCH) {
+        Ok(now) => (now.as_secs() as i64) * 1000 + (now.subsec_millis() as i64),
+        Err(_) => 0,
+    }
 }
 
 fn random_nonce() -> String {

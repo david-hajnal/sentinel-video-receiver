@@ -28,3 +28,6 @@ camera.json
 *.h264
 *.mp4
 *.pcap
+
+# Runtime clip metadata
+sentinel_rtp_cam/clips/
