@@ -1,4 +1,5 @@
 use anyhow::{anyhow, bail, Result};
+use serde_json::Value;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -8,7 +9,6 @@ use tokio::sync::RwLock;
 use tokio::time::sleep;
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
-use serde_json::Value;
 
 use sentinel_rtp_cam::agent_uplink::Uplink;
 use sentinel_rtp_cam::core::rtp::RtpPacket;
@@ -16,7 +16,7 @@ use sentinel_rtp_cam::core::sdp::parse_sdp_video_track;
 use sentinel_rtp_cam::event::{Event, EventBus, MotionStateBus};
 use sentinel_rtp_cam::forward_agent::{
     basic_auth_value, build_stream_maps, forward_motion_event, load_cameras_from_env,
-    parse_rtsp_url, CamConfig, MotionEventIdLatch,
+    load_uplink_ingest_config_from_env, parse_rtsp_url, CamConfig, MotionEventIdLatch,
 };
 use sentinel_rtp_cam::onvif::run_onvif_motion_poller;
 use sentinel_rtp_cam::rtsp::interleaved::{read_interleaved_frame, InterleavedFrame};
@@ -278,8 +278,7 @@ async fn main() -> Result<()> {
             };
             warn!(
                 camera_count = cams.len(),
-                server_hint,
-                "Agent in standby; waiting for forward config"
+                server_hint, "Agent in standby; waiting for forward config"
             );
             last_status = Instant::now();
         }
@@ -328,11 +327,17 @@ async fn main() -> Result<()> {
         bail!("Multiple agent tokens found; single uplink requires a shared token");
     }
     let token_prefix: String = agent_token.chars().take(6).collect();
+    let stream_ingest = load_uplink_ingest_config_from_env();
     info!(
         server = %server_addr,
         agent_id = %agent_id,
         token_prefix = %token_prefix,
         stream_count = stream_map.len(),
+        clip_pre_secs = ?stream_ingest.as_ref().and_then(|cfg| cfg.clip_pre_secs),
+        clip_post_secs = ?stream_ingest.as_ref().and_then(|cfg| cfg.clip_post_secs),
+        clip_ring_secs = ?stream_ingest.as_ref().and_then(|cfg| cfg.clip_ring_secs),
+        clip_stale_part_secs = ?stream_ingest.as_ref().and_then(|cfg| cfg.clip_stale_part_secs),
+        clip_max_secs = ?stream_ingest.as_ref().and_then(|cfg| cfg.clip_max_secs),
         "Agent uplink configured"
     );
     let uplink = Uplink::connect_and_run(
@@ -341,6 +346,7 @@ async fn main() -> Result<()> {
         agent_id,
         stream_map,
         stream_to_camera,
+        stream_ingest,
     );
 
     let cancel = CancellationToken::new();

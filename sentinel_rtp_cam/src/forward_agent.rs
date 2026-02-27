@@ -3,7 +3,7 @@ use base64::Engine;
 use std::collections::HashMap;
 use url::Url;
 
-use crate::agent_uplink::Uplink;
+use crate::agent_uplink::{HelloIngestConfig, Uplink};
 use crate::event::MotionEvent;
 
 #[derive(Debug, Clone)]
@@ -23,6 +23,25 @@ pub struct CamConfig {
 
 fn env_string(key: &str) -> Option<String> {
     std::env::var(key).ok()
+}
+
+fn env_u64(key: &str) -> Option<u64> {
+    std::env::var(key).ok().and_then(|v| v.parse::<u64>().ok())
+}
+
+pub fn load_uplink_ingest_config_from_env() -> Option<HelloIngestConfig> {
+    let ingest = HelloIngestConfig {
+        clip_pre_secs: env_u64("CLIP_PRE_SECS"),
+        clip_post_secs: env_u64("CLIP_POST_SECS"),
+        clip_ring_secs: env_u64("CLIP_RING_SECS"),
+        clip_stale_part_secs: env_u64("CLIP_STALE_PART_SECS"),
+        clip_max_secs: env_u64("CLIP_MAX_SECS"),
+    };
+    if ingest.is_empty() {
+        None
+    } else {
+        Some(ingest)
+    }
 }
 
 pub fn load_cameras_from_env() -> Result<Vec<CamConfig>> {

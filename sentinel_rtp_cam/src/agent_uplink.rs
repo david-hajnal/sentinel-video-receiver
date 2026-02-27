@@ -36,11 +36,37 @@ struct HelloPayload {
     streams_info: Vec<HelloStream>,
 }
 
+#[derive(Debug, Clone, Serialize)]
+pub struct HelloIngestConfig {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub clip_pre_secs: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub clip_post_secs: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub clip_ring_secs: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub clip_stale_part_secs: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub clip_max_secs: Option<u64>,
+}
+
+impl HelloIngestConfig {
+    pub fn is_empty(&self) -> bool {
+        self.clip_pre_secs.is_none()
+            && self.clip_post_secs.is_none()
+            && self.clip_ring_secs.is_none()
+            && self.clip_stale_part_secs.is_none()
+            && self.clip_max_secs.is_none()
+    }
+}
+
 #[derive(Debug, Serialize)]
 struct HelloStream {
     stream_id: u32,
     name: String,
     camera_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    ingest: Option<HelloIngestConfig>,
 }
 #[derive(Debug, Deserialize)]
 struct LegacyMotionPayload {
@@ -81,6 +107,7 @@ impl Uplink {
         agent_id: String,
         stream_map: HashMap<u32, String>,
         stream_camera_map: HashMap<u32, String>,
+        stream_ingest: Option<HelloIngestConfig>,
     ) -> Self {
         let (tx, mut rx) = mpsc::channel::<Msg>(4096);
         let stats = Arc::new(UplinkStats::default());
@@ -123,7 +150,11 @@ impl Uplink {
                             .duration_since(UNIX_EPOCH)
                             .map(|d| d.as_secs() as i64)
                             .unwrap_or(0);
-                        let streams_info = build_streams_info(&stream_map, &stream_camera_map);
+                        let streams_info = build_streams_info(
+                            &stream_map,
+                            &stream_camera_map,
+                            stream_ingest.as_ref(),
+                        );
                         let streams: Vec<String> =
                             streams_info.iter().map(|s| s.name.clone()).collect();
                         let hello = HelloPayload {
@@ -173,7 +204,8 @@ impl Uplink {
                                 }
                             }
                             Ok(Ok(rec)) if rec.record_type == RECORD_ERROR => {
-                                if let Ok(err) = serde_json::from_slice::<ErrorPayload>(&rec.payload)
+                                if let Ok(err) =
+                                    serde_json::from_slice::<ErrorPayload>(&rec.payload)
                                 {
                                     error!(code = %err.code, message = %err.message, "HELLO rejected");
                                 } else {
@@ -183,7 +215,10 @@ impl Uplink {
                                 continue;
                             }
                             Ok(Ok(rec)) => {
-                                error!(record_type = rec.record_type, "Unexpected record after HELLO");
+                                error!(
+                                    record_type = rec.record_type,
+                                    "Unexpected record after HELLO"
+                                );
                                 sleep(backoff).await;
                                 continue;
                             }
@@ -518,6 +553,7 @@ fn encode_gap_tls(stream_id: u32, last_seq: u16, new_seq: u16) -> Vec<u8> {
 fn build_streams_info(
     stream_map: &HashMap<u32, String>,
     stream_camera_map: &HashMap<u32, String>,
+    stream_ingest: Option<&HelloIngestConfig>,
 ) -> Vec<HelloStream> {
     let mut streams: Vec<HelloStream> = stream_map
         .iter()
@@ -528,16 +564,95 @@ fn build_streams_info(
                 .get(stream_id)
                 .cloned()
                 .unwrap_or_else(|| format!("stream-{stream_id}")),
+            ingest: stream_ingest.cloned(),
         })
         .collect();
     streams.sort_by_key(|s| s.stream_id);
     streams
 }
 
+#[cfg(test)]
+mod tests {
+    use super::{build_streams_info, HelloIngestConfig};
+    use std::collections::HashMap;
+
+    #[test]
+    fn build_streams_info_includes_ingest_override_when_present() {
+        let mut stream_map = HashMap::new();
+        stream_map.insert(2, "cam2".to_string());
+        stream_map.insert(1, "cam1".to_string());
+        let mut stream_camera_map = HashMap::new();
+        stream_camera_map.insert(1, "camera-1".to_string());
+        stream_camera_map.insert(2, "camera-2".to_string());
+        let ingest = HelloIngestConfig {
+            clip_pre_secs: Some(2),
+            clip_post_secs: Some(120),
+            clip_ring_secs: Some(5),
+            clip_stale_part_secs: Some(3600),
+            clip_max_secs: Some(30),
+        };
+
+        let streams = build_streams_info(&stream_map, &stream_camera_map, Some(&ingest));
+        assert_eq!(streams.len(), 2);
+        assert_eq!(streams[0].stream_id, 1);
+        assert_eq!(streams[1].stream_id, 2);
+        assert_eq!(
+            streams[0]
+                .ingest
+                .as_ref()
+                .and_then(|cfg| cfg.clip_post_secs),
+            Some(120)
+        );
+        assert_eq!(
+            streams[1]
+                .ingest
+                .as_ref()
+                .and_then(|cfg| cfg.clip_post_secs),
+            Some(120)
+        );
+    }
+
+    #[test]
+    fn build_streams_info_omits_ingest_override_when_absent() {
+        let mut stream_map = HashMap::new();
+        stream_map.insert(1, "cam1".to_string());
+        let mut stream_camera_map = HashMap::new();
+        stream_camera_map.insert(1, "camera-1".to_string());
+
+        let streams = build_streams_info(&stream_map, &stream_camera_map, None);
+        assert_eq!(streams.len(), 1);
+        assert!(streams[0].ingest.is_none());
+    }
+
+    #[test]
+    fn hello_ingest_config_is_empty_detects_non_empty_values() {
+        let empty = HelloIngestConfig {
+            clip_pre_secs: None,
+            clip_post_secs: None,
+            clip_ring_secs: None,
+            clip_stale_part_secs: None,
+            clip_max_secs: None,
+        };
+        assert!(empty.is_empty());
+
+        let non_empty = HelloIngestConfig {
+            clip_pre_secs: Some(2),
+            clip_post_secs: None,
+            clip_ring_secs: None,
+            clip_stale_part_secs: None,
+            clip_max_secs: None,
+        };
+        assert!(!non_empty.is_empty());
+    }
+}
+
 fn build_event_payload(msg: &Msg) -> EventPayload {
     let legacy = serde_json::from_slice::<LegacyMotionPayload>(&msg.payload).ok();
     let active = legacy.as_ref().and_then(|p| p.active).unwrap_or(false);
-    let rule = legacy.as_ref().and_then(|p| p.rule.clone()).unwrap_or_else(|| "motion".to_string());
+    let rule = legacy
+        .as_ref()
+        .and_then(|p| p.rule.clone())
+        .unwrap_or_else(|| "motion".to_string());
     let camera_id = legacy.as_ref().and_then(|p| p.camera_id.clone());
     let ts = legacy.as_ref().and_then(|p| p.ts.clone());
     let event_ts = ts
@@ -549,13 +664,16 @@ fn build_event_payload(msg: &Msg) -> EventPayload {
                 .map(|d| d.as_millis() as i64)
                 .unwrap_or(0)
         });
-    let event_id = legacy.as_ref().and_then(|p| p.event_id.clone()).or_else(|| {
-        if event_ts > 0 {
-            Some(format!("stream{}-{}", msg.stream_id, event_ts))
-        } else {
-            None
-        }
-    });
+    let event_id = legacy
+        .as_ref()
+        .and_then(|p| p.event_id.clone())
+        .or_else(|| {
+            if event_ts > 0 {
+                Some(format!("stream{}-{}", msg.stream_id, event_ts))
+            } else {
+                None
+            }
+        });
     EventPayload {
         stream_id: msg.stream_id.to_string(),
         event_type: "motion".to_string(),
@@ -588,8 +706,7 @@ fn load_tls_config(ca_path: &Path) -> Result<rustls::ClientConfig> {
 
 fn load_certs(path: &Path) -> Result<Vec<rustls::pki_types::CertificateDer<'static>>> {
     let mut reader = std::io::BufReader::new(std::fs::File::open(path)?);
-    let certs = rustls_pemfile::certs(&mut reader)
-        .collect::<std::result::Result<Vec<_>, _>>()?;
+    let certs = rustls_pemfile::certs(&mut reader).collect::<std::result::Result<Vec<_>, _>>()?;
     Ok(certs)
 }
 
