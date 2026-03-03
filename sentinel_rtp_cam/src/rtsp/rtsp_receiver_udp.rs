@@ -4,6 +4,7 @@ use tokio::{net::UdpSocket, sync::mpsc};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info};
 
+use crate::config::AgentConfig;
 use crate::core::h264_depacketize::H264Depacketizer;
 use crate::core::h264_sync::H264SyncGate;
 use crate::core::rtp::RtpPacket;
@@ -37,37 +38,34 @@ fn unquote(mut s: String) -> String {
 
 impl UdpReceiverConfig {
     pub fn from_env() -> Self {
-        let host = std::env::var("UDP_RTSP_HOST")
-            .or_else(|_| std::env::var("RTSP_HOST"))
-            .unwrap_or_else(|_| "192.168.1.187".to_string());
+        let host = AgentConfig::runtime_var("UDP_RTSP_HOST")
+            .or_else(|| AgentConfig::runtime_var("RTSP_HOST"))
+            .unwrap_or_else(|| "192.168.1.187".to_string());
 
-        let port: u16 = std::env::var("UDP_RTSP_PORT")
-            .or_else(|_| std::env::var("RTSP_PORT"))
-            .ok()
+        let port: u16 = AgentConfig::runtime_var("UDP_RTSP_PORT")
+            .or_else(|| AgentConfig::runtime_var("RTSP_PORT"))
             .and_then(|v| v.parse().ok())
             .unwrap_or(554);
 
-        let path = std::env::var("UDP_RTSP_PATH")
-            .or_else(|_| std::env::var("RTSP_PATH"))
-            .unwrap_or_else(|_| "/stream2".to_string());
+        let path = AgentConfig::runtime_var("UDP_RTSP_PATH")
+            .or_else(|| AgentConfig::runtime_var("RTSP_PATH"))
+            .unwrap_or_else(|| "/stream2".to_string());
 
-        let rtp_port: u16 = std::env::var("UDP_RTP_PORT")
-            .ok()
+        let rtp_port: u16 = AgentConfig::runtime_var("UDP_RTP_PORT")
             .and_then(|v| v.parse().ok())
             .unwrap_or(5004);
 
-        let rtcp_port: u16 = std::env::var("UDP_RTCP_PORT")
-            .ok()
+        let rtcp_port: u16 = AgentConfig::runtime_var("UDP_RTCP_PORT")
             .and_then(|v| v.parse().ok())
             .unwrap_or(5005);
 
         // Prefer UDP_RTSP_USER/PASS, fall back to RTSP_USER/PASS
-        let user = std::env::var("UDP_RTSP_USER")
-            .or_else(|_| std::env::var("RTSP_USER"))
-            .unwrap_or_else(|_| "".to_string());
-        let pass = std::env::var("UDP_RTSP_PASS")
-            .or_else(|_| std::env::var("RTSP_PASS"))
-            .unwrap_or_else(|_| "".to_string());
+        let user = AgentConfig::runtime_var("UDP_RTSP_USER")
+            .or_else(|| AgentConfig::runtime_var("RTSP_USER"))
+            .unwrap_or_else(|| "".to_string());
+        let pass = AgentConfig::runtime_var("UDP_RTSP_PASS")
+            .or_else(|| AgentConfig::runtime_var("RTSP_PASS"))
+            .unwrap_or_else(|| "".to_string());
 
         Self {
             host: unquote(host),

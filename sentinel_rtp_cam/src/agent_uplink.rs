@@ -18,6 +18,7 @@ use tokio_rustls::TlsConnector;
 use tracing::{debug, error, info, warn};
 use url::Url;
 
+use crate::config::AgentConfig;
 use crate::proto::{Msg, GAP, MOTION, RTP};
 
 #[derive(Clone)]
@@ -183,8 +184,8 @@ impl Uplink {
                         }
                         info!(stream_count = stream_map.len(), "Uplink HELLO sent");
 
-                        let hello_timeout_secs = std::env::var("INGEST_TLS_HELLO_TIMEOUT_SECS")
-                            .ok()
+                        let hello_timeout_secs =
+                            AgentConfig::runtime_var("INGEST_TLS_HELLO_TIMEOUT_SECS")
                             .and_then(|v| v.parse::<u64>().ok())
                             .unwrap_or(10);
                         let hello_ok = match tokio::time::timeout(
@@ -453,8 +454,7 @@ impl Uplink {
 }
 
 fn build_tls_connector(server_addr: &str) -> Result<(TlsConnector, ServerName<'static>)> {
-    let ca_path = std::env::var("INGEST_TLS_CA")
-        .ok()
+    let ca_path = AgentConfig::runtime_var("INGEST_TLS_CA")
         .filter(|v| !v.trim().is_empty())
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("/etc/sentinel_rtp_cam/ca.crt"));
@@ -711,7 +711,7 @@ fn load_certs(path: &Path) -> Result<Vec<rustls::pki_types::CertificateDer<'stat
 }
 
 fn resolve_server_name(server_addr: &str) -> Result<ServerName<'static>> {
-    if let Ok(name) = std::env::var("INGEST_TLS_SERVER_NAME") {
+    if let Some(name) = AgentConfig::runtime_var("INGEST_TLS_SERVER_NAME") {
         if let Ok(ip) = name.parse::<IpAddr>() {
             return Ok(ServerName::IpAddress(ip.into()));
         }

@@ -258,7 +258,7 @@ impl ClipRecorder {
                 } else {
                     // Motion ended before IDR -> stay armed and record minimum duration when IDR arrives
                     info!("Motion ended before IDR frame received, will record minimum duration clip when IDR arrives");
-                    
+
                     // Check for timeout - if armed for too long without starting recording, give up
                     if armed_at.elapsed() > Duration::from_secs(30) {
                         warn!(
@@ -283,7 +283,7 @@ impl ClipRecorder {
                     if stop_at.is_none() {
                         let elapsed = started_at.elapsed();
                         let remaining_min = self.cfg.min_clip_duration.saturating_sub(elapsed);
-                        
+
                         if remaining_min > Duration::ZERO {
                             // Still need to record more to meet minimum duration
                             let deadline = Instant::now() + remaining_min;
@@ -368,10 +368,10 @@ impl ClipRecorder {
                         .cfg
                         .max_clip_secs
                         .map(|secs| started_at + Duration::from_secs(secs));
-                    
+
                     // Set stop_at to ensure minimum duration recording
                     let stop_at = Some(started_at + self.cfg.min_clip_duration);
-                    
+
                     let mut new_state = State::Recording {
                         rule,
                         camera_id,
@@ -761,5 +761,204 @@ impl ClipRecorder {
         }
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ClipRecorder, ClipRecorderConfig, State};
+    use crate::event::{MotionMetadata, MotionState};
+    use chrono::{Duration as ChronoDuration, Utc};
+    use std::path::PathBuf;
+    use std::time::Duration;
+    use tokio::time::Instant;
+    use ulid::Ulid;
+
+    fn test_output_dir(name: &str) -> PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("sentinel_clip_recorder_{name}_{}", Ulid::new()));
+        std::fs::create_dir_all(&dir).expect("create test output dir");
+        dir
+    }
+
+    fn active_motion_state(rule: &str, camera_id: &str, event_id: &str) -> MotionState {
+        let mut state = MotionState::new();
+        state.insert(
+            rule.to_string(),
+            MotionMetadata {
+                camera_id: camera_id.to_string(),
+                event_id: event_id.to_string(),
+            },
+        );
+        state
+    }
+
+    fn sps_nal() -> Vec<u8> {
+        vec![0, 0, 0, 1, 0x67, 0x64, 0x00, 0x1F]
+    }
+
+    fn pps_nal() -> Vec<u8> {
+        vec![0, 0, 0, 1, 0x68, 0xEE, 0x3C, 0x80]
+    }
+
+    fn idr_nal() -> Vec<u8> {
+        vec![0, 0, 0, 1, 0x65, 0x88, 0x84]
+    }
+
+    #[tokio::test]
+    async fn motion_end_before_min_duration_uses_remaining_minimum_deadline() {
+        let output_dir = test_output_dir("remaining_min");
+        let mut recorder = ClipRecorder::new(ClipRecorderConfig {
+            output_dir: output_dir.clone(),
+            post_roll: Duration::from_secs(1),
+            min_clip_duration: Duration::from_secs(5),
+            ..ClipRecorderConfig::default()
+        });
+
+        let (writer, file_path) = recorder
+            .spawn_clip_writer("rule-a", "cam-1", "evt-1")
+            .await
+            .expect("spawn clip writer");
+
+        recorder.state = State::Recording {
+            rule: "rule-a".to_string(),
+            camera_id: "cam-1".to_string(),
+            event_id: "evt-1".to_string(),
+            writer,
+            stop_at: None,
+            hard_stop_at: None,
+            started_at: Instant::now() - Duration::from_secs(2),
+            started_at_utc: Utc::now() - ChronoDuration::seconds(2),
+            file_path,
+        };
+
+        recorder
+            .on_motion_state_change(&MotionState::new())
+            .await
+            .expect("handle motion end");
+
+        let remaining = match &recorder.state {
+            State::Recording {
+                stop_at: Some(stop_at),
+                ..
+            } => stop_at.saturating_duration_since(Instant::now()),
+            _ => panic!("recorder should stay in recording state with a stop deadline"),
+        };
+
+        assert!(
+            remaining >= Duration::from_millis(2400),
+            "expected minimum-duration deadline, got {:?}",
+            remaining
+        );
+        assert!(
+            remaining <= Duration::from_millis(3600),
+            "remaining minimum deadline drifted too far: {:?}",
+            remaining
+        );
+
+        drop(recorder);
+        let _ = tokio::fs::remove_dir_all(&output_dir).await;
+    }
+
+    #[tokio::test]
+    async fn motion_end_after_min_duration_uses_post_roll_deadline() {
+        let output_dir = test_output_dir("post_roll");
+        let mut recorder = ClipRecorder::new(ClipRecorderConfig {
+            output_dir: output_dir.clone(),
+            post_roll: Duration::from_secs(2),
+            min_clip_duration: Duration::from_secs(5),
+            ..ClipRecorderConfig::default()
+        });
+
+        let (writer, file_path) = recorder
+            .spawn_clip_writer("rule-a", "cam-1", "evt-1")
+            .await
+            .expect("spawn clip writer");
+
+        recorder.state = State::Recording {
+            rule: "rule-a".to_string(),
+            camera_id: "cam-1".to_string(),
+            event_id: "evt-1".to_string(),
+            writer,
+            stop_at: None,
+            hard_stop_at: None,
+            started_at: Instant::now() - Duration::from_secs(8),
+            started_at_utc: Utc::now() - ChronoDuration::seconds(8),
+            file_path,
+        };
+
+        recorder
+            .on_motion_state_change(&MotionState::new())
+            .await
+            .expect("handle motion end");
+
+        let remaining = match &recorder.state {
+            State::Recording {
+                stop_at: Some(stop_at),
+                ..
+            } => stop_at.saturating_duration_since(Instant::now()),
+            _ => panic!("recorder should stay in recording state with a stop deadline"),
+        };
+
+        assert!(
+            remaining >= Duration::from_millis(1500),
+            "expected post-roll deadline, got {:?}",
+            remaining
+        );
+        assert!(
+            remaining <= Duration::from_millis(2600),
+            "post-roll deadline drifted too far: {:?}",
+            remaining
+        );
+
+        drop(recorder);
+        let _ = tokio::fs::remove_dir_all(&output_dir).await;
+    }
+
+    #[tokio::test]
+    async fn recording_start_sets_hard_stop_from_max_clip_secs() {
+        let output_dir = test_output_dir("hard_stop");
+        let mut recorder = ClipRecorder::new(ClipRecorderConfig {
+            output_dir: output_dir.clone(),
+            min_clip_duration: Duration::from_secs(5),
+            max_clip_secs: Some(4),
+            ..ClipRecorderConfig::default()
+        });
+
+        recorder
+            .on_motion_state_change(&active_motion_state("rule-a", "cam-1", "evt-1"))
+            .await
+            .expect("arm recorder");
+        recorder.on_nal(sps_nal()).await.expect("feed sps");
+        recorder.on_nal(pps_nal()).await.expect("feed pps");
+        recorder.on_nal(idr_nal()).await.expect("feed idr");
+
+        let (hard_window, min_window) = match &recorder.state {
+            State::Recording {
+                started_at,
+                stop_at: Some(stop_at),
+                hard_stop_at: Some(hard_stop_at),
+                ..
+            } => (
+                hard_stop_at.duration_since(*started_at),
+                stop_at.duration_since(*started_at),
+            ),
+            _ => panic!("recorder should transition into recording with hard stop"),
+        };
+
+        assert!(
+            hard_window >= Duration::from_millis(3500)
+                && hard_window <= Duration::from_millis(4500),
+            "hard-stop window should be close to max_clip_secs, got {:?}",
+            hard_window
+        );
+        assert!(
+            min_window >= Duration::from_millis(4500) && min_window <= Duration::from_millis(5500),
+            "minimum clip window should be close to min_clip_duration, got {:?}",
+            min_window
+        );
+
+        drop(recorder);
+        let _ = tokio::fs::remove_dir_all(&output_dir).await;
     }
 }

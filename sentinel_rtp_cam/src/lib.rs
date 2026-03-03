@@ -48,8 +48,8 @@ pub mod config;
 pub mod core;
 
 // Pi <-> server protocol + uplink
-pub mod proto;
 pub mod agent_uplink;
+pub mod proto;
 pub mod server_pipeline;
 
 // RTSP streaming

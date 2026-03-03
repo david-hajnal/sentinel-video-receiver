@@ -5,32 +5,42 @@ use tracing::{info, warn};
 use sentinel_rtp_cam::core::h264_depacketize::H264Depacketizer;
 use sentinel_rtp_cam::core::h264_sync::H264SyncGate;
 use sentinel_rtp_cam::core::rtp::RtpPacket;
-use sentinel_rtp_cam::rtsp::rtsp::RtspClient;
 use sentinel_rtp_cam::core::sdp::parse_sdp_video_track;
 use sentinel_rtp_cam::core::video::annexb_from_raw_nal;
+use sentinel_rtp_cam::rtsp::rtsp::RtspClient;
+use sentinel_rtp_cam::AgentConfig;
+
+const DEFAULT_CAMERA_CONFIG_PATH: &str = "/etc/sentinel_rtp_cam/camera.json";
+
+fn runtime_var(name: &str) -> Option<String> {
+    AgentConfig::runtime_var(name).filter(|v| !v.trim().is_empty())
+}
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    // Initialize tracing
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
-        )
-        .init();
-
-    // Load environment variables from .env file
-    if dotenvy::dotenv().is_err() {
-        dotenvy::from_filename("../.env").ok();
+    if let Ok(camera_value) =
+        AgentConfig::load_camera_json(std::path::Path::new(DEFAULT_CAMERA_CONFIG_PATH))
+    {
+        AgentConfig::apply_json_env_overrides(&camera_value);
     }
 
-    // Read configuration from environment variables
-    let host = std::env::var("UDP_RTSP_HOST").unwrap_or_else(|_| "192.168.1.187".to_string());
-    let port: u16 = std::env::var("UDP_RTSP_PORT")
-        .unwrap_or_else(|_| "8554".to_string())
+    // Initialize tracing
+    let log_filter = runtime_var("RUST_LOG").unwrap_or_else(|| "info".to_string());
+    tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::new(log_filter))
+        .init();
+
+    let host = runtime_var("UDP_RTSP_HOST")
+        .or_else(|| runtime_var("RTSP_HOST"))
+        .unwrap_or_else(|| "192.168.1.187".to_string());
+    let port: u16 = runtime_var("UDP_RTSP_PORT")
+        .or_else(|| runtime_var("RTSP_PORT"))
+        .unwrap_or_else(|| "8554".to_string())
         .parse()
         .unwrap_or(8554);
-    let path = std::env::var("UDP_RTSP_PATH").unwrap_or_else(|_| "/cam".to_string());
+    let path = runtime_var("UDP_RTSP_PATH")
+        .or_else(|| runtime_var("RTSP_PATH"))
+        .unwrap_or_else(|| "/cam".to_string());
     let rtsp_url = format!("rtsp://{}:{}{}", host, port, path);
 
     let mut c = RtspClient::connect(&host, port).await?;
@@ -64,12 +74,12 @@ async fn main() -> Result<()> {
         )
     };
 
-    let rtp_port: u16 = std::env::var("UDP_RTP_PORT")
-        .unwrap_or_else(|_| "5004".to_string())
+    let rtp_port: u16 = runtime_var("UDP_RTP_PORT")
+        .unwrap_or_else(|| "5004".to_string())
         .parse()
         .unwrap_or(5004);
-    let rtcp_port: u16 = std::env::var("UDP_RTCP_PORT")
-        .unwrap_or_else(|_| "5005".to_string())
+    let rtcp_port: u16 = runtime_var("UDP_RTCP_PORT")
+        .unwrap_or_else(|| "5005".to_string())
         .parse()
         .unwrap_or(5005);
 
@@ -95,8 +105,7 @@ async fn main() -> Result<()> {
     let sock = UdpSocket::bind(("0.0.0.0", rtp_port)).await?;
     info!(port = rtp_port, "Receiving RTP on UDP socket");
 
-    let output_file =
-        std::env::var("UDP_OUTPUT_FILE").unwrap_or_else(|_| "udp_out.h264".to_string());
+    let output_file = runtime_var("UDP_OUTPUT_FILE").unwrap_or_else(|| "udp_out.h264".to_string());
     let mut out = tokio::fs::File::create(&output_file).await?;
     let mut dep = H264Depacketizer::new();
     let mut gate = H264SyncGate::new(true);

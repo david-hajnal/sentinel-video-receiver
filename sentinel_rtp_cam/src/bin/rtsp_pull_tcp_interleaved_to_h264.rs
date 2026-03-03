@@ -4,13 +4,20 @@ use tracing::{debug, error, info};
 
 use sentinel_rtp_cam::core::h264_depacketize::H264Depacketizer;
 use sentinel_rtp_cam::core::h264_sync::H264SyncGate;
-use sentinel_rtp_cam::rtsp::interleaved::{read_interleaved_frame, InterleavedFrame};
 use sentinel_rtp_cam::core::rtp::RtpPacket;
-use sentinel_rtp_cam::rtsp::rtsp::RtspClient;
 use sentinel_rtp_cam::core::sdp::parse_sdp_video_track;
 use sentinel_rtp_cam::core::video::annexb_from_raw_nal;
+use sentinel_rtp_cam::rtsp::interleaved::{read_interleaved_frame, InterleavedFrame};
+use sentinel_rtp_cam::rtsp::rtsp::RtspClient;
+use sentinel_rtp_cam::AgentConfig;
 
 use base64::Engine;
+
+const DEFAULT_CAMERA_CONFIG_PATH: &str = "/etc/sentinel_rtp_cam/camera.json";
+
+fn runtime_var(name: &str) -> Option<String> {
+    AgentConfig::runtime_var(name).filter(|v| !v.trim().is_empty())
+}
 
 fn header_value<'a>(headers: &'a [(String, String)], key: &str) -> Option<&'a str> {
     headers
@@ -40,29 +47,33 @@ fn basic_auth_value(user: &str, pass: &str) -> String {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    if let Ok(camera_value) =
+        AgentConfig::load_camera_json(std::path::Path::new(DEFAULT_CAMERA_CONFIG_PATH))
+    {
+        AgentConfig::apply_json_env_overrides(&camera_value);
+    }
+
     // Initialize tracing
+    let log_filter = runtime_var("RUST_LOG").unwrap_or_else(|| "info".to_string());
     tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
-        )
+        .with_env_filter(tracing_subscriber::EnvFilter::new(log_filter))
         .init();
 
-    // Load .env file if it exists
-    dotenvy::dotenv().ok();
-
-    // Read configuration from environment variables
-    let host = std::env::var("TCP_RTSP_HOST").unwrap_or_else(|_| "192.168.1.187".to_string());
-    let port: u16 = std::env::var("TCP_RTSP_PORT")
-        .unwrap_or_else(|_| "554".to_string())
+    let host = runtime_var("TCP_RTSP_HOST")
+        .or_else(|| runtime_var("RTSP_HOST"))
+        .unwrap_or_else(|| "192.168.1.187".to_string());
+    let port: u16 = runtime_var("TCP_RTSP_PORT")
+        .or_else(|| runtime_var("RTSP_PORT"))
+        .unwrap_or_else(|| "554".to_string())
         .parse()
         .map_err(|_| anyhow!("Invalid TCP_RTSP_PORT"))?;
-    let path = std::env::var("TCP_RTSP_PATH").unwrap_or_else(|_| "/stream1".to_string());
+    let path = runtime_var("TCP_RTSP_PATH")
+        .or_else(|| runtime_var("RTSP_PATH"))
+        .unwrap_or_else(|| "/stream1".to_string());
     let rtsp_url = format!("rtsp://{}:{}{}", host, port, path);
 
-    // Read raw credentials from environment (no URL encoding issues).
-    let user = std::env::var("RTSP_USER").map_err(|_| anyhow!("Missing RTSP_USER env var"))?;
-    let pass = std::env::var("RTSP_PASS").map_err(|_| anyhow!("Missing RTSP_PASS env var"))?;
+    let user = runtime_var("RTSP_USER").ok_or_else(|| anyhow!("Missing RTSP_USER"))?;
+    let pass = runtime_var("RTSP_PASS").ok_or_else(|| anyhow!("Missing RTSP_PASS"))?;
     let authz = basic_auth_value(&user, &pass);
 
     let mut c = RtspClient::connect(&host, port).await?;
@@ -152,8 +163,7 @@ async fn main() -> Result<()> {
 
     info!("Reading RTP/RTCP from RTSP TCP connection (interleaved mode)");
 
-    let output_file =
-        std::env::var("TCP_OUTPUT_FILE").unwrap_or_else(|_| "tcp_out.h264".to_string());
+    let output_file = runtime_var("TCP_OUTPUT_FILE").unwrap_or_else(|| "tcp_out.h264".to_string());
     let mut out = tokio::fs::File::create(&output_file).await?;
     let mut dep = H264Depacketizer::new();
     let mut gate = H264SyncGate::new(true);

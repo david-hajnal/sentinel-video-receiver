@@ -15,8 +15,15 @@ use crate::core::video::nal_type_from_annexb;
 #[derive(Debug)]
 pub enum StreamMsg {
     Rtp(Vec<u8>),
-    Gap { last: u16, new: u16 },
-    Motion { rule: String, active: bool, ts: String },
+    Gap {
+        last: u16,
+        new: u16,
+    },
+    Motion {
+        rule: String,
+        active: bool,
+        ts: String,
+    },
 }
 
 #[derive(Clone)]
@@ -27,6 +34,7 @@ pub struct StreamConfig {
     pub pre_secs: u64,
     pub post_secs: u64,
     pub stale_part_secs: u64,
+    pub max_clip_secs: Option<u64>,
 }
 
 #[derive(Debug, Clone)]
@@ -41,6 +49,7 @@ struct ClipState {
     started_at: DateTime<Utc>,
     rule: String,
     stop_at: Instant,
+    hard_stop_at: Option<Instant>,
 }
 
 #[derive(Serialize)]
@@ -78,7 +87,7 @@ pub async fn run_stream(cfg: StreamConfig, mut rx: mpsc::Receiver<StreamMsg>) ->
         tokio::select! {
             _ = tick.tick() => {
                 if let Some(cs) = &clip {
-                    if Instant::now() >= cs.stop_at {
+                    if should_finalize_clip(Instant::now(), cs.stop_at, cs.hard_stop_at) {
                         finalize_clip(cfg.stream_id, clip.take()).await?;
                     }
                 }
@@ -188,7 +197,11 @@ pub async fn run_stream(cfg: StreamConfig, mut rx: mpsc::Receiver<StreamMsg>) ->
     Ok(())
 }
 
-fn build_access_unit(nals: &[Vec<u8>], sps: &mut Option<Vec<u8>>, pps: &mut Option<Vec<u8>>) -> AccessUnit {
+fn build_access_unit(
+    nals: &[Vec<u8>],
+    sps: &mut Option<Vec<u8>>,
+    pps: &mut Option<Vec<u8>>,
+) -> AccessUnit {
     let mut has_idr = false;
     let mut out = Vec::with_capacity(nals.len());
 
@@ -222,6 +235,12 @@ fn prune_ring(ring: &mut VecDeque<AccessUnit>, ring_secs: u64) {
             break;
         }
     }
+}
+
+fn should_finalize_clip(now: Instant, stop_at: Instant, hard_stop_at: Option<Instant>) -> bool {
+    let stop_due = now >= stop_at;
+    let hard_due = hard_stop_at.map(|t| now >= t).unwrap_or(false);
+    stop_due || hard_due
 }
 
 async fn try_start_clip(
@@ -275,18 +294,25 @@ async fn try_start_clip(
     }
 
     let started_at = Utc::now();
-    let stop_at = Instant::now() + Duration::from_secs(cfg.post_secs);
+    let now = Instant::now();
+    let stop_at = now + Duration::from_secs(cfg.post_secs);
+    let hard_stop_at = cfg
+        .max_clip_secs
+        .map(|secs| now + Duration::from_secs(secs));
 
     Ok(Some(ClipState {
         writer,
         started_at,
         rule: rule.to_string(),
         stop_at,
+        hard_stop_at,
     }))
 }
 
 async fn finalize_clip(stream_id: u32, clip: Option<ClipState>) -> Result<()> {
-    let Some(cs) = clip else { return Ok(()); };
+    let Some(cs) = clip else {
+        return Ok(());
+    };
 
     let part_path = cs.writer.part_path().clone();
     let final_path = cs.writer.finalize().await?;
@@ -338,4 +364,33 @@ async fn cleanup_stale_parts(dir: &PathBuf, stale_part_secs: u64) -> Result<()> 
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::should_finalize_clip;
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn post_secs_deadline_finalizes_clip() {
+        let now = Instant::now();
+        let stop_at = now - Duration::from_secs(1);
+        assert!(should_finalize_clip(now, stop_at, None));
+    }
+
+    #[test]
+    fn max_clip_secs_deadline_finalizes_clip() {
+        let now = Instant::now();
+        let stop_at = now + Duration::from_secs(30);
+        let hard_stop_at = Some(now - Duration::from_secs(1));
+        assert!(should_finalize_clip(now, stop_at, hard_stop_at));
+    }
+
+    #[test]
+    fn clip_keeps_recording_before_deadlines() {
+        let now = Instant::now();
+        let stop_at = now + Duration::from_secs(10);
+        let hard_stop_at = Some(now + Duration::from_secs(5));
+        assert!(!should_finalize_clip(now, stop_at, hard_stop_at));
+    }
 }

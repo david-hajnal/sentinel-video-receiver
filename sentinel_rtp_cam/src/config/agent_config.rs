@@ -1,9 +1,21 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
+use std::sync::{OnceLock, RwLock};
+#[cfg(test)]
+use std::sync::Mutex;
 use std::time::Duration;
 use url::Url;
+
+static RUNTIME_OVERRIDES: OnceLock<RwLock<HashMap<String, String>>> = OnceLock::new();
+#[cfg(test)]
+static RUNTIME_TEST_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+
+fn overrides_map() -> &'static RwLock<HashMap<String, String>> {
+    RUNTIME_OVERRIDES.get_or_init(|| RwLock::new(HashMap::new()))
+}
 
 /// Agent configuration that can be updated dynamically via server SSE
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -55,29 +67,29 @@ pub struct CleanupConfig {
 }
 
 impl AgentConfig {
-    /// Load configuration from environment variables
+    /// Load configuration from runtime overrides initialized from JSON.
     pub fn from_env() -> Self {
-        let camera_id = std::env::var("CAMERA_ID")
-            .or_else(|_| std::env::var("ONVIF_HOST"))
-            .unwrap_or_else(|_| "unknown-camera".to_string());
+        let camera_id = Self::runtime_var("CAMERA_ID")
+            .or_else(|| Self::runtime_var("ONVIF_HOST"))
+            .unwrap_or_else(|| "unknown-camera".to_string());
 
         let motion = MotionConfig {
-            enabled: env_bool("MOTION_ENABLED", true),
+            enabled: Self::runtime_bool("MOTION_ENABLED", true),
         };
 
         let server = ServerConfig {
-            enabled: env_bool("SERVER_ENABLED", false),
-            base_url: std::env::var("SERVER_BASE_URL")
-                .unwrap_or_else(|_| "http://127.0.0.1:8080".to_string()),
-            bearer_token: std::env::var("SERVER_BEARER_TOKEN")
-                .unwrap_or_else(|_| "devtoken".to_string()),
-            retry_interval_secs: env_u64("SERVER_RETRY_INTERVAL_SECS", 2),
-            max_retries: env_u64("SERVER_MAX_RETRIES", 5) as u32,
+            enabled: Self::runtime_bool("SERVER_ENABLED", false),
+            base_url: Self::runtime_var("SERVER_BASE_URL")
+                .unwrap_or_else(|| "http://127.0.0.1:8080".to_string()),
+            bearer_token: Self::runtime_var("SERVER_BEARER_TOKEN")
+                .unwrap_or_else(|| "devtoken".to_string()),
+            retry_interval_secs: Self::runtime_u64("SERVER_RETRY_INTERVAL_SECS", 2),
+            max_retries: Self::runtime_u64("SERVER_MAX_RETRIES", 5) as u32,
         };
 
         let cleanup = CleanupConfig {
-            interval_secs: env_u64("CLIP_CLEANUP_INTERVAL_SECS", 30),
-            min_free_bytes: env_u64("CLIP_MIN_FREE_BYTES", 2_000_000_000),
+            interval_secs: Self::runtime_u64("CLIP_CLEANUP_INTERVAL_SECS", 30),
+            min_free_bytes: Self::runtime_u64("CLIP_MIN_FREE_BYTES", 2_000_000_000),
         };
 
         Self {
@@ -156,45 +168,44 @@ impl AgentConfig {
         Self::write_json_file(path, &current)
     }
 
-    /// Apply JSON overrides to process environment variables.
-    pub fn apply_json_env_overrides(value: &Value) {
-        set_env_if_value("CAMERA_ID", value.get("camera_id"));
-        set_env_if_value("AGENT_ID", value.get("agent_id"));
+    /// Build and install runtime key-value overrides from JSON.
+    pub fn install_runtime_overrides(value: &Value) {
+        let mut map = HashMap::new();
+
+        set_map_if_value(&mut map, "CAMERA_ID", value.get("camera_id"));
+        set_map_if_value(&mut map, "AGENT_ID", value.get("agent_id"));
 
         let server = value.get("server").unwrap_or(&Value::Null);
-        set_env_if_value("SERVER_ENABLED", server.get("enabled"));
-        set_env_if_value("SERVER_BASE_URL", server.get("base_url"));
-        set_env_if_value("SERVER_BEARER_TOKEN", server.get("bearer_token"));
-        set_env_if_unset("AGENT_TOKEN", server.get("bearer_token"));
-        set_env_if_unset("SERVER_TOKEN", server.get("bearer_token"));
-        set_env_if_value(
-            "SERVER_RETRY_INTERVAL_SECS",
-            server.get("retry_interval_secs"),
-        );
-        set_env_if_value("SERVER_MAX_RETRIES", server.get("max_retries"));
+        set_map_if_value(&mut map, "SERVER_ENABLED", server.get("enabled"));
+        set_map_if_value(&mut map, "SERVER_BASE_URL", server.get("base_url"));
+        set_map_if_value(&mut map, "SERVER_BEARER_TOKEN", server.get("bearer_token"));
+        set_map_if_unset(&mut map, "AGENT_TOKEN", server.get("bearer_token"));
+        set_map_if_unset(&mut map, "SERVER_TOKEN", server.get("bearer_token"));
+        set_map_if_value(&mut map, "SERVER_RETRY_INTERVAL_SECS", server.get("retry_interval_secs"));
+        set_map_if_value(&mut map, "SERVER_MAX_RETRIES", server.get("max_retries"));
 
         let cleanup = value.get("cleanup").unwrap_or(&Value::Null);
-        set_env_if_value("CLIP_CLEANUP_INTERVAL_SECS", cleanup.get("interval_secs"));
-        set_env_if_value("CLIP_MIN_FREE_BYTES", cleanup.get("min_free_bytes"));
+        set_map_if_value(&mut map, "CLIP_CLEANUP_INTERVAL_SECS", cleanup.get("interval_secs"));
+        set_map_if_value(&mut map, "CLIP_MIN_FREE_BYTES", cleanup.get("min_free_bytes"));
 
         let ingest = value.get("ingest").unwrap_or(&Value::Null);
-        set_env_if_unset("CLIP_DIR", ingest.get("clip_dir"));
-        set_env_if_value("CLIP_PRE_SECS", ingest.get("clip_pre_secs"));
-        set_env_if_value("CLIP_POST_SECS", ingest.get("clip_post_secs"));
-        set_env_if_value("CLIP_RING_SECS", ingest.get("clip_ring_secs"));
-        set_env_if_unset("CLIP_STALE_PART_SECS", ingest.get("clip_stale_part_secs"));
-        set_env_if_unset("CLIP_MAX_SECS", ingest.get("clip_max_secs"));
+        set_map_if_unset(&mut map, "CLIP_DIR", ingest.get("clip_dir"));
+        set_map_if_value(&mut map, "CLIP_PRE_SECS", ingest.get("clip_pre_secs"));
+        set_map_if_value(&mut map, "CLIP_POST_SECS", ingest.get("clip_post_secs"));
+        set_map_if_value(&mut map, "CLIP_RING_SECS", ingest.get("clip_ring_secs"));
+        set_map_if_unset(&mut map, "CLIP_STALE_PART_SECS", ingest.get("clip_stale_part_secs"));
+        set_map_if_unset(&mut map, "CLIP_MAX_SECS", ingest.get("clip_max_secs"));
 
         let forward = value.get("forward_agent").unwrap_or(&Value::Null);
-        set_env_if_value("AGENT_MODE", forward.get("mode"));
-        set_env_if_value("SERVER_ADDR", forward.get("server_addr"));
-        set_env_if_value("MOTION_MERGE_SECS", forward.get("motion_merge_secs"));
+        set_map_if_value(&mut map, "AGENT_MODE", forward.get("mode"));
+        set_map_if_value(&mut map, "SERVER_ADDR", forward.get("server_addr"));
+        set_map_if_value(&mut map, "MOTION_MERGE_SECS", forward.get("motion_merge_secs"));
 
         let logging = value.get("logging").unwrap_or(&Value::Null);
-        set_env_if_value("RUST_LOG", logging.get("rust_log"));
+        set_map_if_value(&mut map, "RUST_LOG", logging.get("rust_log"));
 
         let version = value.get("version").unwrap_or(&Value::Null);
-        set_env_if_value("SENTINEL_VERSION", version.get("sentinel_version"));
+        set_map_if_value(&mut map, "SENTINEL_VERSION", version.get("sentinel_version"));
 
         if let Some(cameras) = value.get("cameras").and_then(|v| v.as_array()) {
             for (idx, cam) in cameras.iter().enumerate() {
@@ -209,72 +220,89 @@ impl AgentConfig {
 
                 let cam_id = cam.get("camera_id").or_else(|| cam.get("id"));
                 let cam_agent_id = cam.get("agent_id").or(cam_id);
-                set_env_if_value(&format!("{prefix}CAMERA_ID"), cam_id);
-                set_env_if_value(&format!("{prefix}AGENT_ID"), cam_agent_id);
-                set_env_if_value(
+                set_map_if_value(&mut map, &format!("{prefix}CAMERA_ID"), cam_id);
+                set_map_if_value(&mut map, &format!("{prefix}AGENT_ID"), cam_agent_id);
+                set_map_if_value(
+                    &mut map,
                     &format!("{prefix}STREAM_ID"),
                     rtsp.get("stream_id").or_else(|| cam.get("stream_id")),
                 );
-                set_env_if_value(
+                set_map_if_value(
+                    &mut map,
                     &format!("{prefix}TRANSPORT"),
                     cam.get("transport").or_else(|| rtsp.get("transport")),
                 );
 
-                set_env_if_string(&format!("{prefix}RTSP_URL"), build_rtsp_url(rtsp));
-                set_env_if_string(&format!("{prefix}RTSP_HOST"), rtsp_host(rtsp));
-                set_env_if_string(&format!("{prefix}RTSP_PORT"), rtsp_port(rtsp));
-                set_env_if_string(&format!("{prefix}RTSP_PATH"), rtsp_path(rtsp));
-                set_env_if_value(&format!("{prefix}RTSP_USER"), user);
-                set_env_if_value(&format!("{prefix}RTSP_PASS"), pass);
+                set_map_if_string(&mut map, &format!("{prefix}RTSP_URL"), build_rtsp_url(rtsp));
+                set_map_if_string(&mut map, &format!("{prefix}RTSP_HOST"), rtsp_host(rtsp));
+                set_map_if_string(&mut map, &format!("{prefix}RTSP_PORT"), rtsp_port(rtsp));
+                set_map_if_string(&mut map, &format!("{prefix}RTSP_PATH"), rtsp_path(rtsp));
+                set_map_if_value(&mut map, &format!("{prefix}RTSP_USER"), user);
+                set_map_if_value(&mut map, &format!("{prefix}RTSP_PASS"), pass);
 
-                set_env_if_string(&format!("{prefix}ONVIF_HOST"), onvif_host(onvif));
-                set_env_if_string(&format!("{prefix}ONVIF_PORT"), onvif_port(onvif));
-                set_env_if_value(&format!("{prefix}ONVIF_USER"), user);
-                set_env_if_value(&format!("{prefix}ONVIF_PASS"), pass);
-                set_env_if_value(&format!("{prefix}ONVIF_DEBUG"), onvif.get("debug"));
-                set_env_if_value(&format!("{prefix}ONVIF_DUMP_XML"), onvif.get("dump_xml"));
-                set_env_if_value(
+                set_map_if_string(&mut map, &format!("{prefix}ONVIF_HOST"), onvif_host(onvif));
+                set_map_if_string(&mut map, &format!("{prefix}ONVIF_PORT"), onvif_port(onvif));
+                set_map_if_value(&mut map, &format!("{prefix}ONVIF_USER"), user);
+                set_map_if_value(&mut map, &format!("{prefix}ONVIF_PASS"), pass);
+                set_map_if_value(&mut map, &format!("{prefix}ONVIF_DEBUG"), onvif.get("debug"));
+                set_map_if_value(
+                    &mut map,
+                    &format!("{prefix}ONVIF_DUMP_XML"),
+                    onvif.get("dump_xml"),
+                );
+                set_map_if_value(
+                    &mut map,
                     &format!("{prefix}ONVIF_SUB_TERMINATION"),
                     onvif.get("sub_termination"),
                 );
-                set_env_if_value(
+                set_map_if_value(
+                    &mut map,
                     &format!("{prefix}ONVIF_RENEW_EVERY_SECS"),
                     onvif.get("renew_every_secs"),
                 );
-                set_env_if_value(
+                set_map_if_value(
+                    &mut map,
                     &format!("{prefix}ONVIF_PULL_TIMEOUT"),
                     onvif.get("pull_timeout"),
                 );
-                set_env_if_value(
+                set_map_if_value(
+                    &mut map,
                     &format!("{prefix}ONVIF_PULL_LIMIT"),
                     onvif.get("pull_limit"),
                 );
-                set_env_if_value(
+                set_map_if_value(
+                    &mut map,
                     &format!("{prefix}ONVIF_RESUBSCRIBE_AFTER_ERRORS"),
                     onvif.get("resubscribe_after_errors"),
                 );
-                set_env_if_value(
+                set_map_if_value(
+                    &mut map,
                     &format!("{prefix}ONVIF_MIN_POLL_GAP_MS"),
                     onvif.get("min_poll_gap_ms"),
                 );
-                set_env_if_value(
+                set_map_if_value(
+                    &mut map,
                     &format!("{prefix}ONVIF_AFTER_SUB_DELAY_MS"),
                     onvif.get("after_sub_delay_ms"),
                 );
-                set_env_if_value(
+                set_map_if_value(
+                    &mut map,
                     &format!("{prefix}ONVIF_CONNREFUSED_RETRIES"),
                     onvif.get("connrefused_retries"),
                 );
-                set_env_if_value(
+                set_map_if_value(
+                    &mut map,
                     &format!("{prefix}ONVIF_CONNREFUSED_BACKOFF_MS"),
                     onvif.get("connrefused_backoff_ms"),
                 );
-                set_env_if_value(&format!("{prefix}MOTION_ENABLED"), motion.get("enabled"));
-                set_env_if_value(
+                set_map_if_value(&mut map, &format!("{prefix}MOTION_ENABLED"), motion.get("enabled"));
+                set_map_if_value(
+                    &mut map,
                     &format!("{prefix}LOCAL_CLIP_ENABLED"),
                     features.get("local_clip_enabled"),
                 );
-                set_env_if_value(
+                set_map_if_value(
+                    &mut map,
                     &format!("{prefix}RTSP_RECEIVER_ENABLED"),
                     features.get("rtsp_receiver_enabled"),
                 );
@@ -290,46 +318,105 @@ impl AgentConfig {
 
                 let cam_id = first.get("camera_id").or_else(|| first.get("id"));
                 let cam_agent_id = first.get("agent_id").or(cam_id);
-                set_env_if_unset("CAMERA_ID", cam_id);
-                set_env_if_unset("AGENT_ID", cam_agent_id);
-                set_env_if_unset("MOTION_ENABLED", motion.get("enabled"));
-                set_env_if_unset("LOCAL_CLIP_ENABLED", features.get("local_clip_enabled"));
-                set_env_if_unset(
+                set_map_if_unset(&mut map, "CAMERA_ID", cam_id);
+                set_map_if_unset(&mut map, "AGENT_ID", cam_agent_id);
+                set_map_if_unset(&mut map, "MOTION_ENABLED", motion.get("enabled"));
+                set_map_if_unset(&mut map, "LOCAL_CLIP_ENABLED", features.get("local_clip_enabled"));
+                set_map_if_unset(
+                    &mut map,
                     "RTSP_RECEIVER_ENABLED",
                     features.get("rtsp_receiver_enabled"),
                 );
-                set_env_if_unset_string("RTSP_URL", build_rtsp_url(rtsp));
-                set_env_if_unset_string("RTSP_HOST", rtsp_host(rtsp));
-                set_env_if_unset_string("RTSP_PORT", rtsp_port(rtsp));
-                set_env_if_unset_string("RTSP_PATH", rtsp_path(rtsp));
-                set_env_if_unset("CAM1_STREAM_ID", rtsp.get("stream_id"));
-                set_env_if_unset("RTSP_USER", user);
-                set_env_if_unset("RTSP_PASS", pass);
-                set_env_if_unset_string("ONVIF_HOST", onvif_host(onvif));
-                set_env_if_unset_string("ONVIF_PORT", onvif_port(onvif));
-                set_env_if_unset("ONVIF_USER", user);
-                set_env_if_unset("ONVIF_PASS", pass);
-                set_env_if_unset("ONVIF_DEBUG", onvif.get("debug"));
-                set_env_if_unset("ONVIF_DUMP_XML", onvif.get("dump_xml"));
-                set_env_if_unset("ONVIF_SUB_TERMINATION", onvif.get("sub_termination"));
-                set_env_if_unset("ONVIF_RENEW_EVERY_SECS", onvif.get("renew_every_secs"));
-                set_env_if_unset("ONVIF_PULL_TIMEOUT", onvif.get("pull_timeout"));
-                set_env_if_unset("ONVIF_PULL_LIMIT", onvif.get("pull_limit"));
-                set_env_if_unset(
+                set_map_if_unset_string(&mut map, "RTSP_URL", build_rtsp_url(rtsp));
+                set_map_if_unset_string(&mut map, "RTSP_HOST", rtsp_host(rtsp));
+                set_map_if_unset_string(&mut map, "RTSP_PORT", rtsp_port(rtsp));
+                set_map_if_unset_string(&mut map, "RTSP_PATH", rtsp_path(rtsp));
+                set_map_if_unset(&mut map, "CAM1_STREAM_ID", rtsp.get("stream_id"));
+                set_map_if_unset(&mut map, "RTSP_USER", user);
+                set_map_if_unset(&mut map, "RTSP_PASS", pass);
+                set_map_if_unset_string(&mut map, "ONVIF_HOST", onvif_host(onvif));
+                set_map_if_unset_string(&mut map, "ONVIF_PORT", onvif_port(onvif));
+                set_map_if_unset(&mut map, "ONVIF_USER", user);
+                set_map_if_unset(&mut map, "ONVIF_PASS", pass);
+                set_map_if_unset(&mut map, "ONVIF_DEBUG", onvif.get("debug"));
+                set_map_if_unset(&mut map, "ONVIF_DUMP_XML", onvif.get("dump_xml"));
+                set_map_if_unset(&mut map, "ONVIF_SUB_TERMINATION", onvif.get("sub_termination"));
+                set_map_if_unset(&mut map, "ONVIF_RENEW_EVERY_SECS", onvif.get("renew_every_secs"));
+                set_map_if_unset(&mut map, "ONVIF_PULL_TIMEOUT", onvif.get("pull_timeout"));
+                set_map_if_unset(&mut map, "ONVIF_PULL_LIMIT", onvif.get("pull_limit"));
+                set_map_if_unset(
+                    &mut map,
                     "ONVIF_RESUBSCRIBE_AFTER_ERRORS",
                     onvif.get("resubscribe_after_errors"),
                 );
-                set_env_if_unset("ONVIF_MIN_POLL_GAP_MS", onvif.get("min_poll_gap_ms"));
-                set_env_if_unset("ONVIF_AFTER_SUB_DELAY_MS", onvif.get("after_sub_delay_ms"));
-                set_env_if_unset(
+                set_map_if_unset(&mut map, "ONVIF_MIN_POLL_GAP_MS", onvif.get("min_poll_gap_ms"));
+                set_map_if_unset(&mut map, "ONVIF_AFTER_SUB_DELAY_MS", onvif.get("after_sub_delay_ms"));
+                set_map_if_unset(
+                    &mut map,
                     "ONVIF_CONNREFUSED_RETRIES",
                     onvif.get("connrefused_retries"),
                 );
-                set_env_if_unset(
+                set_map_if_unset(
+                    &mut map,
                     "ONVIF_CONNREFUSED_BACKOFF_MS",
                     onvif.get("connrefused_backoff_ms"),
                 );
             }
+        }
+
+        if let Ok(mut guard) = overrides_map().write() {
+            *guard = map;
+        }
+    }
+
+    /// Backward-compatible alias.
+    pub fn apply_json_env_overrides(value: &Value) {
+        Self::install_runtime_overrides(value);
+    }
+
+    pub fn runtime_var(key: &str) -> Option<String> {
+        overrides_map().read().ok().and_then(|m| m.get(key).cloned())
+    }
+
+    pub fn runtime_bool(key: &str, default: bool) -> bool {
+        Self::runtime_var(key)
+            .and_then(|v| match v.as_str() {
+                "1" | "true" | "TRUE" | "yes" | "YES" => Some(true),
+                "0" | "false" | "FALSE" | "no" | "NO" => Some(false),
+                _ => None,
+            })
+            .unwrap_or(default)
+    }
+
+    pub fn runtime_u64(key: &str, default: u64) -> u64 {
+        Self::runtime_var(key)
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(default)
+    }
+
+    pub fn clear_runtime_overrides() {
+        if let Ok(mut guard) = overrides_map().write() {
+            guard.clear();
+        }
+    }
+
+    #[cfg(test)]
+    pub fn runtime_test_lock() -> &'static Mutex<()> {
+        RUNTIME_TEST_LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    #[cfg(test)]
+    pub fn runtime_snapshot() -> HashMap<String, String> {
+        overrides_map()
+            .read()
+            .map(|m| m.clone())
+            .unwrap_or_default()
+    }
+
+    #[cfg(test)]
+    pub fn runtime_restore(snapshot: HashMap<String, String>) {
+        if let Ok(mut guard) = overrides_map().write() {
+            *guard = snapshot;
         }
     }
 
@@ -687,32 +774,32 @@ fn value_to_string(value: &Value) -> Option<String> {
     }
 }
 
-fn set_env_if_value(key: &str, value: Option<&Value>) {
+fn set_map_if_value(map: &mut HashMap<String, String>, key: &str, value: Option<&Value>) {
     if let Some(value) = value.and_then(value_to_string) {
-        std::env::set_var(key, value);
+        map.insert(key.to_string(), value);
     }
 }
 
-fn set_env_if_string(key: &str, value: Option<String>) {
+fn set_map_if_string(map: &mut HashMap<String, String>, key: &str, value: Option<String>) {
     if let Some(value) = value {
         if !value.trim().is_empty() {
-            std::env::set_var(key, value);
+            map.insert(key.to_string(), value);
         }
     }
 }
 
-fn set_env_if_unset_string(key: &str, value: Option<String>) {
-    if std::env::var_os(key).is_some() {
+fn set_map_if_unset_string(map: &mut HashMap<String, String>, key: &str, value: Option<String>) {
+    if map.contains_key(key) {
         return;
     }
-    set_env_if_string(key, value);
+    set_map_if_string(map, key, value);
 }
 
-fn set_env_if_unset(key: &str, value: Option<&Value>) {
-    if std::env::var_os(key).is_some() {
+fn set_map_if_unset(map: &mut HashMap<String, String>, key: &str, value: Option<&Value>) {
+    if map.contains_key(key) {
         return;
     }
-    set_env_if_value(key, value);
+    set_map_if_value(map, key, value);
 }
 
 impl AgentConfig {
@@ -785,21 +872,64 @@ impl Default for AgentConfig {
     }
 }
 
-// Helper functions for parsing env vars
-fn env_bool(key: &str, default: bool) -> bool {
-    std::env::var(key)
-        .ok()
-        .and_then(|v| match v.as_str() {
-            "1" | "true" | "TRUE" | "yes" | "YES" => Some(true),
-            "0" | "false" | "FALSE" | "no" | "NO" => Some(false),
-            _ => None,
-        })
-        .unwrap_or(default)
-}
 
-fn env_u64(key: &str, default: u64) -> u64 {
-    std::env::var(key)
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(default)
+#[cfg(test)]
+mod tests {
+    use super::AgentConfig;
+    use serde_json::json;
+    use std::collections::HashMap;
+    use std::sync::MutexGuard;
+
+    struct EnvGuard {
+        _lock: MutexGuard<'static, ()>,
+        saved: HashMap<String, String>,
+    }
+
+    impl EnvGuard {
+        fn new() -> Self {
+            let lock = AgentConfig::runtime_test_lock()
+                .lock()
+                .expect("lock runtime mutex");
+            let saved = AgentConfig::runtime_snapshot();
+            AgentConfig::clear_runtime_overrides();
+            Self { _lock: lock, saved }
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            AgentConfig::runtime_restore(std::mem::take(&mut self.saved));
+        }
+    }
+
+    #[test]
+    fn apply_json_env_overrides_applies_ingest_clip_settings() {
+        let _guard = EnvGuard::new();
+
+        let cfg = json!({
+            "ingest": {
+                "clip_dir": "/var/lib/sentinel_rtp_cam/clips",
+                "clip_max_secs": 30,
+                "clip_post_secs": 120,
+                "clip_pre_secs": 2,
+                "clip_ring_secs": 15,
+                "clip_stale_part_secs": 3600
+            }
+        });
+
+        AgentConfig::apply_json_env_overrides(&cfg);
+
+        assert_eq!(
+            AgentConfig::runtime_var("CLIP_DIR").as_deref(),
+            Some("/var/lib/sentinel_rtp_cam/clips")
+        );
+        assert_eq!(AgentConfig::runtime_var("CLIP_MAX_SECS").as_deref(), Some("30"));
+        assert_eq!(AgentConfig::runtime_var("CLIP_POST_SECS").as_deref(), Some("120"));
+        assert_eq!(AgentConfig::runtime_var("CLIP_PRE_SECS").as_deref(), Some("2"));
+        assert_eq!(AgentConfig::runtime_var("CLIP_RING_SECS").as_deref(), Some("15"));
+        assert_eq!(
+            AgentConfig::runtime_var("CLIP_STALE_PART_SECS").as_deref(),
+            Some("3600")
+        );
+    }
 }

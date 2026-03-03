@@ -4,6 +4,7 @@ use std::collections::HashMap;
 use url::Url;
 
 use crate::agent_uplink::{HelloIngestConfig, Uplink};
+use crate::config::AgentConfig;
 use crate::event::MotionEvent;
 
 #[derive(Debug, Clone)]
@@ -22,11 +23,11 @@ pub struct CamConfig {
 }
 
 fn env_string(key: &str) -> Option<String> {
-    std::env::var(key).ok()
+    AgentConfig::runtime_var(key)
 }
 
 fn env_u64(key: &str) -> Option<u64> {
-    std::env::var(key).ok().and_then(|v| v.parse::<u64>().ok())
+    AgentConfig::runtime_var(key).and_then(|v| v.parse::<u64>().ok())
 }
 
 pub fn load_uplink_ingest_config_from_env() -> Option<HelloIngestConfig> {

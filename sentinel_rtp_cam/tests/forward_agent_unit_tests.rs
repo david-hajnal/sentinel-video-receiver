@@ -2,40 +2,33 @@ use std::collections::HashMap;
 use std::sync::{Mutex, MutexGuard};
 
 use chrono::Utc;
+use serde_json::json;
 
 use sentinel_rtp_cam::event::MotionEvent;
 use sentinel_rtp_cam::forward_agent::{
     basic_auth_value, build_stream_maps, forward_motion_event, load_cameras_from_env,
     parse_rtsp_url, CamConfig, MotionSender,
 };
+use sentinel_rtp_cam::AgentConfig;
 
 static ENV_LOCK: Mutex<()> = Mutex::new(());
 
 struct EnvGuard {
     _lock: MutexGuard<'static, ()>,
-    saved: HashMap<String, Option<String>>,
 }
 
 impl EnvGuard {
-    fn new(pairs: &[(&str, &str)]) -> Self {
+    fn new(config: serde_json::Value) -> Self {
         let lock = ENV_LOCK.lock().unwrap();
-        let mut saved = HashMap::new();
-        for (key, value) in pairs {
-            saved.insert((*key).to_string(), std::env::var(*key).ok());
-            std::env::set_var(*key, value);
-        }
-        Self { _lock: lock, saved }
+        AgentConfig::clear_runtime_overrides();
+        AgentConfig::apply_json_env_overrides(&config);
+        Self { _lock: lock }
     }
 }
 
 impl Drop for EnvGuard {
     fn drop(&mut self) {
-        for (key, value) in self.saved.drain() {
-            match value {
-                Some(v) => std::env::set_var(&key, v),
-                None => std::env::remove_var(&key),
-            }
-        }
+        AgentConfig::clear_runtime_overrides();
     }
 }
 
@@ -93,18 +86,24 @@ fn parse_rtsp_url_parses_components() {
 
 #[test]
 fn load_cameras_from_env_uses_per_camera_override() {
-    // Scenario: per-camera RTSP credentials should override global defaults.
-    let _guard = EnvGuard::new(&[
-        ("CAM1_RTSP_URL", "rtsp://example.com/stream"),
-        ("CAM1_STREAM_ID", "7"),
-        ("CAM1_TRANSPORT", "tcp"),
-        ("CAM1_CAMERA_ID", "cam-test-1"),
-        ("AGENT_TOKEN", "test-token"),
-        ("RTSP_USER", "global_user"),
-        ("RTSP_PASS", "global_pass"),
-        ("CAM1_RTSP_USER", "cam_user"),
-        ("CAM1_RTSP_PASS", "cam_pass"),
-    ]);
+    // Scenario: camera-level credentials from JSON runtime config should be used.
+    let _guard = EnvGuard::new(json!({
+        "server": {
+            "bearer_token": "test-token"
+        },
+        "cameras": [
+            {
+                "id": "cam-test-1",
+                "user": "cam_user",
+                "pass": "cam_pass",
+                "transport": "tcp",
+                "rtsp": {
+                    "url": "rtsp://example.com/stream",
+                    "stream_id": 7
+                }
+            }
+        ]
+    }));
 
     let cams = load_cameras_from_env().unwrap();
     assert_eq!(cams.len(), 1);
@@ -115,13 +114,23 @@ fn load_cameras_from_env_uses_per_camera_override() {
 #[test]
 fn load_cameras_from_env_falls_back_to_global_camera_id() {
     // Scenario: when CAM1_CAMERA_ID is missing, CAMERA_ID should be used for the first camera.
-    let _guard = EnvGuard::new(&[
-        ("CAM1_RTSP_URL", "rtsp://example.com/stream"),
-        ("CAM1_STREAM_ID", "7"),
-        ("CAM1_TRANSPORT", "tcp"),
-        ("AGENT_TOKEN", "test-token"),
-        ("CAMERA_ID", "cam-global"),
-    ]);
+    let _guard = EnvGuard::new(json!({
+        "camera_id": "cam-global",
+        "server": {
+            "bearer_token": "test-token"
+        },
+        "cameras": [
+            {
+                "user": "cam_user",
+                "pass": "cam_pass",
+                "transport": "tcp",
+                "rtsp": {
+                    "url": "rtsp://example.com/stream",
+                    "stream_id": 7
+                }
+            }
+        ]
+    }));
 
     let cams = load_cameras_from_env().unwrap();
     assert_eq!(cams.len(), 1);

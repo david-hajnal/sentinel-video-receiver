@@ -2,6 +2,7 @@ use anyhow::{anyhow, bail, Result};
 use tokio::sync::mpsc;
 use tracing::debug;
 
+use crate::config::AgentConfig;
 use crate::core::h264_depacketize::H264Depacketizer;
 use crate::core::h264_sync::H264SyncGate;
 use crate::core::rtp::RtpPacket;
@@ -32,15 +33,14 @@ pub struct TcpInterleavedReceiverConfig {
 impl TcpInterleavedReceiverConfig {
     pub fn from_env_defaults() -> Result<Self> {
         let rtsp_url =
-            std::env::var("RTSP_URL").map_err(|_| anyhow!("Missing RTSP_URL env var"))?;
-        let host = std::env::var("RTSP_HOST").map_err(|_| anyhow!("Missing RTSP_HOST env var"))?;
-        let port: u16 = std::env::var("RTSP_PORT")
-            .ok()
+            AgentConfig::runtime_var("RTSP_URL").ok_or_else(|| anyhow!("Missing RTSP_URL"))?;
+        let host = AgentConfig::runtime_var("RTSP_HOST").ok_or_else(|| anyhow!("Missing RTSP_HOST"))?;
+        let port: u16 = AgentConfig::runtime_var("RTSP_PORT")
             .and_then(|v| v.parse().ok())
             .unwrap_or(554);
 
-        let user = std::env::var("RTSP_USER").map_err(|_| anyhow!("Missing RTSP_USER env var"))?;
-        let pass = std::env::var("RTSP_PASS").map_err(|_| anyhow!("Missing RTSP_PASS env var"))?;
+        let user = AgentConfig::runtime_var("RTSP_USER").ok_or_else(|| anyhow!("Missing RTSP_USER"))?;
+        let pass = AgentConfig::runtime_var("RTSP_PASS").ok_or_else(|| anyhow!("Missing RTSP_PASS"))?;
 
         Ok(Self {
             rtsp_url,

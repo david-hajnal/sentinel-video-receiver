@@ -12,6 +12,9 @@ use sentinel_rtp_cam::{
     VideoNal,
 };
 
+const DEFAULT_SERVER_CONFIG_PATH: &str = "/etc/sentinel_rtp_cam/server.json";
+const DEFAULT_CAMERA_CONFIG_PATH: &str = "/etc/sentinel_rtp_cam/camera.json";
+
 fn spawn_logger(mut rx: mpsc::Receiver<Event>) {
     tokio::spawn(async move {
         while let Some(ev) = rx.recv().await {
@@ -41,15 +44,26 @@ fn arg_flag(name: &str) -> bool {
     std::env::args().any(|a| a == name)
 }
 
-fn env_bool(name: &str, default: bool) -> bool {
-    std::env::var(name)
-        .ok()
-        .and_then(|v| match v.as_str() {
-            "1" | "true" | "TRUE" | "yes" | "YES" => Some(true),
-            "0" | "false" | "FALSE" | "no" | "NO" => Some(false),
-            _ => None,
-        })
+fn runtime_var(name: &str) -> Option<String> {
+    AgentConfig::runtime_var(name).filter(|v| !v.trim().is_empty())
+}
+
+fn runtime_bool(name: &str, default: bool) -> bool {
+    AgentConfig::runtime_bool(name, default)
+}
+
+fn runtime_u64(name: &str, default: u64) -> u64 {
+    runtime_var(name)
+        .and_then(|v| v.parse::<u64>().ok())
         .unwrap_or(default)
+}
+
+fn runtime_opt_u64(name: &str) -> Option<u64> {
+    runtime_var(name).and_then(|v| v.parse::<u64>().ok())
+}
+
+fn runtime_opt_usize(name: &str) -> Option<usize> {
+    runtime_var(name).and_then(|v| v.parse::<usize>().ok())
 }
 
 fn paths_resolve_to_same_file(a: &std::path::Path, b: &std::path::Path) -> bool {
@@ -64,37 +78,12 @@ fn paths_resolve_to_same_file(a: &std::path::Path, b: &std::path::Path) -> bool 
 
 #[tokio::main(flavor = "multi_thread", worker_threads = 2)]
 async fn main() -> Result<()> {
-    // .env support
-    if dotenvy::dotenv().is_err() {
-        dotenvy::from_filename("../.env").ok();
-    }
+    let server_source_path = PathBuf::from(DEFAULT_SERVER_CONFIG_PATH);
+    let camera_config_path = PathBuf::from(DEFAULT_CAMERA_CONFIG_PATH);
 
-    let legacy_config_path = std::env::var("AGENT_CONFIG_JSON")
-        .or_else(|_| std::env::var("CONFIG_JSON_PATH"))
-        .ok();
-    let server_config_path = std::env::var("SERVER_CONFIG_JSON")
-        .unwrap_or_else(|_| "/etc/sentinel_rtp_cam/server.json".to_string());
-    let server_config_path = PathBuf::from(server_config_path);
-    let camera_config_path = std::env::var("CAMERA_CONFIG_JSON")
-        .ok()
-        .or_else(|| legacy_config_path.clone())
-        .unwrap_or_else(|| "/etc/sentinel_rtp_cam/camera.json".to_string());
-    let camera_config_path = PathBuf::from(camera_config_path);
-
-    // Load JSON config and apply env overrides before reading env-based settings.
+    // Load JSON config and install runtime overrides before reading runtime settings.
     let mut server_error: Option<String> = None;
     let mut camera_error: Option<String> = None;
-    let use_legacy_server = std::env::var("SERVER_CONFIG_JSON").is_err()
-        && !server_config_path.exists()
-        && legacy_config_path.is_some();
-    let use_legacy_camera =
-        std::env::var("CAMERA_CONFIG_JSON").is_err() && legacy_config_path.is_some();
-    let server_source_path = if use_legacy_server {
-        PathBuf::from(legacy_config_path.clone().unwrap())
-    } else {
-        server_config_path.clone()
-    };
-
     let server_value = match AgentConfig::load_server_json(&server_source_path) {
         Ok(value) => value,
         Err(e) => {
@@ -113,11 +102,9 @@ async fn main() -> Result<()> {
     AgentConfig::apply_json_env_overrides(&config_value);
 
     // Initialize tracing subscriber
+    let log_filter = runtime_var("RUST_LOG").unwrap_or_else(|| "info".to_string());
     tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
-        )
+        .with_env_filter(tracing_subscriber::EnvFilter::new(log_filter))
         .with_target(false)
         .with_thread_ids(true)
         .with_line_number(true)
@@ -137,23 +124,11 @@ async fn main() -> Result<()> {
             "Failed to load camera config JSON, using defaults"
         );
     }
-    if use_legacy_server {
-        warn!(
-            path = %server_source_path.display(),
-            "SERVER_CONFIG_JSON unset; using legacy config for server settings"
-        );
-    }
-    if use_legacy_camera {
-        warn!(
-            path = %camera_config_path.display(),
-            "CAMERA_CONFIG_JSON unset; using legacy config path for camera settings"
-        );
-    }
 
     let onvif_only = arg_flag("--onvif-only");
-    let local_clip_enabled = env_bool("LOCAL_CLIP_ENABLED", true);
+    let local_clip_enabled = runtime_bool("LOCAL_CLIP_ENABLED", true);
     let rtsp_receiver_enabled =
-        !onvif_only && local_clip_enabled && env_bool("RTSP_RECEIVER_ENABLED", true);
+        !onvif_only && local_clip_enabled && runtime_bool("RTSP_RECEIVER_ENABLED", true);
 
     // Build agent configuration from JSON
     let agent_config = AgentConfig::from_json_value(config_value.clone());
@@ -202,54 +177,28 @@ async fn main() -> Result<()> {
         // Recorder task
         let motion_rx = motion_state.subscribe();
         let rec_cfg = ClipRecorderConfig {
-            output_dir: std::env::var("OUTPUT_DIR")
-                .or_else(|_| std::env::var("CLIP_DIR"))
-                .unwrap_or_else(|_| "clips".to_string())
+            output_dir: runtime_var("OUTPUT_DIR")
+                .or_else(|| runtime_var("CLIP_DIR"))
+                .unwrap_or_else(|| "clips".to_string())
                 .into(),
             post_roll: std::time::Duration::from_secs(
-                std::env::var("POST_ROLL_SECS")
-                    .or_else(|_| std::env::var("CLIP_POST_ROLL_SECS"))
-                    .ok()
+                runtime_var("POST_ROLL_SECS")
+                    .or_else(|| runtime_var("CLIP_POST_ROLL_SECS"))
                     .and_then(|v| v.parse().ok())
                     .unwrap_or(3),
             ),
-            min_clip_duration: std::time::Duration::from_secs(
-                std::env::var("CLIP_MIN_DURATION_SECS")
-                    .ok()
-                    .and_then(|v| v.parse().ok())
-                    .unwrap_or(5),
-            ),
-            flush_interval: std::time::Duration::from_secs(
-                std::env::var("CLIP_FLUSH_SECS")
-                    .ok()
-                    .and_then(|v| v.parse().ok())
-                    .unwrap_or(1),
-            ),
-            stale_part_max_age: std::time::Duration::from_secs(
-                std::env::var("CLIP_STALE_PART_SECS")
-                    .ok()
-                    .and_then(|v| v.parse().ok())
-                    .unwrap_or(24 * 60 * 60),
-            ),
-            write_batch_bytes: std::env::var("CLIP_WRITE_BATCH_BYTES")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(256 * 1024),
-            max_files: std::env::var("CLIP_MAX_FILES")
-                .ok()
-                .and_then(|v| v.parse().ok()),
-            max_age_secs: std::env::var("CLIP_MAX_AGE_SECS")
-                .ok()
-                .and_then(|v| v.parse().ok()),
-            max_total_bytes: std::env::var("CLIP_MAX_TOTAL_BYTES")
-                .ok()
-                .and_then(|v| v.parse().ok()),
-            max_clip_bytes: std::env::var("CLIP_MAX_BYTES")
-                .ok()
-                .and_then(|v| v.parse().ok()),
-            max_clip_secs: std::env::var("CLIP_MAX_SECS")
-                .ok()
-                .and_then(|v| v.parse().ok()),
+            min_clip_duration: std::time::Duration::from_secs(runtime_u64("CLIP_MIN_DURATION_SECS", 5)),
+            flush_interval: std::time::Duration::from_secs(runtime_u64("CLIP_FLUSH_SECS", 1)),
+            stale_part_max_age: std::time::Duration::from_secs(runtime_u64(
+                "CLIP_STALE_PART_SECS",
+                24 * 60 * 60,
+            )),
+            write_batch_bytes: runtime_opt_usize("CLIP_WRITE_BATCH_BYTES").unwrap_or(256 * 1024),
+            max_files: runtime_opt_usize("CLIP_MAX_FILES"),
+            max_age_secs: runtime_opt_u64("CLIP_MAX_AGE_SECS"),
+            max_total_bytes: runtime_opt_u64("CLIP_MAX_TOTAL_BYTES"),
+            max_clip_bytes: runtime_opt_u64("CLIP_MAX_BYTES"),
+            max_clip_secs: runtime_opt_u64("CLIP_MAX_SECS"),
         };
 
         tokio::spawn(async move {
@@ -281,9 +230,7 @@ async fn main() -> Result<()> {
 
         // SSE config listener
         let camera_id_clone = agent_config.camera_id.clone();
-        let stream_id = std::env::var("CAM1_STREAM_ID")
-            .ok()
-            .and_then(|v| v.parse::<u32>().ok());
+        let stream_id = runtime_var("CAM1_STREAM_ID").and_then(|v| v.parse::<u32>().ok());
         let server_cfg_clone = server_cfg.clone();
         let server_config_path = server_source_path.clone();
         let camera_config_path = camera_config_path.clone();
@@ -416,9 +363,9 @@ async fn main() -> Result<()> {
     );
 
     let disk_cfg = DiskCleanupConfig {
-        clips_dir: std::env::var("OUTPUT_DIR")
-            .or_else(|_| std::env::var("CLIP_DIR"))
-            .unwrap_or_else(|_| "clips".to_string())
+        clips_dir: runtime_var("OUTPUT_DIR")
+            .or_else(|| runtime_var("CLIP_DIR"))
+            .unwrap_or_else(|| "clips".to_string())
             .into(),
         min_free_bytes: cleanup_cfg.min_free_bytes,
         check_interval: std::time::Duration::from_secs(cleanup_cfg.interval_secs),

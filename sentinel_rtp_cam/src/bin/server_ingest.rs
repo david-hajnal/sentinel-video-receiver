@@ -12,6 +12,22 @@ use sentinel_rtp_cam::proto::{decode_gap, read_msg, Msg, GAP, HELLO, MOTION, RTP
 use sentinel_rtp_cam::server_pipeline::{run_stream, StreamConfig, StreamMsg};
 use sentinel_rtp_cam::AgentConfig;
 
+const DEFAULT_CAMERA_CONFIG_PATH: &str = "/etc/sentinel_rtp_cam/camera.json";
+
+fn runtime_var(name: &str) -> Option<String> {
+    AgentConfig::runtime_var(name).filter(|v| !v.trim().is_empty())
+}
+
+fn runtime_u64(name: &str, default: u64) -> u64 {
+    runtime_var(name)
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(default)
+}
+
+fn runtime_opt_u64(name: &str) -> Option<u64> {
+    runtime_var(name).and_then(|v| v.parse::<u64>().ok())
+}
+
 #[derive(Debug, Deserialize)]
 struct HelloPayload {
     agent_id: String,
@@ -27,14 +43,7 @@ struct HelloStream {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let legacy_config_path = std::env::var("AGENT_CONFIG_JSON")
-        .or_else(|_| std::env::var("CONFIG_JSON_PATH"))
-        .ok();
-    let camera_config_path = std::env::var("CAMERA_CONFIG_JSON")
-        .ok()
-        .or_else(|| legacy_config_path.clone())
-        .unwrap_or_else(|| "/etc/sentinel_rtp_cam/camera.json".to_string());
-    let camera_config_path = std::path::PathBuf::from(camera_config_path);
+    let camera_config_path = std::path::PathBuf::from(DEFAULT_CAMERA_CONFIG_PATH);
     let mut config_error: Option<String> = None;
     match AgentConfig::load_camera_json(&camera_config_path) {
         Ok(value) => AgentConfig::apply_json_env_overrides(&value),
@@ -43,11 +52,9 @@ async fn main() -> Result<()> {
         }
     }
 
+    let log_filter = runtime_var("RUST_LOG").unwrap_or_else(|| "info".to_string());
     tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
-        )
+        .with_env_filter(tracing_subscriber::EnvFilter::new(log_filter))
         .init();
 
     if let Some(error) = config_error {
@@ -57,40 +64,19 @@ async fn main() -> Result<()> {
             "Failed to load camera config JSON, using defaults"
         );
     }
-    if std::env::var("CAMERA_CONFIG_JSON").is_err() && legacy_config_path.is_some() {
-        warn!(
-            path = %camera_config_path.display(),
-            "CAMERA_CONFIG_JSON unset; using legacy config path for camera settings"
-        );
-    }
 
-    let bind = std::env::var("SERVER_BIND").unwrap_or_else(|_| "0.0.0.0:9000".to_string());
-    let token = std::env::var("SERVER_TOKEN").unwrap_or_else(|_| "devtoken".to_string());
+    let bind = runtime_var("SERVER_BIND").unwrap_or_else(|| "0.0.0.0:9000".to_string());
+    let token = runtime_var("SERVER_TOKEN").unwrap_or_else(|| "devtoken".to_string());
 
-    let clip_dir = PathBuf::from(std::env::var("CLIP_DIR").unwrap_or_else(|_| "clips".to_string()));
-    let pre_secs: u64 = std::env::var("CLIP_PRE_SECS")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(3);
-    let post_secs: u64 = std::env::var("CLIP_POST_SECS")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(5);
-    let ring_secs: u64 = std::env::var("CLIP_RING_SECS")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(pre_secs);
-    let stale_part_secs: u64 = std::env::var("CLIP_STALE_PART_SECS")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(24 * 60 * 60);
-    let _write_batch_bytes: usize = std::env::var("CLIP_WRITE_BATCH_BYTES")
-        .ok()
+    let clip_dir = PathBuf::from(runtime_var("CLIP_DIR").unwrap_or_else(|| "clips".to_string()));
+    let pre_secs: u64 = runtime_u64("CLIP_PRE_SECS", 3);
+    let post_secs: u64 = runtime_u64("CLIP_POST_SECS", 5);
+    let ring_secs: u64 = runtime_u64("CLIP_RING_SECS", pre_secs);
+    let stale_part_secs: u64 = runtime_u64("CLIP_STALE_PART_SECS", 24 * 60 * 60);
+    let _write_batch_bytes: usize = runtime_var("CLIP_WRITE_BATCH_BYTES")
         .and_then(|v| v.parse().ok())
         .unwrap_or(256 * 1024);
-    let _max_clip_secs: Option<u64> = std::env::var("CLIP_MAX_SECS")
-        .ok()
-        .and_then(|v| v.parse().ok());
+    let max_clip_secs: Option<u64> = runtime_opt_u64("CLIP_MAX_SECS");
 
     let listener = TcpListener::bind(&bind).await?;
     info!(bind = %bind, "Server ingest listening");
@@ -114,6 +100,7 @@ async fn main() -> Result<()> {
                 pre_secs,
                 post_secs,
                 stale_part_secs,
+                max_clip_secs,
             )
             .await
             {
@@ -133,6 +120,7 @@ async fn handle_conn(
     pre_secs: u64,
     post_secs: u64,
     stale_part_secs: u64,
+    max_clip_secs: Option<u64>,
 ) -> Result<()> {
     let hello = read_msg(&mut sock).await?;
     if hello.msg_type != HELLO {
@@ -154,6 +142,7 @@ async fn handle_conn(
             pre_secs,
             post_secs,
             stale_part_secs,
+            max_clip_secs,
         );
     }
 
@@ -172,6 +161,7 @@ async fn handle_conn(
             pre_secs,
             post_secs,
             stale_part_secs,
+            max_clip_secs,
         );
 
         match msg_type {
@@ -212,6 +202,7 @@ fn ensure_stream(
     pre_secs: u64,
     post_secs: u64,
     stale_part_secs: u64,
+    max_clip_secs: Option<u64>,
 ) -> mpsc::Sender<StreamMsg> {
     let mut guard = streams.lock().unwrap();
     if let Some(tx) = guard.get(&stream_id) {
@@ -226,6 +217,7 @@ fn ensure_stream(
         pre_secs,
         post_secs,
         stale_part_secs,
+        max_clip_secs,
     };
 
     tokio::spawn(async move {

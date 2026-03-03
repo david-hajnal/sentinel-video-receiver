@@ -23,6 +23,17 @@ use sentinel_rtp_cam::rtsp::interleaved::{read_interleaved_frame, InterleavedFra
 use sentinel_rtp_cam::rtsp::rtsp::RtspClient;
 use sentinel_rtp_cam::{run_agent_heartbeat_poster, AgentConfig, CameraHeartbeatTarget};
 
+const DEFAULT_SERVER_CONFIG_PATH: &str = "/etc/sentinel_rtp_cam/server.json";
+const DEFAULT_CAMERA_CONFIG_PATH: &str = "/etc/sentinel_rtp_cam/camera.json";
+
+fn runtime_var(name: &str) -> Option<String> {
+    AgentConfig::runtime_var(name).filter(|v| !v.trim().is_empty())
+}
+
+fn runtime_i64(name: &str) -> Option<i64> {
+    runtime_var(name).and_then(|v| v.parse::<i64>().ok())
+}
+
 async fn try_pull_remote_config(
     client: &reqwest::Client,
     base_url: &str,
@@ -72,33 +83,11 @@ async fn try_pull_remote_config(
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    if dotenvy::dotenv().is_err() {
-        dotenvy::from_filename("../.env").ok();
-    }
-
-    let legacy_config_path = std::env::var("AGENT_CONFIG_JSON")
-        .or_else(|_| std::env::var("CONFIG_JSON_PATH"))
-        .ok();
-    let server_config_path = std::env::var("SERVER_CONFIG_JSON")
-        .unwrap_or_else(|_| "/etc/sentinel_rtp_cam/server.json".to_string());
-    let server_config_path = PathBuf::from(server_config_path);
-    let camera_config_path = std::env::var("CAMERA_CONFIG_JSON")
-        .ok()
-        .or_else(|| legacy_config_path.clone())
-        .unwrap_or_else(|| "/etc/sentinel_rtp_cam/camera.json".to_string());
-    let camera_config_path = PathBuf::from(camera_config_path);
+    let server_source_path = PathBuf::from(DEFAULT_SERVER_CONFIG_PATH);
+    let server_config_path = server_source_path.clone();
+    let camera_config_path = PathBuf::from(DEFAULT_CAMERA_CONFIG_PATH);
     let mut server_error: Option<String> = None;
     let mut camera_error: Option<String> = None;
-    let use_legacy_server = std::env::var("SERVER_CONFIG_JSON").is_err()
-        && !server_config_path.exists()
-        && legacy_config_path.is_some();
-    let use_legacy_camera =
-        std::env::var("CAMERA_CONFIG_JSON").is_err() && legacy_config_path.is_some();
-    let server_source_path = if use_legacy_server {
-        PathBuf::from(legacy_config_path.clone().unwrap())
-    } else {
-        server_config_path.clone()
-    };
 
     let server_value = match AgentConfig::load_server_json(&server_source_path) {
         Ok(value) => value,
@@ -117,11 +106,9 @@ async fn main() -> Result<()> {
     let config_value = AgentConfig::merge_server_camera_configs(&camera_value, &server_value);
     AgentConfig::apply_json_env_overrides(&config_value);
 
+    let log_filter = runtime_var("RUST_LOG").unwrap_or_else(|| "info".to_string());
     tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
-        )
+        .with_env_filter(tracing_subscriber::EnvFilter::new(log_filter))
         .init();
 
     if let Some(error) = server_error {
@@ -136,18 +123,6 @@ async fn main() -> Result<()> {
             error = %error,
             path = %camera_config_path.display(),
             "Failed to load camera config JSON, using defaults"
-        );
-    }
-    if use_legacy_server {
-        warn!(
-            path = %server_source_path.display(),
-            "SERVER_CONFIG_JSON unset; using legacy config for server settings"
-        );
-    }
-    if use_legacy_camera {
-        warn!(
-            path = %camera_config_path.display(),
-            "CAMERA_CONFIG_JSON unset; using legacy config path for camera settings"
         );
     }
 
@@ -188,10 +163,7 @@ async fn main() -> Result<()> {
         let config_value = AgentConfig::merge_server_camera_configs(&camera_value, &server_value);
         AgentConfig::apply_json_env_overrides(&config_value);
 
-        let server_addr = std::env::var("SERVER_ADDR")
-            .ok()
-            .map(|v| v.trim().to_string())
-            .filter(|v| !v.is_empty());
+        let server_addr = runtime_var("SERVER_ADDR");
         let cams = match load_cameras_from_env() {
             Ok(cams) => cams,
             Err(e) => {
@@ -202,21 +174,13 @@ async fn main() -> Result<()> {
             }
         };
 
-        let server_base_url = std::env::var("SERVER_BASE_URL")
-            .ok()
-            .map(|v| v.trim().to_string())
-            .filter(|v| !v.is_empty());
-        let server_bearer = std::env::var("SERVER_BEARER_TOKEN")
-            .ok()
-            .map(|v| v.trim().to_string())
-            .filter(|v| !v.is_empty());
+        let server_base_url = runtime_var("SERVER_BASE_URL");
+        let server_bearer = runtime_var("SERVER_BEARER_TOKEN");
 
         if !heartbeat_started {
             if server_base_url.is_some() && server_bearer.is_some() {
-                let agent_id = std::env::var("AGENT_ID")
-                    .ok()
-                    .filter(|v| !v.trim().is_empty())
-                    .or_else(|| std::env::var("HOSTNAME").ok())
+                let agent_id = runtime_var("AGENT_ID")
+                    .or_else(|| runtime_var("HOSTNAME"))
                     .unwrap_or_else(|| "agent".to_string());
                 let server_cfg = AgentConfig::from_env().server;
                 let camera_targets = camera_targets.clone();
@@ -233,10 +197,7 @@ async fn main() -> Result<()> {
 
         if last_pull.elapsed() > Duration::from_secs(30) {
             if let (Some(base_url), Some(token)) = (&server_base_url, &server_bearer) {
-                let camera_hint = std::env::var("CAMERA_ID")
-                    .ok()
-                    .filter(|v| !v.trim().is_empty())
-                    .or_else(|| std::env::var("CAM1_CAMERA_ID").ok());
+                let camera_hint = runtime_var("CAMERA_ID").or_else(|| runtime_var("CAM1_CAMERA_ID"));
                 match try_pull_remote_config(
                     &http_client,
                     base_url,
@@ -367,14 +328,8 @@ async fn main() -> Result<()> {
 
     let cam_map = camera_to_stream.clone();
     let uplink_motion = uplink.clone();
-    let motion_merge_secs = std::env::var("MOTION_MERGE_SECS")
-        .ok()
-        .and_then(|v| v.parse::<i64>().ok())
-        .or_else(|| {
-            std::env::var("CLIP_POST_SECS")
-                .ok()
-                .and_then(|v| v.parse::<i64>().ok())
-        })
+    let motion_merge_secs = runtime_i64("MOTION_MERGE_SECS")
+        .or_else(|| runtime_i64("CLIP_POST_SECS"))
         .unwrap_or(0)
         .max(0);
     let motion_merge_window = chrono::Duration::seconds(motion_merge_secs);

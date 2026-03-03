@@ -8,6 +8,8 @@ use reqwest::header::{HeaderMap, HeaderValue, CONTENT_TYPE};
 use std::time::Duration;
 use tokio::time::{interval, sleep};
 
+use sentinel_rtp_cam::AgentConfig;
+
 const TOPIC_DIALECT_CONCRETE_SET: &str =
     "http://www.onvif.org/ver10/tev/topicExpression/ConcreteSet";
 
@@ -25,6 +27,11 @@ const RENEW_EVERY_SECS: u64 = 300; // renew every 5 minutes
 const PULL_TIMEOUT: &str = "PT30S"; // long poll 30s
 const PULL_LIMIT: u32 = 10;
 const RESUBSCRIBE_AFTER_ERRORS: u32 = 3; // recreate after N consecutive errors
+const DEFAULT_CAMERA_CONFIG_PATH: &str = "/etc/sentinel_rtp_cam/camera.json";
+
+fn runtime_var(name: &str) -> Option<String> {
+    AgentConfig::runtime_var(name).filter(|v| !v.trim().is_empty())
+}
 
 fn wsse_password_digest(nonce_raw: &[u8], created: &str, password: &str) -> String {
     use sha1::{Digest, Sha1};
@@ -305,19 +312,18 @@ async fn renew_subscription(
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    // Load environment variables from .env file
-    if dotenvy::dotenv().is_err() {
-        dotenvy::from_filename("../.env").ok();
+    if let Ok(camera_value) =
+        AgentConfig::load_camera_json(std::path::Path::new(DEFAULT_CAMERA_CONFIG_PATH))
+    {
+        AgentConfig::apply_json_env_overrides(&camera_value);
     }
 
-    // Use env vars so special chars are safe.
-    let host = std::env::var("ONVIF_HOST").unwrap_or_else(|_| "192.168.1.187".to_string());
-    let port: u16 = std::env::var("ONVIF_PORT")
-        .ok()
+    let host = runtime_var("ONVIF_HOST").unwrap_or_else(|| "192.168.1.187".to_string());
+    let port: u16 = runtime_var("ONVIF_PORT")
         .and_then(|v| v.parse().ok())
         .unwrap_or(2020);
-    let user = std::env::var("ONVIF_USER").map_err(|_| anyhow!("Missing ONVIF_USER"))?;
-    let pass = std::env::var("ONVIF_PASS").map_err(|_| anyhow!("Missing ONVIF_PASS"))?;
+    let user = runtime_var("ONVIF_USER").ok_or_else(|| anyhow!("Missing ONVIF_USER"))?;
+    let pass = runtime_var("ONVIF_PASS").ok_or_else(|| anyhow!("Missing ONVIF_PASS"))?;
 
     // Your GetServices output shows XAddr = http://<ip>:<port>/onvif/service for events too.
     let onvif_service = format!("http://{}:{}/onvif/service", host, port);

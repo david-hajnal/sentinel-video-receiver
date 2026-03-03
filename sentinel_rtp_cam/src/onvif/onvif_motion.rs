@@ -10,6 +10,7 @@ use std::time::{Duration, Instant};
 use tokio::time::{interval, sleep};
 use tracing::{debug, info, warn};
 
+use crate::config::AgentConfig;
 use crate::event::{Event, EventBus, MotionEvent, MotionStateBus};
 
 // --- Dialect / Actions (match camera expectations) ---
@@ -33,25 +34,18 @@ const DEFAULT_MIN_POLL_GAP_MS: u64 = 800;
 
 // ---------- tiny env helpers ----------
 fn env_bool(key: &str) -> bool {
-    matches!(
-        std::env::var(key).ok().as_deref(),
-        Some("1") | Some("true") | Some("TRUE") | Some("yes") | Some("YES")
-    )
+    AgentConfig::runtime_bool(key, false)
 }
 fn env_u64(key: &str, default: u64) -> u64 {
-    std::env::var(key)
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(default)
+    AgentConfig::runtime_u64(key, default)
 }
 fn env_u32(key: &str, default: u32) -> u32 {
-    std::env::var(key)
-        .ok()
+    AgentConfig::runtime_var(key)
         .and_then(|v| v.parse().ok())
         .unwrap_or(default)
 }
 fn env_string(key: &str, default: &str) -> String {
-    std::env::var(key).unwrap_or_else(|_| default.to_string())
+    AgentConfig::runtime_var(key).unwrap_or_else(|| default.to_string())
 }
 
 #[derive(Clone)]
@@ -474,20 +468,21 @@ fn load_onvif_cameras_from_env() -> Result<Vec<OnvifCameraConfig>> {
     let mut cams = Vec::new();
     for i in 1..=4 {
         let prefix = format!("CAM{}_ONVIF_", i);
-        let host = match std::env::var(format!("{prefix}HOST")) {
-            Ok(v) => v,
-            Err(_) => continue,
+        let host = match AgentConfig::runtime_var(&format!("{prefix}HOST")) {
+            Some(v) if !v.trim().is_empty() => v,
+            _ => continue,
         };
-        let port: u16 = std::env::var(format!("{prefix}PORT"))
-            .ok()
+        let port: u16 = AgentConfig::runtime_var(&format!("{prefix}PORT"))
             .and_then(|v| v.parse().ok())
             .unwrap_or(2020);
-        let user = std::env::var(format!("{prefix}USER"))
-            .map_err(|_| anyhow!("Missing CAM{}_ONVIF_USER", i))?;
-        let pass = std::env::var(format!("{prefix}PASS"))
-            .map_err(|_| anyhow!("Missing CAM{}_ONVIF_PASS", i))?;
-        let camera_id = std::env::var(format!("CAM{}_CAMERA_ID", i))
-            .unwrap_or_else(|_| format!("cam-{}", i));
+        let user = AgentConfig::runtime_var(&format!("{prefix}USER"))
+            .ok_or_else(|| anyhow!("Missing CAM{}_ONVIF_USER", i))?;
+        let pass = AgentConfig::runtime_var(&format!("{prefix}PASS"))
+            .ok_or_else(|| anyhow!("Missing CAM{}_ONVIF_PASS", i))?;
+        let camera_id =
+            AgentConfig::runtime_var(&format!("CAM{}_CAMERA_ID", i)).unwrap_or_else(|| {
+                format!("cam-{}", i)
+            });
         cams.push(OnvifCameraConfig {
             camera_id,
             host,
@@ -502,16 +497,15 @@ fn load_onvif_cameras_from_env() -> Result<Vec<OnvifCameraConfig>> {
     }
 
     let host = env_string("ONVIF_HOST", "192.168.1.187");
-    let port: u16 = std::env::var("ONVIF_PORT")
-        .ok()
+    let port: u16 = AgentConfig::runtime_var("ONVIF_PORT")
         .and_then(|v| v.parse().ok())
         .unwrap_or(2020);
-    let user = std::env::var("ONVIF_USER").map_err(|_| anyhow!("Missing ONVIF_USER"))?;
-    let pass = std::env::var("ONVIF_PASS").map_err(|_| anyhow!("Missing ONVIF_PASS"))?;
-    let camera_id = std::env::var("CAMERA_ID")
-        .or_else(|_| std::env::var("CAM1_CAMERA_ID"))
-        .or_else(|_| std::env::var("ONVIF_HOST"))
-        .unwrap_or_else(|_| "unknown-camera".to_string());
+    let user = AgentConfig::runtime_var("ONVIF_USER").ok_or_else(|| anyhow!("Missing ONVIF_USER"))?;
+    let pass = AgentConfig::runtime_var("ONVIF_PASS").ok_or_else(|| anyhow!("Missing ONVIF_PASS"))?;
+    let camera_id = AgentConfig::runtime_var("CAMERA_ID")
+        .or_else(|| AgentConfig::runtime_var("CAM1_CAMERA_ID"))
+        .or_else(|| AgentConfig::runtime_var("ONVIF_HOST"))
+        .unwrap_or_else(|| "unknown-camera".to_string());
     Ok(vec![OnvifCameraConfig {
         camera_id,
         host,
@@ -714,5 +708,179 @@ async fn run_onvif_motion_poller_for_camera(
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        debug_enabled, dump_enabled, env_string, env_u32, env_u64, load_onvif_cameras_from_env,
+        DEFAULT_MIN_POLL_GAP_MS, DEFAULT_PULL_LIMIT, DEFAULT_PULL_TIMEOUT,
+        DEFAULT_RENEW_EVERY_SECS, DEFAULT_RESUBSCRIBE_AFTER_ERRORS, DEFAULT_SUB_TERMINATION,
+    };
+    use crate::config::AgentConfig;
+    use serde_json::json;
+    use std::collections::HashMap;
+    use std::sync::MutexGuard;
+
+    struct EnvGuard {
+        _lock: MutexGuard<'static, ()>,
+        saved: HashMap<String, String>,
+    }
+
+    impl EnvGuard {
+        fn new() -> Self {
+            let lock = AgentConfig::runtime_test_lock()
+                .lock()
+                .expect("lock runtime mutex");
+            let saved = AgentConfig::runtime_snapshot();
+            AgentConfig::clear_runtime_overrides();
+            Self { _lock: lock, saved }
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            AgentConfig::runtime_restore(std::mem::take(&mut self.saved));
+        }
+    }
+
+    #[test]
+    fn onvif_json_config_drives_motion_camera_used_by_clip_recorder() {
+        let _guard = EnvGuard::new();
+
+        let cfg = json!({
+            "cameras": [
+                {
+                    "id": "cam-from-json",
+                    "user": "alice",
+                    "pass": "secret",
+                    "onvif": {
+                        "url": "http://10.20.30.40:3030/onvif/service"
+                    }
+                }
+            ]
+        });
+        AgentConfig::apply_json_env_overrides(&cfg);
+
+        // The resolved camera config feeds motion metadata consumed by ClipRecorder.
+        let cameras = load_onvif_cameras_from_env().expect("load onvif cameras from env");
+        assert_eq!(cameras.len(), 1);
+        let cam = &cameras[0];
+        assert_eq!(cam.camera_id, "cam-from-json");
+        assert_eq!(cam.host, "10.20.30.40");
+        assert_eq!(cam.port, 3030);
+        assert_eq!(cam.user, "alice");
+        assert_eq!(cam.pass, "secret");
+    }
+
+    #[test]
+    fn onvif_json_config_applies_extended_fields_and_keeps_nulls_unset() {
+        let _guard = EnvGuard::new();
+
+        let cfg = json!({
+            "cameras": [
+                {
+                    "id": "cam-001",
+                    "user": "alice",
+                    "pass": "secret",
+                    "onvif": {
+                        "after_sub_delay_ms": 4000,
+                        "connrefused_backoff_ms": 250,
+                        "connrefused_retries": 20,
+                        "debug": null,
+                        "dump_xml": null,
+                        "min_poll_gap_ms": null,
+                        "pull_limit": null,
+                        "pull_timeout": null,
+                        "renew_every_secs": null,
+                        "resubscribe_after_errors": null,
+                        "sub_termination": null,
+                        "url": "http://192.168.1.187:2020/onvif/service"
+                    }
+                }
+            ]
+        });
+        AgentConfig::apply_json_env_overrides(&cfg);
+
+        assert_eq!(
+            AgentConfig::runtime_var("CAM1_ONVIF_AFTER_SUB_DELAY_MS").as_deref(),
+            Some("4000")
+        );
+        assert_eq!(
+            AgentConfig::runtime_var("CAM1_ONVIF_CONNREFUSED_BACKOFF_MS").as_deref(),
+            Some("250")
+        );
+        assert_eq!(
+            AgentConfig::runtime_var("CAM1_ONVIF_CONNREFUSED_RETRIES").as_deref(),
+            Some("20")
+        );
+
+        assert_eq!(
+            AgentConfig::runtime_var("ONVIF_AFTER_SUB_DELAY_MS").as_deref(),
+            Some("4000")
+        );
+        assert_eq!(
+            AgentConfig::runtime_var("ONVIF_CONNREFUSED_BACKOFF_MS").as_deref(),
+            Some("250")
+        );
+        assert_eq!(
+            AgentConfig::runtime_var("ONVIF_CONNREFUSED_RETRIES").as_deref(),
+            Some("20")
+        );
+
+        assert!(AgentConfig::runtime_var("CAM1_ONVIF_DEBUG").is_none());
+        assert!(AgentConfig::runtime_var("CAM1_ONVIF_DUMP_XML").is_none());
+        assert!(AgentConfig::runtime_var("CAM1_ONVIF_MIN_POLL_GAP_MS").is_none());
+        assert!(AgentConfig::runtime_var("CAM1_ONVIF_PULL_LIMIT").is_none());
+        assert!(AgentConfig::runtime_var("CAM1_ONVIF_PULL_TIMEOUT").is_none());
+        assert!(AgentConfig::runtime_var("CAM1_ONVIF_RENEW_EVERY_SECS").is_none());
+        assert!(AgentConfig::runtime_var("CAM1_ONVIF_RESUBSCRIBE_AFTER_ERRORS").is_none());
+        assert!(AgentConfig::runtime_var("CAM1_ONVIF_SUB_TERMINATION").is_none());
+
+        assert!(AgentConfig::runtime_var("ONVIF_DEBUG").is_none());
+        assert!(AgentConfig::runtime_var("ONVIF_DUMP_XML").is_none());
+        assert!(AgentConfig::runtime_var("ONVIF_MIN_POLL_GAP_MS").is_none());
+        assert!(AgentConfig::runtime_var("ONVIF_PULL_LIMIT").is_none());
+        assert!(AgentConfig::runtime_var("ONVIF_PULL_TIMEOUT").is_none());
+        assert!(AgentConfig::runtime_var("ONVIF_RENEW_EVERY_SECS").is_none());
+        assert!(AgentConfig::runtime_var("ONVIF_RESUBSCRIBE_AFTER_ERRORS").is_none());
+        assert!(AgentConfig::runtime_var("ONVIF_SUB_TERMINATION").is_none());
+
+        assert!(!debug_enabled());
+        assert!(!dump_enabled());
+        assert_eq!(
+            env_u64("ONVIF_MIN_POLL_GAP_MS", DEFAULT_MIN_POLL_GAP_MS),
+            DEFAULT_MIN_POLL_GAP_MS
+        );
+        assert_eq!(
+            env_u32("ONVIF_PULL_LIMIT", DEFAULT_PULL_LIMIT),
+            DEFAULT_PULL_LIMIT
+        );
+        assert_eq!(
+            env_string("ONVIF_PULL_TIMEOUT", DEFAULT_PULL_TIMEOUT),
+            DEFAULT_PULL_TIMEOUT
+        );
+        assert_eq!(
+            env_u64("ONVIF_RENEW_EVERY_SECS", DEFAULT_RENEW_EVERY_SECS),
+            DEFAULT_RENEW_EVERY_SECS
+        );
+        assert_eq!(
+            env_u32("ONVIF_RESUBSCRIBE_AFTER_ERRORS", DEFAULT_RESUBSCRIBE_AFTER_ERRORS),
+            DEFAULT_RESUBSCRIBE_AFTER_ERRORS
+        );
+        assert_eq!(
+            env_string("ONVIF_SUB_TERMINATION", DEFAULT_SUB_TERMINATION),
+            DEFAULT_SUB_TERMINATION
+        );
+
+        let cameras = load_onvif_cameras_from_env().expect("load onvif cameras from env");
+        assert_eq!(cameras.len(), 1);
+        let cam = &cameras[0];
+        assert_eq!(cam.host, "192.168.1.187");
+        assert_eq!(cam.port, 2020);
+        assert_eq!(cam.user, "alice");
+        assert_eq!(cam.pass, "secret");
+        assert_eq!(cam.camera_id, "cam-001");
     }
 }

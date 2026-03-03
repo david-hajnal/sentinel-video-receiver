@@ -1,9 +1,7 @@
 use rand::RngCore;
 use tokio::io::{duplex, AsyncWriteExt};
 
-use sentinel_rtp_cam::proto::{
-    read_msg, write_msg, Msg, MAX_LEN, MAGIC, VERSION, HELLO, RTP,
-};
+use sentinel_rtp_cam::proto::{read_msg, write_msg, Msg, HELLO, MAGIC, MAX_LEN, RTP, VERSION};
 
 #[tokio::test]
 async fn roundtrip_hello() {

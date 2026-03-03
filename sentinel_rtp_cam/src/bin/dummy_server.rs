@@ -13,6 +13,15 @@ use tokio_stream::{wrappers::BroadcastStream, StreamExt};
 use tower_http::{cors::CorsLayer, trace::TraceLayer};
 use tracing::{info, warn};
 
+use sentinel_rtp_cam::AgentConfig;
+
+const DEFAULT_SERVER_CONFIG_PATH: &str = "/etc/sentinel_rtp_cam/server.json";
+const DEFAULT_CAMERA_CONFIG_PATH: &str = "/etc/sentinel_rtp_cam/camera.json";
+
+fn runtime_var(name: &str) -> Option<String> {
+    AgentConfig::runtime_var(name).filter(|v| !v.trim().is_empty())
+}
+
 #[derive(Clone)]
 struct AppState {
     config_json_pretty: Arc<RwLock<String>>,
@@ -284,25 +293,23 @@ async fn handle_clip_meta(
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    let server_value = AgentConfig::load_server_json(std::path::Path::new(DEFAULT_SERVER_CONFIG_PATH))
+        .unwrap_or_else(|_| serde_json::Value::Object(Default::default()));
+    let camera_value = AgentConfig::load_camera_json(std::path::Path::new(DEFAULT_CAMERA_CONFIG_PATH))
+        .unwrap_or_else(|_| serde_json::Value::Object(Default::default()));
+    let config_value = AgentConfig::merge_server_camera_configs(&camera_value, &server_value);
+    AgentConfig::apply_json_env_overrides(&config_value);
+
     // Initialize tracing
+    let log_filter = runtime_var("RUST_LOG").unwrap_or_else(|| "info".to_string());
     tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
-        )
+        .with_env_filter(tracing_subscriber::EnvFilter::new(log_filter))
         .with_target(false)
         .init();
 
-    // Load .env
-    if dotenvy::dotenv().is_err() {
-        dotenvy::from_filename("../.env").ok();
-    }
-
-    let bind_addr =
-        std::env::var("DUMMY_SERVER_BIND").unwrap_or_else(|_| "127.0.0.1:8080".to_string());
-
+    let bind_addr = runtime_var("DUMMY_SERVER_BIND").unwrap_or_else(|| "127.0.0.1:8080".to_string());
     let bearer_token =
-        std::env::var("DUMMY_SERVER_TOKEN").unwrap_or_else(|_| "test-token-12345".to_string());
+        runtime_var("DUMMY_SERVER_TOKEN").unwrap_or_else(|| "test-token-12345".to_string());
 
     // Default config
     let default_config = serde_json::json!({
