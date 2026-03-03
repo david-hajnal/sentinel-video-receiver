@@ -1,15 +1,213 @@
 use anyhow::Result;
+use chrono::Utc;
+use serde::Deserialize;
 use serde_json::{json, Value};
 use std::sync::Arc;
 use tokio::net::TcpStream;
+use tokio::process::Command;
 use tokio::sync::{mpsc, RwLock};
 use tokio::time::{sleep, timeout, Duration};
 use tracing::{debug, error, info, warn};
 use url::Url;
 
-use crate::config::agent_config::ServerConfig;
+use crate::config::{agent_config::ServerConfig, AgentConfig};
 use crate::core::clip_recorder::ClipMeta;
 use crate::event::MotionEvent;
+
+#[derive(Debug, Deserialize, Clone)]
+struct FirmwareJobCommand {
+    job_id: i64,
+    action: String,
+    target_version: Option<String>,
+    #[allow(dead_code)]
+    status: String,
+    start_after_update: bool,
+}
+
+#[derive(Debug, Deserialize)]
+struct FirmwareJobResponse {
+    job: Option<FirmwareJobCommand>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct FirmwareHeartbeatState {
+    job_id: Option<i64>,
+    current_version: Option<String>,
+    target_version: Option<String>,
+    status: Option<String>,
+    error: Option<String>,
+    can_rollback: Option<bool>,
+    started_at: Option<String>,
+    finished_at: Option<String>,
+}
+
+impl FirmwareHeartbeatState {
+    fn as_json(&self) -> Option<Value> {
+        if self.job_id.is_none()
+            && self.current_version.is_none()
+            && self.target_version.is_none()
+            && self.status.is_none()
+            && self.error.is_none()
+            && self.can_rollback.is_none()
+            && self.started_at.is_none()
+            && self.finished_at.is_none()
+        {
+            return None;
+        }
+
+        Some(json!({
+            "job_id": self.job_id,
+            "current_version": self.current_version,
+            "target_version": self.target_version,
+            "status": self.status,
+            "error": self.error,
+            "can_rollback": self.can_rollback,
+            "started_at": self.started_at,
+            "finished_at": self.finished_at,
+        }))
+    }
+}
+
+async fn fetch_firmware_job_command(
+    client: &reqwest::Client,
+    config: &ServerConfig,
+) -> Result<Option<FirmwareJobCommand>> {
+    let base = config.base_url.trim_end_matches('/');
+    for path in ["/api/agent/firmware/job", "/api/v1/agent/firmware/job"] {
+        let url = format!("{base}{path}");
+        let response = client
+            .get(&url)
+            .bearer_auth(&config.bearer_token)
+            .send()
+            .await?;
+        if response.status() == reqwest::StatusCode::NOT_FOUND {
+            continue;
+        }
+        let response = response.error_for_status()?;
+        let payload: FirmwareJobResponse = response.json().await?;
+        return Ok(payload.job);
+    }
+    Ok(None)
+}
+
+async fn execute_firmware_job(job: &FirmwareJobCommand) -> Result<()> {
+    let updater_cmd = AgentConfig::runtime_var("FIRMWARE_UPDATER_CMD")
+        .unwrap_or_else(|| "/usr/local/bin/sentinel-firmware-update".to_string());
+    let mut cmd = Command::new(&updater_cmd);
+
+    match job.action.as_str() {
+        "update" => {
+            let target = job
+                .target_version
+                .as_deref()
+                .ok_or_else(|| anyhow::anyhow!("Missing target version for update job"))?;
+            cmd.arg(target);
+            if job.start_after_update {
+                cmd.arg("--start");
+            }
+        }
+        "rollback" => {
+            cmd.arg("--rollback");
+            if job.start_after_update {
+                cmd.arg("--start");
+            }
+        }
+        other => {
+            return Err(anyhow::anyhow!("Unsupported firmware job action: {other}"));
+        }
+    }
+
+    let output = timeout(Duration::from_secs(120), cmd.output())
+        .await
+        .map_err(|_| anyhow::anyhow!("Firmware updater timed out after 120 seconds"))??;
+
+    if output.status.success() {
+        return Ok(());
+    }
+
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let detail = if !stderr.is_empty() {
+        stderr
+    } else if !stdout.is_empty() {
+        stdout
+    } else {
+        "no output".to_string()
+    };
+    Err(anyhow::anyhow!(
+        "Firmware updater failed ({:?}): {}",
+        output.status,
+        detail
+    ))
+}
+
+async fn maybe_process_firmware_job(
+    client: &reqwest::Client,
+    config: &ServerConfig,
+    state: &mut FirmwareHeartbeatState,
+) {
+    let job = match fetch_firmware_job_command(client, config).await {
+        Ok(job) => job,
+        Err(e) => {
+            warn!(error = %e, "Failed to poll firmware job command");
+            return;
+        }
+    };
+
+    let Some(job) = job else {
+        return;
+    };
+
+    let running_status = if job.action == "rollback" {
+        "rollback_running"
+    } else {
+        "installing"
+    };
+    state.job_id = Some(job.job_id);
+    state.target_version = job.target_version.clone();
+    state.status = Some(running_status.to_string());
+    state.error = None;
+    state.started_at = Some(Utc::now().to_rfc3339());
+    state.finished_at = None;
+
+    info!(
+        job_id = job.job_id,
+        action = %job.action,
+        target_version = ?job.target_version,
+        "Executing firmware job"
+    );
+
+    match execute_firmware_job(&job).await {
+        Ok(_) => {
+            let status = if job.action == "rollback" {
+                "rollback_succeeded"
+            } else {
+                "succeeded"
+            };
+            state.status = Some(status.to_string());
+            state.error = None;
+            state.finished_at = Some(Utc::now().to_rfc3339());
+            if job.action == "update" {
+                state.current_version = job.target_version.clone();
+                state.can_rollback = Some(true);
+            } else {
+                state.can_rollback = Some(false);
+            }
+            info!(job_id = job.job_id, status, "Firmware job completed");
+        }
+        Err(e) => {
+            let status = if job.action == "rollback" {
+                "rollback_failed"
+            } else {
+                "failed"
+            };
+            state.status = Some(status.to_string());
+            state.error = Some(e.to_string());
+            state.finished_at = Some(Utc::now().to_rfc3339());
+            warn!(job_id = job.job_id, status, error = %e, "Firmware job failed");
+        }
+    }
+}
 
 /// Helper function that retries an async operation forever with exponential backoff
 /// Useful for network operations that should never permanently fail
@@ -368,14 +566,19 @@ pub async fn run_heartbeat_poster(config: ServerConfig, camera_id: String) -> Re
 
     let url = format!("{}/api/heartbeat", config.base_url);
     let heartbeat_interval = Duration::from_secs(30);
+    let mut firmware = FirmwareHeartbeatState::default();
 
     loop {
         sleep(heartbeat_interval).await;
+        maybe_process_firmware_job(&client, &config, &mut firmware).await;
 
-        let payload = json!({
+        let mut payload = json!({
             "camera_id": camera_id,
-            "timestamp": chrono::Utc::now().to_rfc3339(),
+            "timestamp": Utc::now().to_rfc3339(),
         });
+        if let Some(firmware_payload) = firmware.as_json() {
+            payload["firmware"] = firmware_payload;
+        }
 
         let config_clone = config.clone();
         let client_clone = client.clone();
@@ -450,9 +653,11 @@ pub async fn run_agent_heartbeat_poster(
 
     let url = format!("{}/api/heartbeat", config.base_url);
     let heartbeat_interval = Duration::from_secs(30);
+    let mut firmware = FirmwareHeartbeatState::default();
 
     loop {
         sleep(heartbeat_interval).await;
+        maybe_process_firmware_job(&client, &config, &mut firmware).await;
 
         let camera_snapshot = cameras.read().await.clone();
         let mut camera_status = Vec::new();
@@ -466,11 +671,14 @@ pub async fn run_agent_heartbeat_poster(
             }));
         }
 
-        let payload = json!({
+        let mut payload = json!({
             "agent_id": agent_id,
-            "timestamp": chrono::Utc::now().to_rfc3339(),
+            "timestamp": Utc::now().to_rfc3339(),
             "cameras": camera_status,
         });
+        if let Some(firmware_payload) = firmware.as_json() {
+            payload["firmware"] = firmware_payload;
+        }
 
         let config_clone = config.clone();
         let client_clone = client.clone();
