@@ -10,7 +10,7 @@ For device install/manage, use the tooling repo: `david-hajnal/sentinel-tooling`
 - `agent_forward` — forward agent used in production (talks to server ingest).
 - `app` — local receiver/recorder (developer use).
 - `server_ingest` — server-side ingest for forward mode.
-- `onvif_motion_pull`, `rtsp_pull_*` — diagnostics/dev helpers.
+- `onvif_motion_pull` — diagnostics/dev helper.
 
 ## Configuration
 
