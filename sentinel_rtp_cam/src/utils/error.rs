@@ -231,3 +231,35 @@ impl From<anyhow::Error> for Error {
         Error::Internal(e.to_string())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn from_str_maps_to_internal_error() {
+        let err = Error::from("plain message");
+        match err {
+            Error::Internal(msg) => assert_eq!(msg, "plain message"),
+            _ => panic!("expected Error::Internal"),
+        }
+    }
+
+    #[test]
+    fn from_string_maps_to_internal_error() {
+        let err = Error::from("owned message".to_string());
+        match err {
+            Error::Internal(msg) => assert_eq!(msg, "owned message"),
+            _ => panic!("expected Error::Internal"),
+        }
+    }
+
+    #[test]
+    fn from_anyhow_maps_to_internal_error_with_message() {
+        let err = Error::from(anyhow::anyhow!("anyhow message"));
+        match err {
+            Error::Internal(msg) => assert!(msg.contains("anyhow message")),
+            _ => panic!("expected Error::Internal"),
+        }
+    }
+}

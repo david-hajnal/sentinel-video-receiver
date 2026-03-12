@@ -223,3 +223,38 @@ pub async fn run_tcp_interleaved_receiver(
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_interleaved_channels_extracts_rtp_and_rtcp_channels() {
+        let transport = "RTP/AVP/TCP;unicast;interleaved=2-3;mode=play";
+        assert_eq!(parse_interleaved_channels(transport), Some((2, 3)));
+    }
+
+    #[test]
+    fn parse_interleaved_channels_returns_none_for_invalid_values() {
+        assert_eq!(
+            parse_interleaved_channels("RTP/AVP/TCP;unicast;interleaved=abc-def"),
+            None
+        );
+        assert_eq!(
+            parse_interleaved_channels("RTP/AVP/TCP;unicast;mode=play"),
+            None
+        );
+    }
+
+    #[test]
+    fn header_value_matches_keys_case_insensitively() {
+        let headers = vec![("TrAnSpOrT".to_string(), "value".to_string())];
+        assert_eq!(header_value(&headers, "transport"), Some("value"));
+        assert_eq!(header_value(&headers, "TRANSPORT"), Some("value"));
+    }
+
+    #[test]
+    fn basic_auth_value_builds_expected_header() {
+        assert_eq!(basic_auth_value("user", "pass"), "Basic dXNlcjpwYXNz");
+    }
+}

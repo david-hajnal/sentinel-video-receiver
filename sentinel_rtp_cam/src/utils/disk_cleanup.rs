@@ -172,3 +172,61 @@ pub async fn run_disk_cleanup(cfg: DiskCleanupConfig) -> Result<()> {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn make_temp_dir(label: &str) -> std::path::PathBuf {
+        let suffix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "sentinel-rtp-cam-{}-{}-{}",
+            label,
+            std::process::id(),
+            suffix
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn get_available_space_returns_positive_value_for_existing_path() {
+        let dir = make_temp_dir("disk-space");
+        let available = get_available_space(&dir).unwrap();
+        assert!(available > 0);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cleanup_until_space_available_deletes_h264_files_and_sidecars() {
+        let dir = make_temp_dir("cleanup");
+        let old_h264 = dir.join("old.h264");
+        let new_h264 = dir.join("new.h264");
+        let old_json = dir.join("old.json");
+        let new_json = dir.join("new.json");
+        let keep_txt = dir.join("keep.txt");
+
+        tokio::fs::write(&old_h264, b"old").await.unwrap();
+        tokio::fs::write(&old_json, b"{}").await.unwrap();
+        tokio::fs::write(&new_h264, b"new").await.unwrap();
+        tokio::fs::write(&new_json, b"{}").await.unwrap();
+        tokio::fs::write(&keep_txt, b"keep").await.unwrap();
+
+        let deleted = cleanup_until_space_available(&dir, u64::MAX).await.unwrap();
+
+        assert_eq!(deleted, 2);
+        assert!(!old_h264.exists());
+        assert!(!new_h264.exists());
+        assert!(!old_json.exists());
+        assert!(!new_json.exists());
+        assert!(keep_txt.exists());
+
+        tokio::fs::remove_dir_all(&dir).await.unwrap();
+    }
+}

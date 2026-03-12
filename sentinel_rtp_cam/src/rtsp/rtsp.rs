@@ -151,3 +151,67 @@ impl RtspClient {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::io::AsyncWriteExt;
+    use tokio::net::TcpListener;
+
+    async fn connected_streams() -> (TcpStream, TcpStream) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let client_task = tokio::spawn(async move { TcpStream::connect(addr).await.unwrap() });
+        let (server_stream, _) = listener.accept().await.unwrap();
+        let client_stream = client_task.await.unwrap();
+
+        (client_stream, server_stream)
+    }
+
+    #[test]
+    fn header_get_is_case_insensitive() {
+        let headers = vec![("Content-Length".to_string(), "12".to_string())];
+        assert_eq!(header_get(&headers, "content-length"), Some("12".to_string()));
+        assert_eq!(header_get(&headers, "CONTENT-LENGTH"), Some("12".to_string()));
+    }
+
+    #[tokio::test]
+    async fn read_exact_bytes_consumes_leftover_then_stream() {
+        let (client_stream, mut server_stream) = connected_streams().await;
+        let writer = tokio::spawn(async move {
+            server_stream.write_all(&[3u8, 4u8]).await.unwrap();
+        });
+
+        let mut client = RtspClient {
+            stream: client_stream,
+            cseq: 1,
+            session: None,
+            leftover: vec![1u8, 2u8],
+        };
+
+        let got = client.read_exact_bytes(4).await.unwrap();
+        assert_eq!(got, vec![1u8, 2u8, 3u8, 4u8]);
+        assert!(client.leftover.is_empty());
+        writer.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn set_session_from_strips_session_parameters() {
+        let (client_stream, _server_stream) = connected_streams().await;
+        let mut client = RtspClient {
+            stream: client_stream,
+            cseq: 1,
+            session: None,
+            leftover: Vec::new(),
+        };
+
+        client.set_session_from(&RtspResponse {
+            status: 200,
+            headers: vec![("Session".to_string(), "abc123;timeout=60".to_string())],
+            body: Vec::new(),
+        });
+
+        assert_eq!(client.session.as_deref(), Some("abc123"));
+    }
+}

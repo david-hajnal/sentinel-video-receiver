@@ -269,3 +269,52 @@ pub async fn run_udp_receiver(
 
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn unquote_strips_single_and_double_quotes() {
+        assert_eq!(unquote("\"value\"".to_string()), "value");
+        assert_eq!(unquote("'value'".to_string()), "value");
+        assert_eq!(unquote("value".to_string()), "value");
+    }
+
+    #[test]
+    fn rtsp_url_normalizes_path_prefix() {
+        let cfg_no_slash = UdpReceiverConfig {
+            host: "cam.local".to_string(),
+            port: 8554,
+            path: "stream2".to_string(),
+            rtp_port: 5004,
+            rtcp_port: 5005,
+            user: "".to_string(),
+            pass: "".to_string(),
+        };
+        assert_eq!(cfg_no_slash.rtsp_url(), "rtsp://cam.local:8554/stream2");
+
+        let cfg_with_slash = UdpReceiverConfig {
+            path: "/stream2".to_string(),
+            ..cfg_no_slash
+        };
+        assert_eq!(cfg_with_slash.rtsp_url(), "rtsp://cam.local:8554/stream2");
+    }
+
+    #[test]
+    fn has_auth_depends_on_username_presence() {
+        let mut cfg = UdpReceiverConfig {
+            host: "cam.local".to_string(),
+            port: 554,
+            path: "/stream2".to_string(),
+            rtp_port: 5004,
+            rtcp_port: 5005,
+            user: "".to_string(),
+            pass: "pass".to_string(),
+        };
+        assert!(!cfg.has_auth());
+
+        cfg.user = "user".to_string();
+        assert!(cfg.has_auth());
+    }
+}

@@ -84,3 +84,28 @@ where
 
     Err(last_err.unwrap_or_else(|| anyhow!("request failed after retries")))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn is_retryable_status_accepts_429_and_5xx_only() {
+        assert!(is_retryable_status(StatusCode::TOO_MANY_REQUESTS));
+        assert!(is_retryable_status(StatusCode::INTERNAL_SERVER_ERROR));
+        assert!(!is_retryable_status(StatusCode::BAD_REQUEST));
+        assert!(!is_retryable_status(StatusCode::OK));
+    }
+
+    #[test]
+    fn exp_backoff_doubles_and_caps_at_max() {
+        let base = Duration::from_millis(100);
+        let max = Duration::from_millis(500);
+
+        assert_eq!(exp_backoff(0, base, max), Duration::from_millis(100));
+        assert_eq!(exp_backoff(1, base, max), Duration::from_millis(200));
+        assert_eq!(exp_backoff(2, base, max), Duration::from_millis(400));
+        assert_eq!(exp_backoff(3, base, max), Duration::from_millis(500));
+        assert_eq!(exp_backoff(20, base, max), Duration::from_millis(500));
+    }
+}
