@@ -2,6 +2,8 @@ use anyhow::Result;
 use chrono::Utc;
 use serde::Deserialize;
 use serde_json::{json, Value};
+use std::fs;
+use std::path::Path;
 use std::sync::Arc;
 use tokio::net::TcpStream;
 use tokio::process::Command;
@@ -13,6 +15,9 @@ use url::Url;
 use crate::config::{agent_config::ServerConfig, AgentConfig};
 use crate::core::clip_recorder::ClipMeta;
 use crate::event::MotionEvent;
+
+const FIRMWARE_VERSION_PATH: &str = "/etc/sentinel_rtp_cam/firmware-version";
+const FIRMWARE_BACKUP_BINARY_PATH: &str = "/usr/local/bin/sentinel_rtp_cam.prev";
 
 #[derive(Debug, Deserialize, Clone)]
 struct FirmwareJobCommand {
@@ -66,6 +71,53 @@ impl FirmwareHeartbeatState {
             "finished_at": self.finished_at,
         }))
     }
+}
+
+fn read_installed_firmware_version_from_path(path: &Path) -> Option<String> {
+    fs::read_to_string(path)
+        .ok()
+        .map(|raw| raw.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+fn read_installed_firmware_version() -> Option<String> {
+    read_installed_firmware_version_from_path(Path::new(FIRMWARE_VERSION_PATH)).or_else(|| {
+        AgentConfig::runtime_var("SENTINEL_VERSION").filter(|value| !value.trim().is_empty())
+    })
+}
+
+fn build_idle_firmware_state(
+    current_version: Option<String>,
+    can_rollback: bool,
+) -> FirmwareHeartbeatState {
+    if current_version.is_none() && !can_rollback {
+        return FirmwareHeartbeatState::default();
+    }
+
+    FirmwareHeartbeatState {
+        current_version: current_version.clone(),
+        target_version: current_version,
+        status: Some("idle".to_string()),
+        can_rollback: Some(can_rollback),
+        ..Default::default()
+    }
+}
+
+fn baseline_firmware_state_from_paths(
+    version_path: &Path,
+    backup_path: &Path,
+) -> FirmwareHeartbeatState {
+    build_idle_firmware_state(
+        read_installed_firmware_version_from_path(version_path),
+        backup_path.exists(),
+    )
+}
+
+fn baseline_firmware_state() -> FirmwareHeartbeatState {
+    build_idle_firmware_state(
+        read_installed_firmware_version(),
+        Path::new(FIRMWARE_BACKUP_BINARY_PATH).exists(),
+    )
 }
 
 async fn fetch_firmware_job_command(
@@ -566,10 +618,9 @@ pub async fn run_heartbeat_poster(config: ServerConfig, camera_id: String) -> Re
 
     let url = format!("{}/api/heartbeat", config.base_url);
     let heartbeat_interval = Duration::from_secs(30);
-    let mut firmware = FirmwareHeartbeatState::default();
-
     loop {
         sleep(heartbeat_interval).await;
+        let mut firmware = baseline_firmware_state();
         maybe_process_firmware_job(&client, &config, &mut firmware).await;
 
         let mut payload = json!({
@@ -653,10 +704,9 @@ pub async fn run_agent_heartbeat_poster(
 
     let url = format!("{}/api/heartbeat", config.base_url);
     let heartbeat_interval = Duration::from_secs(30);
-    let mut firmware = FirmwareHeartbeatState::default();
-
     loop {
         sleep(heartbeat_interval).await;
+        let mut firmware = baseline_firmware_state();
         maybe_process_firmware_job(&client, &config, &mut firmware).await;
 
         let camera_snapshot = cameras.read().await.clone();
@@ -1054,8 +1104,21 @@ fn first_bool(value: &Value, keys: &[&str]) -> Option<bool> {
 
 #[cfg(test)]
 mod tests {
-    use super::normalize_config_update;
+    use super::{baseline_firmware_state_from_paths, normalize_config_update};
     use serde_json::json;
+    use std::fs;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn unique_test_dir(name: &str) -> std::path::PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("time")
+            .as_nanos();
+        std::env::temp_dir().join(format!(
+            "sentinel-server-client-{name}-{}-{nanos}",
+            std::process::id()
+        ))
+    }
 
     #[test]
     fn normalize_config_selects_camera_from_list() {
@@ -1134,5 +1197,38 @@ mod tests {
         assert_eq!(camera["rtsp"]["stream_id"], 7);
         assert_eq!(camera["onvif"]["url"], "http://10.0.0.2:2020/onvif/service");
         assert_eq!(camera["motion"]["enabled"], true);
+    }
+
+    #[test]
+    fn baseline_firmware_state_reports_idle_version_and_rollback_capability() {
+        let dir = unique_test_dir("firmware-state");
+        fs::create_dir_all(&dir).expect("temp dir");
+        let version_path = dir.join("firmware-version");
+        let backup_path = dir.join("sentinel_rtp_cam.prev");
+        fs::write(&version_path, "0.6.4\n").expect("version file");
+        fs::write(&backup_path, "").expect("backup file");
+
+        let state = baseline_firmware_state_from_paths(&version_path, &backup_path);
+
+        assert_eq!(state.current_version.as_deref(), Some("0.6.4"));
+        assert_eq!(state.target_version.as_deref(), Some("0.6.4"));
+        assert_eq!(state.status.as_deref(), Some("idle"));
+        assert_eq!(state.can_rollback, Some(true));
+
+        fs::remove_dir_all(&dir).expect("cleanup");
+    }
+
+    #[test]
+    fn baseline_firmware_state_is_empty_without_local_firmware_metadata() {
+        let dir = unique_test_dir("firmware-empty");
+        fs::create_dir_all(&dir).expect("temp dir");
+        let version_path = dir.join("firmware-version");
+        let backup_path = dir.join("sentinel_rtp_cam.prev");
+
+        let state = baseline_firmware_state_from_paths(&version_path, &backup_path);
+
+        assert!(state.as_json().is_none());
+
+        fs::remove_dir_all(&dir).expect("cleanup");
     }
 }
