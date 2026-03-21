@@ -21,6 +21,8 @@ use crate::onvif::{run_onvif_capability_probe, OnvifProbeCameraConfig};
 const FIRMWARE_VERSION_PATH: &str = "/etc/sentinel_rtp_cam/firmware-version";
 const FIRMWARE_BACKUP_BINARY_PATH: &str = "/usr/local/bin/sentinel_rtp_cam.prev";
 const DEFAULT_FIRMWARE_UPDATER_CMD: &str = "/usr/local/bin/sentinel-firmware-update";
+const PROC_STAT_PATH: &str = "/proc/stat";
+const PROC_MEMINFO_PATH: &str = "/proc/meminfo";
 
 #[derive(Debug, Deserialize, Clone)]
 struct FirmwareJobCommand {
@@ -59,6 +61,106 @@ struct FirmwareHeartbeatState {
     can_rollback: Option<bool>,
     started_at: Option<String>,
     finished_at: Option<String>,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TelemetryStatus {
+    Operational,
+    Degraded,
+    Suspended,
+}
+
+impl TelemetryStatus {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Operational => "operational",
+            Self::Degraded => "degraded",
+            Self::Suspended => "suspended",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TelemetryCapabilities {
+    face_recognition: bool,
+    license_plate: bool,
+    object_tracking: bool,
+    anomalous_motion: bool,
+}
+
+impl Default for TelemetryCapabilities {
+    fn default() -> Self {
+        Self {
+            face_recognition: false,
+            license_plate: false,
+            object_tracking: false,
+            anomalous_motion: false,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct HeartbeatTelemetry {
+    status: String,
+    cpu_load_pct: Option<u64>,
+    memory_used_mb: Option<u64>,
+    memory_total_mb: Option<u64>,
+    active_models: Vec<String>,
+    capabilities: TelemetryCapabilities,
+}
+
+impl HeartbeatTelemetry {
+    fn as_json(&self) -> Value {
+        json!({
+            "status": self.status,
+            "cpu_load_pct": self.cpu_load_pct,
+            "memory_used_mb": self.memory_used_mb,
+            "memory_total_mb": self.memory_total_mb,
+            "active_models": self.active_models,
+            "capabilities": {
+                "face_recognition": self.capabilities.face_recognition,
+                "license_plate": self.capabilities.license_plate,
+                "object_tracking": self.capabilities.object_tracking,
+                "anomalous_motion": self.capabilities.anomalous_motion,
+            },
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct MemoryUsageMb {
+    used_mb: u64,
+    total_mb: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CpuSample {
+    idle: u64,
+    total: u64,
+}
+
+#[derive(Debug, Default)]
+struct TelemetrySampler {
+    last_cpu_sample: Option<CpuSample>,
+}
+
+impl TelemetrySampler {
+    fn new() -> Self {
+        Self {
+            last_cpu_sample: read_cpu_sample_from_path(Path::new(PROC_STAT_PATH)),
+        }
+    }
+
+    fn sample(&mut self, status: TelemetryStatus) -> HeartbeatTelemetry {
+        build_heartbeat_telemetry(
+            status,
+            sample_cpu_load_pct(&mut self.last_cpu_sample, Path::new(PROC_STAT_PATH)),
+            read_memory_usage_mb_from_path(Path::new(PROC_MEMINFO_PATH)),
+            collect_active_models(),
+            detect_telemetry_capabilities(),
+        )
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -405,6 +507,105 @@ impl FirmwareHeartbeatState {
     }
 }
 
+fn sanitize_active_models<I>(models: I) -> Vec<String>
+where
+    I: IntoIterator<Item = String>,
+{
+    let mut seen = HashSet::new();
+    let mut out = Vec::new();
+    for model in models {
+        let trimmed = model.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if seen.insert(trimmed.to_string()) {
+            out.push(trimmed.to_string());
+        }
+    }
+    out
+}
+
+fn collect_active_models() -> Vec<String> {
+    sanitize_active_models(Vec::<String>::new())
+}
+
+fn detect_telemetry_capabilities() -> TelemetryCapabilities {
+    TelemetryCapabilities::default()
+}
+
+fn build_heartbeat_telemetry(
+    status: TelemetryStatus,
+    cpu_load_pct: Option<u64>,
+    memory: Option<MemoryUsageMb>,
+    active_models: Vec<String>,
+    capabilities: TelemetryCapabilities,
+) -> HeartbeatTelemetry {
+    HeartbeatTelemetry {
+        status: status.as_str().to_string(),
+        cpu_load_pct: cpu_load_pct.map(|value| value.min(100)),
+        memory_used_mb: memory.map(|value| value.used_mb),
+        memory_total_mb: memory.map(|value| value.total_mb),
+        active_models: sanitize_active_models(active_models),
+        capabilities,
+    }
+}
+
+fn parse_meminfo_value_kb(raw: &str, key: &str) -> Option<u64> {
+    raw.lines().find_map(|line| {
+        let rest = line.strip_prefix(key)?;
+        rest.split_whitespace().next()?.parse().ok()
+    })
+}
+
+fn read_memory_usage_mb_from_path(path: &Path) -> Option<MemoryUsageMb> {
+    let raw = fs::read_to_string(path).ok()?;
+    let total_kb = parse_meminfo_value_kb(&raw, "MemTotal:")?;
+    let available_kb = parse_meminfo_value_kb(&raw, "MemAvailable:").or_else(|| {
+        Some(
+            parse_meminfo_value_kb(&raw, "MemFree:")?
+                + parse_meminfo_value_kb(&raw, "Buffers:")?
+                + parse_meminfo_value_kb(&raw, "Cached:")?,
+        )
+    })?;
+    let available_kb = available_kb.min(total_kb);
+    Some(MemoryUsageMb {
+        used_mb: total_kb.saturating_sub(available_kb) / 1024,
+        total_mb: total_kb / 1024,
+    })
+}
+
+fn read_cpu_sample_from_path(path: &Path) -> Option<CpuSample> {
+    let raw = fs::read_to_string(path).ok()?;
+    let line = raw.lines().find(|line| line.starts_with("cpu "))?;
+    let values = line
+        .split_whitespace()
+        .skip(1)
+        .map(str::parse::<u64>)
+        .collect::<Result<Vec<_>, _>>()
+        .ok()?;
+    if values.len() < 4 {
+        return None;
+    }
+    let idle = values[3] + values.get(4).copied().unwrap_or(0);
+    let total = values.iter().copied().sum();
+    Some(CpuSample { idle, total })
+}
+
+fn sample_cpu_load_pct(last_sample: &mut Option<CpuSample>, path: &Path) -> Option<u64> {
+    let current = read_cpu_sample_from_path(path)?;
+    let pct = last_sample.and_then(|previous| {
+        let total_delta = current.total.saturating_sub(previous.total);
+        if total_delta == 0 {
+            return None;
+        }
+        let idle_delta = current.idle.saturating_sub(previous.idle);
+        let busy_delta = total_delta.saturating_sub(idle_delta);
+        Some((busy_delta.saturating_mul(100) / total_delta).min(100))
+    });
+    *last_sample = Some(current);
+    pct
+}
+
 fn read_installed_firmware_version_from_path(path: &Path) -> Option<String> {
     fs::read_to_string(path)
         .ok()
@@ -412,23 +613,32 @@ fn read_installed_firmware_version_from_path(path: &Path) -> Option<String> {
         .filter(|value| !value.is_empty())
 }
 
+fn pick_installed_firmware_version(
+    file_version: Option<String>,
+    runtime_override: Option<String>,
+    env_override: Option<String>,
+) -> Option<String> {
+    file_version
+        .filter(|value| !value.trim().is_empty())
+        .or_else(|| runtime_override.filter(|value| !value.trim().is_empty()))
+        .or_else(|| env_override.filter(|value| !value.trim().is_empty()))
+}
+
 fn read_installed_firmware_version() -> Option<String> {
-    read_installed_firmware_version_from_path(Path::new(FIRMWARE_VERSION_PATH)).or_else(|| {
-        AgentConfig::runtime_var("SENTINEL_VERSION").filter(|value| !value.trim().is_empty())
-    })
+    pick_installed_firmware_version(
+        read_installed_firmware_version_from_path(Path::new(FIRMWARE_VERSION_PATH)),
+        AgentConfig::runtime_var("SENTINEL_VERSION"),
+        std::env::var("SENTINEL_VERSION").ok(),
+    )
 }
 
 fn build_idle_firmware_state(
     current_version: Option<String>,
     can_rollback: bool,
 ) -> FirmwareHeartbeatState {
-    if current_version.is_none() && !can_rollback {
-        return FirmwareHeartbeatState::default();
-    }
-
     FirmwareHeartbeatState {
-        current_version: current_version.clone(),
-        target_version: current_version,
+        current_version,
+        target_version: None,
         status: Some("idle".to_string()),
         can_rollback: Some(can_rollback),
         ..Default::default()
@@ -451,6 +661,90 @@ fn baseline_firmware_state() -> FirmwareHeartbeatState {
         read_installed_firmware_version(),
         Path::new(FIRMWARE_BACKUP_BINARY_PATH).exists(),
     )
+}
+
+fn build_camera_heartbeat_payload(
+    camera_id: &str,
+    timestamp: &str,
+    onvif_summary: &OnvifProbeSummary,
+    telemetry: &HeartbeatTelemetry,
+    firmware: &FirmwareHeartbeatState,
+) -> Value {
+    let mut payload = json!({
+        "camera_id": camera_id,
+        "timestamp": timestamp,
+        "onvif_probe": onvif_summary.as_json(),
+        "telemetry": telemetry.as_json(),
+    });
+    if let Some(firmware_payload) = firmware.as_json() {
+        payload["firmware"] = firmware_payload;
+    }
+    payload
+}
+
+fn build_agent_heartbeat_payload(
+    agent_id: &str,
+    timestamp: &str,
+    cameras: Vec<Value>,
+    telemetry: &HeartbeatTelemetry,
+    firmware: &FirmwareHeartbeatState,
+) -> Value {
+    let mut payload = json!({
+        "agent_id": agent_id,
+        "timestamp": timestamp,
+        "telemetry": telemetry.as_json(),
+        "cameras": cameras,
+    });
+    if let Some(firmware_payload) = firmware.as_json() {
+        payload["firmware"] = firmware_payload;
+    }
+    payload
+}
+
+async fn post_heartbeat(
+    client: &reqwest::Client,
+    config: &ServerConfig,
+    payload: &Value,
+) -> Result<()> {
+    let base = config.base_url.trim_end_matches('/');
+    let posted = try_fallback_paths(&["/api/v1/heartbeat", "/api/heartbeat"], |path| {
+        let url = format!("{base}{path}");
+        async move {
+            let response = client
+                .post(&url)
+                .bearer_auth(&config.bearer_token)
+                .json(payload)
+                .send()
+                .await?;
+            if response.status() == reqwest::StatusCode::NOT_FOUND {
+                return Ok(FallbackOutcome::NotFound);
+            }
+            response.error_for_status()?;
+            Ok(FallbackOutcome::Success(()))
+        }
+    })
+    .await?;
+    if posted.is_some() {
+        Ok(())
+    } else {
+        Err(anyhow::anyhow!("No heartbeat endpoint available"))
+    }
+}
+
+fn pending_firmware_status(job: &FirmwareJobCommand) -> &'static str {
+    if job.action == "rollback" {
+        "rollback_pending"
+    } else {
+        "pending"
+    }
+}
+
+fn running_firmware_status(job: &FirmwareJobCommand) -> &'static str {
+    if job.action == "rollback" {
+        "rollback_running"
+    } else {
+        "installing"
+    }
 }
 
 async fn fetch_firmware_job_command(
@@ -549,11 +843,15 @@ async fn execute_firmware_job(job: &FirmwareJobCommand) -> Result<()> {
     ))
 }
 
-async fn maybe_process_firmware_job(
+async fn maybe_process_firmware_job<R, Fut>(
     client: &reqwest::Client,
     config: &ServerConfig,
     state: &mut FirmwareHeartbeatState,
-) {
+    mut report: R,
+) where
+    R: FnMut(FirmwareHeartbeatState) -> Fut,
+    Fut: std::future::Future<Output = ()>,
+{
     let job = match fetch_firmware_job_command(client, config).await {
         Ok(job) => job,
         Err(e) => {
@@ -566,17 +864,21 @@ async fn maybe_process_firmware_job(
         return;
     };
 
-    let running_status = if job.action == "rollback" {
-        "rollback_running"
-    } else {
-        "installing"
-    };
     state.job_id = Some(job.job_id);
     state.target_version = job.target_version.clone();
-    state.status = Some(running_status.to_string());
+    state.status = Some(pending_firmware_status(&job).to_string());
     state.error = None;
     state.started_at = Some(Utc::now().to_rfc3339());
     state.finished_at = None;
+    report(state.clone()).await;
+
+    if job.action == "update" {
+        state.status = Some("downloading".to_string());
+        report(state.clone()).await;
+    }
+
+    state.status = Some(running_firmware_status(&job).to_string());
+    report(state.clone()).await;
 
     info!(
         job_id = job.job_id,
@@ -587,6 +889,10 @@ async fn maybe_process_firmware_job(
 
     match execute_firmware_job(&job).await {
         Ok(_) => {
+            if job.action == "update" && job.start_after_update {
+                state.status = Some("restarting".to_string());
+                report(state.clone()).await;
+            }
             let status = if job.action == "rollback" {
                 "rollback_succeeded"
             } else {
@@ -595,13 +901,17 @@ async fn maybe_process_firmware_job(
             state.status = Some(status.to_string());
             state.error = None;
             state.finished_at = Some(Utc::now().to_rfc3339());
-            if job.action == "update" {
+            state.current_version = read_installed_firmware_version();
+            if state.current_version.is_none() && job.action == "update" {
                 state.current_version = job.target_version.clone();
+            }
+            if job.action == "update" {
                 state.can_rollback = Some(true);
             } else {
                 state.can_rollback = Some(false);
             }
             info!(job_id = job.job_id, status, "Firmware job completed");
+            report(state.clone()).await;
         }
         Err(e) => {
             let status = if job.action == "rollback" {
@@ -612,7 +922,9 @@ async fn maybe_process_firmware_job(
             state.status = Some(status.to_string());
             state.error = Some(e.to_string());
             state.finished_at = Some(Utc::now().to_rfc3339());
+            state.current_version = read_installed_firmware_version();
             warn!(job_id = job.job_id, status, error = %e, "Firmware job failed");
+            report(state.clone()).await;
         }
     }
 }
@@ -1056,42 +1368,53 @@ pub async fn run_heartbeat_poster(
         .timeout(Duration::from_secs(10))
         .build()?;
 
-    let url = format!("{}/api/heartbeat", config.base_url);
     let heartbeat_interval = Duration::from_secs(30);
+    let mut telemetry_sampler = TelemetrySampler::new();
     loop {
         sleep(heartbeat_interval).await;
-        let mut firmware = baseline_firmware_state();
-        maybe_process_firmware_job(&client, &config, &mut firmware).await;
         onvif_probe.poll_for_jobs(&client, &config).await;
         let onvif_summary = onvif_probe.summary_for(&camera_id).await;
+        let telemetry = telemetry_sampler.sample(TelemetryStatus::Operational);
+        let mut firmware = baseline_firmware_state();
+        maybe_process_firmware_job(&client, &config, &mut firmware, |firmware_state| {
+            let client = client.clone();
+            let config = config.clone();
+            let camera_id = camera_id.clone();
+            let onvif_summary = onvif_summary.clone();
+            let telemetry = telemetry.clone();
+            async move {
+                let timestamp = Utc::now().to_rfc3339();
+                let payload = build_camera_heartbeat_payload(
+                    &camera_id,
+                    &timestamp,
+                    &onvif_summary,
+                    &telemetry,
+                    &firmware_state,
+                );
+                if let Err(error) = post_heartbeat(&client, &config, &payload).await {
+                    warn!(error = %error, "Failed to post firmware heartbeat update");
+                }
+            }
+        })
+        .await;
 
-        let mut payload = json!({
-            "camera_id": camera_id,
-            "timestamp": Utc::now().to_rfc3339(),
-            "onvif_probe": onvif_summary.as_json(),
-        });
-        if let Some(firmware_payload) = firmware.as_json() {
-            payload["firmware"] = firmware_payload;
-        }
+        let timestamp = Utc::now().to_rfc3339();
+        let payload = build_camera_heartbeat_payload(
+            &camera_id,
+            &timestamp,
+            &onvif_summary,
+            &telemetry,
+            &firmware,
+        );
 
         let config_clone = config.clone();
         let client_clone = client.clone();
-        let url_clone = url.clone();
         let payload_clone = payload.clone();
 
         // Post in background with retry_forever
         tokio::spawn(async move {
             retry_forever(
-                || async {
-                    client_clone
-                        .post(&url_clone)
-                        .bearer_auth(&config_clone.bearer_token)
-                        .json(&payload_clone)
-                        .send()
-                        .await?
-                        .error_for_status()?;
-                    Ok(())
-                },
+                || async { post_heartbeat(&client_clone, &config_clone, &payload_clone).await },
                 Duration::from_secs(config_clone.retry_interval_secs),
                 "post_heartbeat",
             )
@@ -1146,18 +1469,20 @@ pub async fn run_agent_heartbeat_poster(
         .timeout(Duration::from_secs(10))
         .build()?;
 
-    let url = format!("{}/api/heartbeat", config.base_url);
     let heartbeat_interval = Duration::from_secs(30);
+    let mut telemetry_sampler = TelemetrySampler::new();
     loop {
         sleep(heartbeat_interval).await;
-        let mut firmware = baseline_firmware_state();
-        maybe_process_firmware_job(&client, &config, &mut firmware).await;
         onvif_probe.poll_for_jobs(&client, &config).await;
 
         let camera_snapshot = cameras.read().await.clone();
         let mut camera_status = Vec::new();
+        let mut any_camera_impaired = false;
         for cam in camera_snapshot {
             let (ok, latency_ms, error) = check_rtsp_reachability(&cam.rtsp_url).await;
+            if !ok {
+                any_camera_impaired = true;
+            }
             let onvif_summary = onvif_probe.summary_for(&cam.camera_id).await;
             camera_status.push(json!({
                 "camera_id": cam.camera_id,
@@ -1167,33 +1492,50 @@ pub async fn run_agent_heartbeat_poster(
                 "onvif_probe": onvif_summary.as_json(),
             }));
         }
-
-        let mut payload = json!({
-            "agent_id": agent_id,
-            "timestamp": Utc::now().to_rfc3339(),
-            "cameras": camera_status,
+        let telemetry = telemetry_sampler.sample(if any_camera_impaired {
+            TelemetryStatus::Degraded
+        } else {
+            TelemetryStatus::Operational
         });
-        if let Some(firmware_payload) = firmware.as_json() {
-            payload["firmware"] = firmware_payload;
-        }
+        let mut firmware = baseline_firmware_state();
+        maybe_process_firmware_job(&client, &config, &mut firmware, |firmware_state| {
+            let client = client.clone();
+            let config = config.clone();
+            let agent_id = agent_id.clone();
+            let telemetry = telemetry.clone();
+            let camera_status = camera_status.clone();
+            async move {
+                let timestamp = Utc::now().to_rfc3339();
+                let payload = build_agent_heartbeat_payload(
+                    &agent_id,
+                    &timestamp,
+                    camera_status,
+                    &telemetry,
+                    &firmware_state,
+                );
+                if let Err(error) = post_heartbeat(&client, &config, &payload).await {
+                    warn!(error = %error, "Failed to post firmware heartbeat update");
+                }
+            }
+        })
+        .await;
+
+        let timestamp = Utc::now().to_rfc3339();
+        let payload = build_agent_heartbeat_payload(
+            &agent_id,
+            &timestamp,
+            camera_status,
+            &telemetry,
+            &firmware,
+        );
 
         let config_clone = config.clone();
         let client_clone = client.clone();
-        let url_clone = url.clone();
         let payload_clone = payload.clone();
 
         tokio::spawn(async move {
             retry_forever(
-                || async {
-                    client_clone
-                        .post(&url_clone)
-                        .bearer_auth(&config_clone.bearer_token)
-                        .json(&payload_clone)
-                        .send()
-                        .await?
-                        .error_for_status()?;
-                    Ok(())
-                },
+                || async { post_heartbeat(&client_clone, &config_clone, &payload_clone).await },
                 Duration::from_secs(config_clone.retry_interval_secs),
                 "post_agent_heartbeat",
             )
@@ -1552,11 +1894,13 @@ fn first_bool(value: &Value, keys: &[&str]) -> Option<bool> {
 #[cfg(test)]
 mod tests {
     use super::{
-        baseline_firmware_state_from_paths, normalize_config_update, pick_firmware_updater_cmd,
-        try_fallback_paths, FallbackOutcome, OnvifProbeJobCommand, OnvifProbeJobResponse,
-        OnvifProbeManager, DEFAULT_FIRMWARE_UPDATER_CMD,
+        baseline_firmware_state_from_paths, build_agent_heartbeat_payload,
+        build_heartbeat_telemetry, build_idle_firmware_state, normalize_config_update,
+        pick_firmware_updater_cmd, pick_installed_firmware_version, try_fallback_paths,
+        FallbackOutcome, MemoryUsageMb, OnvifProbeJobCommand, OnvifProbeJobResponse,
+        OnvifProbeManager, TelemetryCapabilities, TelemetryStatus, DEFAULT_FIRMWARE_UPDATER_CMD,
     };
-    use serde_json::json;
+    use serde_json::{json, Value};
     use std::fs;
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -1662,7 +2006,7 @@ mod tests {
         let state = baseline_firmware_state_from_paths(&version_path, &backup_path);
 
         assert_eq!(state.current_version.as_deref(), Some("0.6.4"));
-        assert_eq!(state.target_version.as_deref(), Some("0.6.4"));
+        assert!(state.target_version.is_none());
         assert_eq!(state.status.as_deref(), Some("idle"));
         assert_eq!(state.can_rollback, Some(true));
 
@@ -1670,7 +2014,7 @@ mod tests {
     }
 
     #[test]
-    fn baseline_firmware_state_is_empty_without_local_firmware_metadata() {
+    fn baseline_firmware_state_reports_idle_without_local_firmware_metadata() {
         let dir = unique_test_dir("firmware-empty");
         fs::create_dir_all(&dir).expect("temp dir");
         let version_path = dir.join("firmware-version");
@@ -1678,9 +2022,169 @@ mod tests {
 
         let state = baseline_firmware_state_from_paths(&version_path, &backup_path);
 
-        assert!(state.as_json().is_none());
+        assert_eq!(state.current_version, None);
+        assert!(state.target_version.is_none());
+        assert_eq!(state.status.as_deref(), Some("idle"));
+        assert_eq!(state.can_rollback, Some(false));
 
         fs::remove_dir_all(&dir).expect("cleanup");
+    }
+
+    #[test]
+    fn baseline_firmware_state_refreshes_manual_version_changes() {
+        let dir = unique_test_dir("firmware-refresh");
+        fs::create_dir_all(&dir).expect("temp dir");
+        let version_path = dir.join("firmware-version");
+        let backup_path = dir.join("sentinel_rtp_cam.prev");
+
+        fs::write(&version_path, "1.1.1\n").expect("initial version");
+        let first = baseline_firmware_state_from_paths(&version_path, &backup_path);
+        assert_eq!(first.current_version.as_deref(), Some("1.1.1"));
+        assert_eq!(first.status.as_deref(), Some("idle"));
+
+        fs::write(&version_path, "1.1.2\n").expect("updated version");
+        let second = baseline_firmware_state_from_paths(&version_path, &backup_path);
+        assert_eq!(second.current_version.as_deref(), Some("1.1.2"));
+        assert_eq!(second.status.as_deref(), Some("idle"));
+
+        fs::remove_dir_all(&dir).expect("cleanup");
+    }
+
+    #[test]
+    fn installed_firmware_version_prefers_file_then_runtime_then_env() {
+        assert_eq!(
+            pick_installed_firmware_version(
+                Some("1.1.1".to_string()),
+                Some("1.1.2".to_string()),
+                Some("1.1.3".to_string()),
+            )
+            .as_deref(),
+            Some("1.1.1")
+        );
+        assert_eq!(
+            pick_installed_firmware_version(
+                Some("   ".to_string()),
+                Some("1.1.2".to_string()),
+                Some("1.1.3".to_string()),
+            )
+            .as_deref(),
+            Some("1.1.2")
+        );
+        assert_eq!(
+            pick_installed_firmware_version(
+                None,
+                Some("   ".to_string()),
+                Some("1.1.3".to_string())
+            )
+            .as_deref(),
+            Some("1.1.3")
+        );
+    }
+
+    #[test]
+    fn telemetry_json_uses_memory_fields_and_sanitizes_models() {
+        let telemetry = build_heartbeat_telemetry(
+            TelemetryStatus::Degraded,
+            Some(140),
+            Some(MemoryUsageMb {
+                used_mb: 512,
+                total_mb: 1024,
+            }),
+            vec![
+                " detector-a ".to_string(),
+                "".to_string(),
+                "detector-a".to_string(),
+                "detector-b".to_string(),
+            ],
+            TelemetryCapabilities {
+                face_recognition: false,
+                license_plate: false,
+                object_tracking: false,
+                anomalous_motion: false,
+            },
+        );
+
+        let payload = telemetry.as_json();
+
+        assert_eq!(payload["status"], "degraded");
+        assert_eq!(payload["cpu_load_pct"], 100);
+        assert_eq!(payload["memory_used_mb"], 512);
+        assert_eq!(payload["memory_total_mb"], 1024);
+        assert_eq!(
+            payload["active_models"],
+            json!(["detector-a", "detector-b"])
+        );
+        assert!(payload.get("gpu_vram_used_mb").is_none());
+        assert!(payload.get("gpu_vram_total_mb").is_none());
+    }
+
+    #[test]
+    fn agent_heartbeat_payload_includes_telemetry_and_idle_firmware() {
+        let telemetry = build_heartbeat_telemetry(
+            TelemetryStatus::Operational,
+            Some(12),
+            Some(MemoryUsageMb {
+                used_mb: 321,
+                total_mb: 2048,
+            }),
+            vec!["model-1".to_string()],
+            TelemetryCapabilities::default(),
+        );
+        let firmware = build_idle_firmware_state(Some("1.1.2".to_string()), true);
+        let payload = build_agent_heartbeat_payload(
+            "agent-1",
+            "2026-03-21T18:00:00Z",
+            vec![json!({
+                "camera_id": "cam-1",
+                "rtsp_ok": true,
+                "rtsp_latency_ms": 5,
+                "rtsp_error": Value::Null,
+                "onvif_probe": {
+                    "status": "never_run",
+                },
+            })],
+            &telemetry,
+            &firmware,
+        );
+
+        assert_eq!(payload["agent_id"], "agent-1");
+        assert_eq!(payload["telemetry"]["status"], "operational");
+        assert_eq!(payload["telemetry"]["memory_used_mb"], 321);
+        assert_eq!(payload["firmware"]["current_version"], "1.1.2");
+        assert_eq!(payload["firmware"]["status"], "idle");
+        assert_eq!(payload["firmware"]["can_rollback"], true);
+        assert_eq!(payload["firmware"]["target_version"], Value::Null);
+        assert_eq!(payload["cameras"][0]["camera_id"], "cam-1");
+    }
+
+    #[tokio::test]
+    async fn heartbeat_post_falls_back_to_legacy_endpoint() {
+        let attempts = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let attempts_for_closure = attempts.clone();
+        let posted = try_fallback_paths(&["/api/v1/heartbeat", "/api/heartbeat"], move |path| {
+            let attempts = attempts_for_closure.clone();
+            let path = path.to_string();
+            async move {
+                attempts.lock().expect("attempt log").push(path.clone());
+                if path == "/api/v1/heartbeat" {
+                    Ok(FallbackOutcome::NotFound)
+                } else {
+                    Ok(FallbackOutcome::Success(()))
+                }
+            }
+        })
+        .await
+        .expect("fallback post");
+        assert!(posted.is_some());
+
+        let attempts = attempts.lock().expect("attempt log");
+        assert_eq!(
+            *attempts,
+            vec![
+                "/api/v1/heartbeat".to_string(),
+                "/api/heartbeat".to_string(),
+            ]
+        );
     }
 
     #[test]
