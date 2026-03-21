@@ -7,7 +7,13 @@ use axum::{
     Form, Json, Router,
 };
 use serde::Deserialize;
-use std::{collections::HashSet, convert::Infallible, sync::Arc, time::Duration};
+use serde_json::{json, Value};
+use std::{
+    collections::{HashSet, VecDeque},
+    convert::Infallible,
+    sync::Arc,
+    time::Duration,
+};
 use tokio::sync::{broadcast, Mutex, RwLock};
 use tokio_stream::{wrappers::BroadcastStream, StreamExt};
 use tower_http::{cors::CorsLayer, trace::TraceLayer};
@@ -29,6 +35,8 @@ struct AppState {
     config_tx: broadcast::Sender<String>,
     bearer_token: String,
     seen_events: Arc<Mutex<HashSet<String>>>,
+    onvif_jobs: Arc<Mutex<VecDeque<OnvifProbeJobPayload>>>,
+    next_onvif_job_id: Arc<Mutex<i64>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -42,7 +50,9 @@ struct MotionEventPayload {
 
 #[derive(Debug, Deserialize)]
 struct HeartbeatPayload {
-    camera_id: String,
+    camera_id: Option<String>,
+    agent_id: Option<String>,
+    cameras: Option<Vec<Value>>,
     timestamp: String,
 }
 
@@ -58,6 +68,30 @@ struct ClipMetaPayload {
     #[allow(dead_code)]
     ended_at: String,
     duration_secs: i64,
+}
+
+#[derive(Debug, Clone)]
+struct OnvifProbeJobPayload {
+    job_id: i64,
+    action: String,
+    camera_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct OnvifProbeReportPayload {
+    job_id: i64,
+    camera_id: String,
+    agent_id: Option<String>,
+    started_at: String,
+    finished_at: String,
+    status: String,
+    error: Option<String>,
+    report: Value,
+}
+
+#[derive(Debug, Deserialize)]
+struct OnvifJobForm {
+    camera_id: String,
 }
 
 // Auth middleware check
@@ -115,6 +149,7 @@ async fn sse_config_stream(
 // Admin page handler
 async fn admin_page(State(state): State<AppState>) -> Html<String> {
     let config = state.config_json_pretty.read().await;
+    let pending_onvif_jobs = state.onvif_jobs.lock().await.len();
     Html(format!(
         r#"<!DOCTYPE html>
 <html>
@@ -156,15 +191,26 @@ async fn admin_page(State(state): State<AppState>) -> Html<String> {
         <button type="submit">Update Config & Broadcast</button>
     </form>
     <div class="info" style="margin-top: 20px;">
+        Queue an ONVIF capability probe job for the agent to fetch.
+        Pending jobs: {}
+    </div>
+    <form method="post" action="/admin/onvif-job">
+        <input name="camera_id" value="cam-001" style="width: 240px; padding: 8px; background: #252526; color: #d4d4d4; border: 1px solid #3c3c3c;" />
+        <button type="submit">Queue ONVIF Probe</button>
+    </form>
+    <div class="info" style="margin-top: 20px;">
         <strong>Endpoints:</strong><br>
         • SSE: GET /api/v1/config/stream?camera_id=CAM_ID<br>
         • Motion: POST /api/events/motion<br>
         • Heartbeat: POST /api/heartbeat<br>
         • Clips: POST /api/clips<br>
+        • ONVIF Job: GET /api/agent/onvif/job<br>
+        • ONVIF Report: POST /api/agent/onvif/report<br>
     </div>
 </body>
 </html>"#,
-        html_escape(&config)
+        html_escape(&config),
+        pending_onvif_jobs
     ))
 }
 
@@ -209,6 +255,36 @@ async fn admin_update_config(
     let _ = state.config_tx.send(compact_json);
 
     // Redirect back to admin page
+    Ok(Response::builder()
+        .status(StatusCode::SEE_OTHER)
+        .header("Location", "/admin")
+        .body(Body::empty())
+        .unwrap())
+}
+
+async fn admin_enqueue_onvif_job(
+    State(state): State<AppState>,
+    Form(form): Form<OnvifJobForm>,
+) -> Result<Response, StatusCode> {
+    let camera_id = form.camera_id.trim();
+    if camera_id.is_empty() {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+
+    let mut next_id = state.next_onvif_job_id.lock().await;
+    let job = OnvifProbeJobPayload {
+        job_id: *next_id,
+        action: "probe".to_string(),
+        camera_id: camera_id.to_string(),
+    };
+    *next_id += 1;
+    state.onvif_jobs.lock().await.push_back(job.clone());
+    info!(
+        job_id = job.job_id,
+        camera_id = %job.camera_id,
+        "Queued ONVIF probe job"
+    );
+
     Ok(Response::builder()
         .status(StatusCode::SEE_OTHER)
         .header("Location", "/admin")
@@ -261,11 +337,25 @@ async fn handle_heartbeat(
 ) -> Result<StatusCode, StatusCode> {
     check_auth(&headers, &state.bearer_token)?;
 
-    info!(
-        camera_id = %payload.camera_id,
-        timestamp = %payload.timestamp,
-        "Heartbeat received"
-    );
+    if let Some(camera_id) = payload.camera_id {
+        info!(
+            camera_id = %camera_id,
+            timestamp = %payload.timestamp,
+            "Heartbeat received"
+        );
+    } else {
+        let camera_count = payload
+            .cameras
+            .as_ref()
+            .map(|cameras| cameras.len())
+            .unwrap_or(0);
+        info!(
+            agent_id = ?payload.agent_id,
+            camera_count,
+            timestamp = %payload.timestamp,
+            "Agent heartbeat received"
+        );
+    }
 
     Ok(StatusCode::OK)
 }
@@ -291,12 +381,67 @@ async fn handle_clip_meta(
     Ok(StatusCode::OK)
 }
 
+async fn handle_onvif_job(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, StatusCode> {
+    check_auth(&headers, &state.bearer_token)?;
+
+    let job = state.onvif_jobs.lock().await.pop_front();
+    if let Some(job) = &job {
+        info!(
+            job_id = job.job_id,
+            camera_id = %job.camera_id,
+            "Dispatching ONVIF probe job"
+        );
+    }
+
+    Ok(Json(json!({
+        "job": job.map(|job| {
+            json!({
+                "job_id": job.job_id,
+                "action": job.action,
+                "camera_id": job.camera_id,
+            })
+        })
+    })))
+}
+
+async fn handle_onvif_report(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(payload): Json<OnvifProbeReportPayload>,
+) -> Result<StatusCode, StatusCode> {
+    check_auth(&headers, &state.bearer_token)?;
+
+    let report_keys = payload
+        .report
+        .as_object()
+        .map(|obj| obj.len())
+        .unwrap_or_default();
+    info!(
+        job_id = payload.job_id,
+        camera_id = %payload.camera_id,
+        agent_id = ?payload.agent_id,
+        started_at = %payload.started_at,
+        finished_at = %payload.finished_at,
+        status = %payload.status,
+        error = ?payload.error,
+        report_keys,
+        "ONVIF probe report received"
+    );
+
+    Ok(StatusCode::OK)
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let server_value = AgentConfig::load_server_json(std::path::Path::new(DEFAULT_SERVER_CONFIG_PATH))
-        .unwrap_or_else(|_| serde_json::Value::Object(Default::default()));
-    let camera_value = AgentConfig::load_camera_json(std::path::Path::new(DEFAULT_CAMERA_CONFIG_PATH))
-        .unwrap_or_else(|_| serde_json::Value::Object(Default::default()));
+    let server_value =
+        AgentConfig::load_server_json(std::path::Path::new(DEFAULT_SERVER_CONFIG_PATH))
+            .unwrap_or_else(|_| serde_json::Value::Object(Default::default()));
+    let camera_value =
+        AgentConfig::load_camera_json(std::path::Path::new(DEFAULT_CAMERA_CONFIG_PATH))
+            .unwrap_or_else(|_| serde_json::Value::Object(Default::default()));
     let config_value = AgentConfig::merge_server_camera_configs(&camera_value, &server_value);
     AgentConfig::apply_json_env_overrides(&config_value);
 
@@ -307,7 +452,8 @@ async fn main() -> anyhow::Result<()> {
         .with_target(false)
         .init();
 
-    let bind_addr = runtime_var("DUMMY_SERVER_BIND").unwrap_or_else(|| "127.0.0.1:8080".to_string());
+    let bind_addr =
+        runtime_var("DUMMY_SERVER_BIND").unwrap_or_else(|| "127.0.0.1:8080".to_string());
     let bearer_token =
         runtime_var("DUMMY_SERVER_TOKEN").unwrap_or_else(|| "test-token-12345".to_string());
 
@@ -337,6 +483,8 @@ async fn main() -> anyhow::Result<()> {
         config_tx,
         bearer_token: bearer_token.clone(),
         seen_events: Arc::new(Mutex::new(HashSet::new())),
+        onvif_jobs: Arc::new(Mutex::new(VecDeque::new())),
+        next_onvif_job_id: Arc::new(Mutex::new(1)),
     };
 
     let app = Router::new()
@@ -344,8 +492,13 @@ async fn main() -> anyhow::Result<()> {
         .route("/api/events/motion", post(handle_motion_event))
         .route("/api/heartbeat", post(handle_heartbeat))
         .route("/api/clips", post(handle_clip_meta))
+        .route("/api/agent/onvif/job", get(handle_onvif_job))
+        .route("/api/v1/agent/onvif/job", get(handle_onvif_job))
+        .route("/api/agent/onvif/report", post(handle_onvif_report))
+        .route("/api/v1/agent/onvif/report", post(handle_onvif_report))
         .route("/admin", get(admin_page))
         .route("/admin/config", post(admin_update_config))
+        .route("/admin/onvif-job", post(admin_enqueue_onvif_job))
         .layer(CorsLayer::permissive())
         .layer(TraceLayer::new_for_http())
         .with_state(state);
@@ -365,6 +518,14 @@ async fn main() -> anyhow::Result<()> {
     );
     info!("Heartbeat:       POST http://{}/api/heartbeat", bind_addr);
     info!("Clip metadata:   POST http://{}/api/clips", bind_addr);
+    info!(
+        "ONVIF job poll:  GET  http://{}/api/agent/onvif/job",
+        bind_addr
+    );
+    info!(
+        "ONVIF reports:   POST http://{}/api/agent/onvif/report",
+        bind_addr
+    );
     info!("");
     info!("Configure agent with:");
     info!("  SERVER_BASE_URL=http://{}", bind_addr);

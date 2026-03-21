@@ -21,7 +21,10 @@ use sentinel_rtp_cam::forward_agent::{
 use sentinel_rtp_cam::onvif::run_onvif_motion_poller;
 use sentinel_rtp_cam::rtsp::interleaved::{read_interleaved_frame, InterleavedFrame};
 use sentinel_rtp_cam::rtsp::rtsp::RtspClient;
-use sentinel_rtp_cam::{run_agent_heartbeat_poster, AgentConfig, CameraHeartbeatTarget};
+use sentinel_rtp_cam::{
+    load_onvif_probe_cameras_from_env, run_agent_heartbeat_poster, AgentConfig,
+    CameraHeartbeatTarget, OnvifProbeManager,
+};
 
 const DEFAULT_SERVER_CONFIG_PATH: &str = "/etc/sentinel_rtp_cam/server.json";
 const DEFAULT_CAMERA_CONFIG_PATH: &str = "/etc/sentinel_rtp_cam/camera.json";
@@ -132,7 +135,6 @@ async fn main() -> Result<()> {
     let camera_targets: Arc<RwLock<Vec<CameraHeartbeatTarget>>> = Arc::new(RwLock::new(Vec::new()));
     let mut last_status = Instant::now() - Duration::from_secs(120);
     let mut last_pull = Instant::now() - Duration::from_secs(120);
-    let mut heartbeat_started = false;
     let (server_addr, cams) = loop {
         let server_value = match AgentConfig::load_server_json(&server_source_path) {
             Ok(value) => value,
@@ -177,27 +179,10 @@ async fn main() -> Result<()> {
         let server_base_url = runtime_var("SERVER_BASE_URL");
         let server_bearer = runtime_var("SERVER_BEARER_TOKEN");
 
-        if !heartbeat_started {
-            if server_base_url.is_some() && server_bearer.is_some() {
-                let agent_id = runtime_var("AGENT_ID")
-                    .or_else(|| runtime_var("HOSTNAME"))
-                    .unwrap_or_else(|| "agent".to_string());
-                let server_cfg = AgentConfig::from_env().server;
-                let camera_targets = camera_targets.clone();
-                tokio::spawn(async move {
-                    if let Err(e) =
-                        run_agent_heartbeat_poster(server_cfg, agent_id, camera_targets).await
-                    {
-                        warn!(error = %e, "Agent heartbeat task ended");
-                    }
-                });
-                heartbeat_started = true;
-            }
-        }
-
         if last_pull.elapsed() > Duration::from_secs(30) {
             if let (Some(base_url), Some(token)) = (&server_base_url, &server_bearer) {
-                let camera_hint = runtime_var("CAMERA_ID").or_else(|| runtime_var("CAM1_CAMERA_ID"));
+                let camera_hint =
+                    runtime_var("CAMERA_ID").or_else(|| runtime_var("CAM1_CAMERA_ID"));
                 match try_pull_remote_config(
                     &http_client,
                     base_url,
@@ -258,6 +243,44 @@ async fn main() -> Result<()> {
             .collect();
     }
 
+    let agent_id = cams
+        .first()
+        .map(|cam| cam.agent_id.clone())
+        .unwrap_or_else(|| "agent-1".to_string());
+    let onvif_probe_cameras = match load_onvif_probe_cameras_from_env() {
+        Ok(cameras) => cameras,
+        Err(error) => {
+            warn!(
+                error = %error,
+                "Failed to load ONVIF probe camera config; capability probes disabled"
+            );
+            Vec::new()
+        }
+    };
+    let onvif_probe = OnvifProbeManager::new(
+        cams.iter().map(|cam| cam.camera_id.clone()).collect(),
+        onvif_probe_cameras,
+        Some(agent_id.clone()),
+    );
+    if runtime_var("SERVER_BASE_URL").is_some() && runtime_var("SERVER_BEARER_TOKEN").is_some() {
+        let server_cfg = AgentConfig::from_env().server;
+        let camera_targets = camera_targets.clone();
+        let heartbeat_agent_id = agent_id.clone();
+        let onvif_probe = onvif_probe.clone();
+        tokio::spawn(async move {
+            if let Err(error) = run_agent_heartbeat_poster(
+                server_cfg,
+                heartbeat_agent_id,
+                camera_targets,
+                onvif_probe,
+            )
+            .await
+            {
+                warn!(error = %error, "Agent heartbeat task ended");
+            }
+        });
+    }
+
     info!(camera_count = cams.len(), "Loaded camera configs");
     for cam in &cams {
         info!(
@@ -279,10 +302,6 @@ async fn main() -> Result<()> {
         .first()
         .map(|cam| cam.agent_token.clone())
         .ok_or_else(|| anyhow!("No cameras configured"))?;
-    let agent_id = cams
-        .first()
-        .map(|cam| cam.agent_id.clone())
-        .unwrap_or_else(|| "agent-1".to_string());
     let token_mismatch = cams.iter().any(|cam| cam.agent_token != agent_token);
     if token_mismatch {
         bail!("Multiple agent tokens found; single uplink requires a shared token");

@@ -2,6 +2,7 @@ use anyhow::Result;
 use chrono::Utc;
 use serde::Deserialize;
 use serde_json::{json, Value};
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::Path;
 use std::sync::Arc;
@@ -15,6 +16,7 @@ use url::Url;
 use crate::config::{agent_config::ServerConfig, AgentConfig};
 use crate::core::clip_recorder::ClipMeta;
 use crate::event::MotionEvent;
+use crate::onvif::{run_onvif_capability_probe, OnvifProbeCameraConfig};
 
 const FIRMWARE_VERSION_PATH: &str = "/etc/sentinel_rtp_cam/firmware-version";
 const FIRMWARE_BACKUP_BINARY_PATH: &str = "/usr/local/bin/sentinel_rtp_cam.prev";
@@ -34,6 +36,18 @@ struct FirmwareJobResponse {
     job: Option<FirmwareJobCommand>,
 }
 
+#[derive(Debug, Deserialize, Clone)]
+struct OnvifProbeJobCommand {
+    job_id: i64,
+    action: String,
+    camera_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct OnvifProbeJobResponse {
+    job: Option<OnvifProbeJobCommand>,
+}
+
 #[derive(Debug, Clone, Default)]
 struct FirmwareHeartbeatState {
     job_id: Option<i64>,
@@ -44,6 +58,323 @@ struct FirmwareHeartbeatState {
     can_rollback: Option<bool>,
     started_at: Option<String>,
     finished_at: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OnvifProbeSummary {
+    pub job_id: Option<i64>,
+    pub status: String,
+    pub error: Option<String>,
+    pub started_at: Option<String>,
+    pub finished_at: Option<String>,
+    pub last_reported_at: Option<String>,
+}
+
+impl Default for OnvifProbeSummary {
+    fn default() -> Self {
+        Self {
+            job_id: None,
+            status: "never_run".to_string(),
+            error: None,
+            started_at: None,
+            finished_at: None,
+            last_reported_at: None,
+        }
+    }
+}
+
+impl OnvifProbeSummary {
+    fn as_json(&self) -> Value {
+        json!({
+            "job_id": self.job_id,
+            "status": self.status,
+            "error": self.error,
+            "started_at": self.started_at,
+            "finished_at": self.finished_at,
+            "last_reported_at": self.last_reported_at,
+        })
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct OnvifProbeManager {
+    known_cameras: Arc<HashSet<String>>,
+    camera_configs: Arc<HashMap<String, OnvifProbeCameraConfig>>,
+    summaries: Arc<RwLock<HashMap<String, OnvifProbeSummary>>>,
+    in_flight: Arc<RwLock<HashSet<String>>>,
+    agent_id: Option<String>,
+}
+
+impl OnvifProbeManager {
+    pub fn new(
+        known_camera_ids: Vec<String>,
+        camera_configs: Vec<OnvifProbeCameraConfig>,
+        agent_id: Option<String>,
+    ) -> Self {
+        let mut summaries = HashMap::new();
+        let mut known_cameras = HashSet::new();
+        for camera_id in known_camera_ids {
+            summaries.insert(camera_id.clone(), OnvifProbeSummary::default());
+            known_cameras.insert(camera_id);
+        }
+
+        let configs = camera_configs
+            .into_iter()
+            .map(|config| (config.camera_id.clone(), config))
+            .collect();
+
+        Self {
+            known_cameras: Arc::new(known_cameras),
+            camera_configs: Arc::new(configs),
+            summaries: Arc::new(RwLock::new(summaries)),
+            in_flight: Arc::new(RwLock::new(HashSet::new())),
+            agent_id,
+        }
+    }
+
+    pub async fn summary_for(&self, camera_id: &str) -> OnvifProbeSummary {
+        self.summaries
+            .read()
+            .await
+            .get(camera_id)
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    pub async fn poll_for_jobs(&self, client: &reqwest::Client, config: &ServerConfig) {
+        let job = match fetch_onvif_probe_job_command(client, config).await {
+            Ok(job) => job,
+            Err(error) => {
+                warn!(error = %error, "Failed to poll ONVIF probe job command");
+                return;
+            }
+        };
+        let Some(job) = job else {
+            return;
+        };
+
+        let camera_id = job.camera_id.trim().to_string();
+        if job.action != "probe" {
+            let error = format!("Unsupported ONVIF probe action: {}", job.action);
+            self.fail_job_immediately(client.clone(), config.clone(), job, error, None)
+                .await;
+            return;
+        }
+        if camera_id.is_empty() {
+            self.fail_job_immediately(
+                client.clone(),
+                config.clone(),
+                job,
+                "Missing camera_id".to_string(),
+                None,
+            )
+            .await;
+            return;
+        }
+
+        let known = self.known_cameras.contains(&camera_id);
+        let Some(camera_config) = self.camera_configs.get(&camera_id).cloned() else {
+            let summary_id = known.then_some(camera_id.clone());
+            let error = if known {
+                "camera not configured for ONVIF".to_string()
+            } else {
+                format!("unknown camera_id: {}", camera_id)
+            };
+            self.fail_job_immediately(client.clone(), config.clone(), job, error, summary_id)
+                .await;
+            return;
+        };
+
+        if !self.try_mark_in_flight(&camera_id).await {
+            self.fail_job_immediately(
+                client.clone(),
+                config.clone(),
+                job,
+                "busy".to_string(),
+                Some(camera_id),
+            )
+            .await;
+            return;
+        }
+
+        let started_at = Utc::now().to_rfc3339();
+        self.set_running(&camera_id, job.job_id, started_at.clone())
+            .await;
+
+        let manager = self.clone();
+        let client = client.clone();
+        let config = config.clone();
+        tokio::spawn(async move {
+            manager
+                .execute_probe_job(client, config, job, camera_config, started_at)
+                .await;
+        });
+    }
+
+    async fn execute_probe_job(
+        &self,
+        client: reqwest::Client,
+        config: ServerConfig,
+        job: OnvifProbeJobCommand,
+        camera_config: OnvifProbeCameraConfig,
+        started_at: String,
+    ) {
+        let camera_id = camera_config.camera_id.clone();
+        let outcome = run_onvif_capability_probe(&camera_config).await;
+        let finished_at = Utc::now().to_rfc3339();
+
+        let (status, error, report) = match outcome {
+            Ok(report) => ("succeeded".to_string(), None, Some(report)),
+            Err(error) => ("failed".to_string(), Some(error.to_string()), None),
+        };
+
+        self.set_finished(
+            &camera_id,
+            job.job_id,
+            status.clone(),
+            error.clone(),
+            started_at.clone(),
+            finished_at.clone(),
+        )
+        .await;
+        self.release_in_flight(&camera_id).await;
+
+        let payload = json!({
+            "job_id": job.job_id,
+            "camera_id": camera_id,
+            "agent_id": self.agent_id,
+            "started_at": started_at,
+            "finished_at": finished_at,
+            "status": status,
+            "error": error,
+            "report": report,
+        });
+
+        retry_forever(
+            || {
+                let client = client.clone();
+                let config = config.clone();
+                let payload = payload.clone();
+                async move { post_onvif_probe_report(&client, &config, &payload).await }
+            },
+            Duration::from_secs(config.retry_interval_secs),
+            "post_onvif_probe_report",
+        )
+        .await;
+        self.mark_reported(&camera_id).await;
+    }
+
+    async fn fail_job_immediately(
+        &self,
+        client: reqwest::Client,
+        config: ServerConfig,
+        job: OnvifProbeJobCommand,
+        error: String,
+        summary_camera_id: Option<String>,
+    ) {
+        let started_at = Utc::now().to_rfc3339();
+        let finished_at = started_at.clone();
+        if let Some(camera_id) = summary_camera_id.as_deref() {
+            self.set_finished(
+                camera_id,
+                job.job_id,
+                "failed".to_string(),
+                Some(error.clone()),
+                started_at.clone(),
+                finished_at.clone(),
+            )
+            .await;
+        }
+
+        let payload = json!({
+            "job_id": job.job_id,
+            "camera_id": job.camera_id,
+            "agent_id": self.agent_id,
+            "started_at": started_at,
+            "finished_at": finished_at,
+            "status": "failed",
+            "error": error,
+            "report": Value::Null,
+        });
+
+        let manager = self.clone();
+        tokio::spawn(async move {
+            retry_forever(
+                || {
+                    let client = client.clone();
+                    let config = config.clone();
+                    let payload = payload.clone();
+                    async move { post_onvif_probe_report(&client, &config, &payload).await }
+                },
+                Duration::from_secs(config.retry_interval_secs),
+                "post_onvif_probe_report",
+            )
+            .await;
+            if let Some(camera_id) = summary_camera_id {
+                manager.mark_reported(&camera_id).await;
+            }
+        });
+    }
+
+    async fn try_mark_in_flight(&self, camera_id: &str) -> bool {
+        let mut in_flight = self.in_flight.write().await;
+        in_flight.insert(camera_id.to_string())
+    }
+
+    async fn release_in_flight(&self, camera_id: &str) {
+        self.in_flight.write().await.remove(camera_id);
+    }
+
+    async fn set_running(&self, camera_id: &str, job_id: i64, started_at: String) {
+        let mut summaries = self.summaries.write().await;
+        let last_reported_at = summaries
+            .get(camera_id)
+            .and_then(|summary| summary.last_reported_at.clone());
+        summaries.insert(
+            camera_id.to_string(),
+            OnvifProbeSummary {
+                job_id: Some(job_id),
+                status: "running".to_string(),
+                error: None,
+                started_at: Some(started_at),
+                finished_at: None,
+                last_reported_at,
+            },
+        );
+    }
+
+    async fn set_finished(
+        &self,
+        camera_id: &str,
+        job_id: i64,
+        status: String,
+        error: Option<String>,
+        started_at: String,
+        finished_at: String,
+    ) {
+        let mut summaries = self.summaries.write().await;
+        let last_reported_at = summaries
+            .get(camera_id)
+            .and_then(|summary| summary.last_reported_at.clone());
+        summaries.insert(
+            camera_id.to_string(),
+            OnvifProbeSummary {
+                job_id: Some(job_id),
+                status,
+                error,
+                started_at: Some(started_at),
+                finished_at: Some(finished_at),
+                last_reported_at,
+            },
+        );
+    }
+
+    async fn mark_reported(&self, camera_id: &str) {
+        let mut summaries = self.summaries.write().await;
+        if let Some(summary) = summaries.get_mut(camera_id) {
+            summary.last_reported_at = Some(Utc::now().to_rfc3339());
+        }
+    }
 }
 
 impl FirmwareHeartbeatState {
@@ -103,6 +434,7 @@ fn build_idle_firmware_state(
     }
 }
 
+#[cfg(test)]
 fn baseline_firmware_state_from_paths(
     version_path: &Path,
     backup_path: &Path,
@@ -259,6 +591,86 @@ async fn maybe_process_firmware_job(
             warn!(job_id = job.job_id, status, error = %e, "Firmware job failed");
         }
     }
+}
+
+async fn fetch_onvif_probe_job_command(
+    client: &reqwest::Client,
+    config: &ServerConfig,
+) -> Result<Option<OnvifProbeJobCommand>> {
+    let base = config.base_url.trim_end_matches('/');
+    let payload = try_fallback_paths(
+        &["/api/agent/onvif/job", "/api/v1/agent/onvif/job"],
+        |path| {
+            let url = format!("{base}{path}");
+            async move {
+                let response = client
+                    .get(&url)
+                    .bearer_auth(&config.bearer_token)
+                    .send()
+                    .await?;
+                if response.status() == reqwest::StatusCode::NOT_FOUND {
+                    return Ok(FallbackOutcome::NotFound);
+                }
+                let response = response.error_for_status()?;
+                let payload: OnvifProbeJobResponse = response.json().await?;
+                Ok(FallbackOutcome::Success(payload))
+            }
+        },
+    )
+    .await?;
+    Ok(payload.and_then(|payload| payload.job))
+}
+
+async fn post_onvif_probe_report(
+    client: &reqwest::Client,
+    config: &ServerConfig,
+    payload: &Value,
+) -> Result<()> {
+    let base = config.base_url.trim_end_matches('/');
+    let posted = try_fallback_paths(
+        &["/api/agent/onvif/report", "/api/v1/agent/onvif/report"],
+        |path| {
+            let url = format!("{base}{path}");
+            async move {
+                let response = client
+                    .post(&url)
+                    .bearer_auth(&config.bearer_token)
+                    .json(payload)
+                    .send()
+                    .await?;
+                if response.status() == reqwest::StatusCode::NOT_FOUND {
+                    return Ok(FallbackOutcome::NotFound);
+                }
+                response.error_for_status()?;
+                Ok(FallbackOutcome::Success(()))
+            }
+        },
+    )
+    .await?;
+    if posted.is_some() {
+        Ok(())
+    } else {
+        Err(anyhow::anyhow!("No ONVIF probe report endpoint available"))
+    }
+}
+
+enum FallbackOutcome<T> {
+    NotFound,
+    Success(T),
+}
+
+async fn try_fallback_paths<T, F, Fut>(paths: &[&str], mut attempt: F) -> Result<Option<T>>
+where
+    F: FnMut(&str) -> Fut,
+    Fut: std::future::Future<Output = Result<FallbackOutcome<T>>>,
+{
+    for path in paths {
+        match attempt(path).await? {
+            FallbackOutcome::NotFound => continue,
+            FallbackOutcome::Success(value) => return Ok(Some(value)),
+        }
+    }
+    Ok(None)
 }
 
 /// Helper function that retries an async operation forever with exponential backoff
@@ -605,7 +1017,11 @@ async fn upload_clip_file(
 }
 
 /// Sends periodic heartbeat to server
-pub async fn run_heartbeat_poster(config: ServerConfig, camera_id: String) -> Result<()> {
+pub async fn run_heartbeat_poster(
+    config: ServerConfig,
+    camera_id: String,
+    onvif_probe: OnvifProbeManager,
+) -> Result<()> {
     info!(
         server_url = %config.base_url,
         camera_id = %camera_id,
@@ -622,10 +1038,13 @@ pub async fn run_heartbeat_poster(config: ServerConfig, camera_id: String) -> Re
         sleep(heartbeat_interval).await;
         let mut firmware = baseline_firmware_state();
         maybe_process_firmware_job(&client, &config, &mut firmware).await;
+        onvif_probe.poll_for_jobs(&client, &config).await;
+        let onvif_summary = onvif_probe.summary_for(&camera_id).await;
 
         let mut payload = json!({
             "camera_id": camera_id,
             "timestamp": Utc::now().to_rfc3339(),
+            "onvif_probe": onvif_summary.as_json(),
         });
         if let Some(firmware_payload) = firmware.as_json() {
             payload["firmware"] = firmware_payload;
@@ -691,6 +1110,7 @@ pub async fn run_agent_heartbeat_poster(
     config: ServerConfig,
     agent_id: String,
     cameras: Arc<RwLock<Vec<CameraHeartbeatTarget>>>,
+    onvif_probe: OnvifProbeManager,
 ) -> Result<()> {
     info!(
         server_url = %config.base_url,
@@ -708,16 +1128,19 @@ pub async fn run_agent_heartbeat_poster(
         sleep(heartbeat_interval).await;
         let mut firmware = baseline_firmware_state();
         maybe_process_firmware_job(&client, &config, &mut firmware).await;
+        onvif_probe.poll_for_jobs(&client, &config).await;
 
         let camera_snapshot = cameras.read().await.clone();
         let mut camera_status = Vec::new();
         for cam in camera_snapshot {
             let (ok, latency_ms, error) = check_rtsp_reachability(&cam.rtsp_url).await;
+            let onvif_summary = onvif_probe.summary_for(&cam.camera_id).await;
             camera_status.push(json!({
                 "camera_id": cam.camera_id,
                 "rtsp_ok": ok,
                 "rtsp_latency_ms": latency_ms,
                 "rtsp_error": error,
+                "onvif_probe": onvif_summary.as_json(),
             }));
         }
 
@@ -1104,7 +1527,10 @@ fn first_bool(value: &Value, keys: &[&str]) -> Option<bool> {
 
 #[cfg(test)]
 mod tests {
-    use super::{baseline_firmware_state_from_paths, normalize_config_update};
+    use super::{
+        baseline_firmware_state_from_paths, normalize_config_update, try_fallback_paths,
+        FallbackOutcome, OnvifProbeJobCommand, OnvifProbeJobResponse, OnvifProbeManager,
+    };
     use serde_json::json;
     use std::fs;
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -1230,5 +1656,107 @@ mod tests {
         assert!(state.as_json().is_none());
 
         fs::remove_dir_all(&dir).expect("cleanup");
+    }
+
+    #[tokio::test]
+    async fn fetch_onvif_probe_job_falls_back_to_versioned_endpoint() {
+        let payload = try_fallback_paths(
+            &["/api/agent/onvif/job", "/api/v1/agent/onvif/job"],
+            |path| {
+                let path = path.to_string();
+                async move {
+                    if path == "/api/agent/onvif/job" {
+                        Ok(FallbackOutcome::NotFound)
+                    } else {
+                        Ok(FallbackOutcome::Success(OnvifProbeJobResponse {
+                            job: Some(OnvifProbeJobCommand {
+                                job_id: 42,
+                                action: "probe".to_string(),
+                                camera_id: "cam-1".to_string(),
+                            }),
+                        }))
+                    }
+                }
+            },
+        )
+        .await
+        .expect("fallback request")
+        .expect("payload exists");
+        let job = payload.job.expect("job exists");
+
+        assert_eq!(job.job_id, 42);
+        assert_eq!(job.action, "probe");
+        assert_eq!(job.camera_id, "cam-1");
+    }
+
+    #[tokio::test]
+    async fn post_onvif_probe_report_falls_back_to_versioned_endpoint() {
+        let attempts = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let attempts_for_closure = attempts.clone();
+        let posted = try_fallback_paths(
+            &["/api/agent/onvif/report", "/api/v1/agent/onvif/report"],
+            move |path| {
+                let attempts = attempts_for_closure.clone();
+                let path = path.to_string();
+                async move {
+                    attempts.lock().expect("attempt log").push(path.clone());
+                    if path == "/api/agent/onvif/report" {
+                        Ok(FallbackOutcome::NotFound)
+                    } else {
+                        Ok(FallbackOutcome::Success(()))
+                    }
+                }
+            },
+        )
+        .await
+        .expect("fallback post");
+        assert!(posted.is_some());
+
+        let attempts = attempts.lock().expect("attempt log");
+        assert_eq!(
+            *attempts,
+            vec![
+                "/api/agent/onvif/report".to_string(),
+                "/api/v1/agent/onvif/report".to_string(),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn onvif_probe_manager_tracks_summary_transitions() {
+        let manager = OnvifProbeManager::new(vec!["cam-1".to_string()], Vec::new(), None);
+
+        let initial = manager.summary_for("cam-1").await;
+        assert_eq!(initial.status, "never_run");
+        assert!(initial.started_at.is_none());
+
+        manager
+            .set_running("cam-1", 7, "2026-03-21T10:00:00Z".to_string())
+            .await;
+        let running = manager.summary_for("cam-1").await;
+        assert_eq!(running.job_id, Some(7));
+        assert_eq!(running.status, "running");
+        assert_eq!(running.started_at.as_deref(), Some("2026-03-21T10:00:00Z"));
+        assert!(running.finished_at.is_none());
+
+        manager
+            .set_finished(
+                "cam-1",
+                7,
+                "succeeded".to_string(),
+                None,
+                "2026-03-21T10:00:00Z".to_string(),
+                "2026-03-21T10:00:02Z".to_string(),
+            )
+            .await;
+        manager.mark_reported("cam-1").await;
+
+        let finished = manager.summary_for("cam-1").await;
+        assert_eq!(finished.status, "succeeded");
+        assert_eq!(
+            finished.finished_at.as_deref(),
+            Some("2026-03-21T10:00:02Z")
+        );
+        assert!(finished.last_reported_at.is_some());
     }
 }

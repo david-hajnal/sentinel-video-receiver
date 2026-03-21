@@ -6,9 +6,10 @@ use tracing::{error, info, warn};
 use std::path::PathBuf;
 
 use sentinel_rtp_cam::{
-    run_clip_meta_poster, run_disk_cleanup, run_heartbeat_poster, run_motion_event_poster,
-    run_onvif_motion_poller, run_sse_config_listener, run_udp_receiver, AgentConfig, ClipRecorder,
-    ClipRecorderConfig, DiskCleanupConfig, Event, EventBus, MotionStateBus, UdpReceiverConfig,
+    load_onvif_probe_cameras_from_env, run_clip_meta_poster, run_disk_cleanup,
+    run_heartbeat_poster, run_motion_event_poster, run_onvif_motion_poller,
+    run_sse_config_listener, run_udp_receiver, AgentConfig, ClipRecorder, ClipRecorderConfig,
+    DiskCleanupConfig, Event, EventBus, MotionStateBus, OnvifProbeManager, UdpReceiverConfig,
     VideoNal,
 };
 
@@ -140,6 +141,21 @@ async fn main() -> Result<()> {
         server_enabled = agent_config.server.enabled,
         "Agent configuration loaded"
     );
+    let onvif_probe_cameras = match load_onvif_probe_cameras_from_env() {
+        Ok(cameras) => cameras,
+        Err(error) => {
+            warn!(
+                error = %error,
+                "Failed to load ONVIF probe camera config; capability probes disabled"
+            );
+            Vec::new()
+        }
+    };
+    let onvif_probe = OnvifProbeManager::new(
+        vec![agent_config.camera_id.clone()],
+        onvif_probe_cameras,
+        None,
+    );
 
     let cancel = CancellationToken::new();
 
@@ -187,7 +203,10 @@ async fn main() -> Result<()> {
                     .and_then(|v| v.parse().ok())
                     .unwrap_or(3),
             ),
-            min_clip_duration: std::time::Duration::from_secs(runtime_u64("CLIP_MIN_DURATION_SECS", 5)),
+            min_clip_duration: std::time::Duration::from_secs(runtime_u64(
+                "CLIP_MIN_DURATION_SECS",
+                5,
+            )),
             flush_interval: std::time::Duration::from_secs(runtime_u64("CLIP_FLUSH_SECS", 1)),
             stale_part_max_age: std::time::Duration::from_secs(runtime_u64(
                 "CLIP_STALE_PART_SECS",
@@ -347,8 +366,9 @@ async fn main() -> Result<()> {
         // Heartbeat poster
         let camera_id = agent_config.camera_id.clone();
         let server_cfg_clone = server_cfg.clone();
+        let onvif_probe = onvif_probe.clone();
         tokio::spawn(async move {
-            if let Err(e) = run_heartbeat_poster(server_cfg_clone, camera_id).await {
+            if let Err(e) = run_heartbeat_poster(server_cfg_clone, camera_id, onvif_probe).await {
                 error!(error = %e, "Heartbeat poster error");
             }
         });

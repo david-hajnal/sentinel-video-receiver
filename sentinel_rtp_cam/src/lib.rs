@@ -85,7 +85,10 @@ pub use core::{ClipMeta, ClipRecorder, ClipRecorderConfig, VideoNal};
 pub use rtsp::{run_udp_receiver, UdpReceiverConfig};
 
 // ONVIF
-pub use onvif::run_onvif_motion_poller;
+pub use onvif::{
+    load_onvif_probe_cameras_from_env, run_onvif_capability_probe, run_onvif_motion_poller,
+    OnvifProbeCameraConfig, OnvifProbeReport,
+};
 
 // Events
 pub use event::{Event, EventBus, MotionEvent, MotionMetadata, MotionState, MotionStateBus};
@@ -93,7 +96,8 @@ pub use event::{Event, EventBus, MotionEvent, MotionMetadata, MotionState, Motio
 // Server
 pub use server::{
     retry_forever, run_agent_heartbeat_poster, run_clip_meta_poster, run_heartbeat_poster,
-    run_motion_event_poster, run_sse_config_listener, CameraHeartbeatTarget,
+    run_motion_event_poster, run_sse_config_listener, CameraHeartbeatTarget, OnvifProbeManager,
+    OnvifProbeSummary,
 };
 
 // Utils
