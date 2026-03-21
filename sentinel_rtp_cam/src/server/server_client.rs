@@ -20,6 +20,7 @@ use crate::onvif::{run_onvif_capability_probe, OnvifProbeCameraConfig};
 
 const FIRMWARE_VERSION_PATH: &str = "/etc/sentinel_rtp_cam/firmware-version";
 const FIRMWARE_BACKUP_BINARY_PATH: &str = "/usr/local/bin/sentinel_rtp_cam.prev";
+const DEFAULT_FIRMWARE_UPDATER_CMD: &str = "/usr/local/bin/sentinel-firmware-update";
 
 #[derive(Debug, Deserialize, Clone)]
 struct FirmwareJobCommand {
@@ -474,9 +475,31 @@ async fn fetch_firmware_job_command(
     Ok(None)
 }
 
+fn pick_firmware_updater_cmd(
+    runtime_override: Option<String>,
+    env_override: Option<String>,
+) -> String {
+    runtime_override
+        .filter(|value| !value.trim().is_empty())
+        .or_else(|| env_override.filter(|value| !value.trim().is_empty()))
+        .unwrap_or_else(|| DEFAULT_FIRMWARE_UPDATER_CMD.to_string())
+}
+
+fn firmware_updater_cmd() -> String {
+    pick_firmware_updater_cmd(
+        AgentConfig::runtime_var("FIRMWARE_UPDATER_CMD"),
+        std::env::var("FIRMWARE_UPDATER_CMD").ok(),
+    )
+}
+
 async fn execute_firmware_job(job: &FirmwareJobCommand) -> Result<()> {
-    let updater_cmd = AgentConfig::runtime_var("FIRMWARE_UPDATER_CMD")
-        .unwrap_or_else(|| "/usr/local/bin/sentinel-firmware-update".to_string());
+    let updater_cmd = firmware_updater_cmd();
+    if updater_cmd.contains(std::path::MAIN_SEPARATOR) && !Path::new(&updater_cmd).exists() {
+        return Err(anyhow::anyhow!(
+            "Firmware updater not found at {updater_cmd}; set FIRMWARE_UPDATER_CMD to the \
+             installed updater path"
+        ));
+    }
     let mut cmd = Command::new(&updater_cmd);
 
     match job.action.as_str() {
@@ -503,7 +526,8 @@ async fn execute_firmware_job(job: &FirmwareJobCommand) -> Result<()> {
 
     let output = timeout(Duration::from_secs(120), cmd.output())
         .await
-        .map_err(|_| anyhow::anyhow!("Firmware updater timed out after 120 seconds"))??;
+        .map_err(|_| anyhow::anyhow!("Firmware updater timed out after 120 seconds"))?
+        .map_err(|e| anyhow::anyhow!("Failed to execute firmware updater {updater_cmd}: {e}"))?;
 
     if output.status.success() {
         return Ok(());
@@ -1528,8 +1552,9 @@ fn first_bool(value: &Value, keys: &[&str]) -> Option<bool> {
 #[cfg(test)]
 mod tests {
     use super::{
-        baseline_firmware_state_from_paths, normalize_config_update, try_fallback_paths,
-        FallbackOutcome, OnvifProbeJobCommand, OnvifProbeJobResponse, OnvifProbeManager,
+        baseline_firmware_state_from_paths, normalize_config_update, pick_firmware_updater_cmd,
+        try_fallback_paths, FallbackOutcome, OnvifProbeJobCommand, OnvifProbeJobResponse,
+        OnvifProbeManager, DEFAULT_FIRMWARE_UPDATER_CMD,
     };
     use serde_json::json;
     use std::fs;
@@ -1656,6 +1681,25 @@ mod tests {
         assert!(state.as_json().is_none());
 
         fs::remove_dir_all(&dir).expect("cleanup");
+    }
+
+    #[test]
+    fn firmware_updater_command_prefers_runtime_then_env_then_default() {
+        assert_eq!(
+            pick_firmware_updater_cmd(
+                Some("/runtime/updater".to_string()),
+                Some("/env/updater".to_string()),
+            ),
+            "/runtime/updater"
+        );
+        assert_eq!(
+            pick_firmware_updater_cmd(Some("   ".to_string()), Some("/env/updater".to_string())),
+            "/env/updater"
+        );
+        assert_eq!(
+            pick_firmware_updater_cmd(None, Some("   ".to_string())),
+            DEFAULT_FIRMWARE_UPDATER_CMD
+        );
     }
 
     #[tokio::test]
