@@ -63,6 +63,11 @@ struct FirmwareHeartbeatState {
     finished_at: Option<String>,
 }
 
+#[derive(Debug, Default)]
+struct FirmwareJobMemory {
+    last_terminal_state: Option<FirmwareHeartbeatState>,
+}
+
 #[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TelemetryStatus {
@@ -481,6 +486,10 @@ impl OnvifProbeManager {
 }
 
 impl FirmwareHeartbeatState {
+    fn is_terminal(&self) -> bool {
+        is_terminal_firmware_status(self.status.as_deref())
+    }
+
     fn as_json(&self) -> Option<Value> {
         if self.job_id.is_none()
             && self.current_version.is_none()
@@ -504,6 +513,30 @@ impl FirmwareHeartbeatState {
             "started_at": self.started_at,
             "finished_at": self.finished_at,
         }))
+    }
+}
+
+impl FirmwareJobMemory {
+    fn duplicate_terminal_state(
+        &self,
+        job_id: i64,
+        current_version: Option<String>,
+        can_rollback: bool,
+    ) -> Option<FirmwareHeartbeatState> {
+        let mut state = self.last_terminal_state.clone()?;
+        if state.job_id != Some(job_id) || !state.is_terminal() {
+            return None;
+        }
+
+        state.current_version = current_version.or(state.current_version.clone());
+        state.can_rollback = Some(can_rollback);
+        Some(state)
+    }
+
+    fn remember_terminal_state(&mut self, state: &FirmwareHeartbeatState) {
+        if state.is_terminal() {
+            self.last_terminal_state = Some(state.clone());
+        }
     }
 }
 
@@ -739,6 +772,31 @@ fn pending_firmware_status(job: &FirmwareJobCommand) -> &'static str {
     }
 }
 
+fn is_terminal_firmware_status(status: Option<&str>) -> bool {
+    matches!(
+        status,
+        Some("succeeded" | "failed" | "rollback_succeeded" | "rollback_failed")
+    )
+}
+
+fn normalize_firmware_version(value: &str) -> Option<String> {
+    let normalized = value.trim().trim_start_matches('v').trim();
+    if normalized.is_empty() {
+        None
+    } else {
+        Some(normalized.to_string())
+    }
+}
+
+fn firmware_versions_match(installed_version: Option<&str>, target_version: Option<&str>) -> bool {
+    match (installed_version, target_version) {
+        (Some(installed), Some(target)) => {
+            normalize_firmware_version(installed) == normalize_firmware_version(target)
+        }
+        _ => false,
+    }
+}
+
 fn running_firmware_status(job: &FirmwareJobCommand) -> &'static str {
     if job.action == "rollback" {
         "rollback_running"
@@ -847,6 +905,7 @@ async fn maybe_process_firmware_job<R, Fut>(
     client: &reqwest::Client,
     config: &ServerConfig,
     state: &mut FirmwareHeartbeatState,
+    memory: &mut FirmwareJobMemory,
     mut report: R,
 ) where
     R: FnMut(FirmwareHeartbeatState) -> Fut,
@@ -863,6 +922,49 @@ async fn maybe_process_firmware_job<R, Fut>(
     let Some(job) = job else {
         return;
     };
+
+    let installed_version = read_installed_firmware_version();
+    let can_rollback = Path::new(FIRMWARE_BACKUP_BINARY_PATH).exists();
+
+    if let Some(terminal_state) =
+        memory.duplicate_terminal_state(job.job_id, installed_version.clone(), can_rollback)
+    {
+        *state = terminal_state.clone();
+        info!(
+            job_id = job.job_id,
+            action = %job.action,
+            target_version = ?job.target_version,
+            status = ?state.status,
+            "Skipping duplicate firmware job that already reached a terminal state"
+        );
+        report(state.clone()).await;
+        return;
+    }
+
+    if job.action == "update"
+        && firmware_versions_match(installed_version.as_deref(), job.target_version.as_deref())
+    {
+        let now = Utc::now().to_rfc3339();
+        state.job_id = Some(job.job_id);
+        state.current_version = installed_version.or(job.target_version.clone());
+        state.target_version = job.target_version.clone();
+        state.status = Some("succeeded".to_string());
+        state.error = None;
+        state.can_rollback = Some(can_rollback);
+        state.started_at = Some(now.clone());
+        state.finished_at = Some(now);
+        memory.remember_terminal_state(state);
+        info!(
+            job_id = job.job_id,
+            action = %job.action,
+            target_version = ?job.target_version,
+            start_after_update = job.start_after_update,
+            current_version = ?state.current_version,
+            "Skipping firmware update because target version is already installed"
+        );
+        report(state.clone()).await;
+        return;
+    }
 
     state.job_id = Some(job.job_id);
     state.target_version = job.target_version.clone();
@@ -884,6 +986,7 @@ async fn maybe_process_firmware_job<R, Fut>(
         job_id = job.job_id,
         action = %job.action,
         target_version = ?job.target_version,
+        start_after_update = job.start_after_update,
         "Executing firmware job"
     );
 
@@ -910,6 +1013,7 @@ async fn maybe_process_firmware_job<R, Fut>(
             } else {
                 state.can_rollback = Some(false);
             }
+            memory.remember_terminal_state(state);
             info!(job_id = job.job_id, status, "Firmware job completed");
             report(state.clone()).await;
         }
@@ -923,6 +1027,7 @@ async fn maybe_process_firmware_job<R, Fut>(
             state.error = Some(e.to_string());
             state.finished_at = Some(Utc::now().to_rfc3339());
             state.current_version = read_installed_firmware_version();
+            memory.remember_terminal_state(state);
             warn!(job_id = job.job_id, status, error = %e, "Firmware job failed");
             report(state.clone()).await;
         }
@@ -1370,32 +1475,39 @@ pub async fn run_heartbeat_poster(
 
     let heartbeat_interval = Duration::from_secs(30);
     let mut telemetry_sampler = TelemetrySampler::new();
+    let mut firmware_job_memory = FirmwareJobMemory::default();
     loop {
         sleep(heartbeat_interval).await;
         onvif_probe.poll_for_jobs(&client, &config).await;
         let onvif_summary = onvif_probe.summary_for(&camera_id).await;
         let telemetry = telemetry_sampler.sample(TelemetryStatus::Operational);
         let mut firmware = baseline_firmware_state();
-        maybe_process_firmware_job(&client, &config, &mut firmware, |firmware_state| {
-            let client = client.clone();
-            let config = config.clone();
-            let camera_id = camera_id.clone();
-            let onvif_summary = onvif_summary.clone();
-            let telemetry = telemetry.clone();
-            async move {
-                let timestamp = Utc::now().to_rfc3339();
-                let payload = build_camera_heartbeat_payload(
-                    &camera_id,
-                    &timestamp,
-                    &onvif_summary,
-                    &telemetry,
-                    &firmware_state,
-                );
-                if let Err(error) = post_heartbeat(&client, &config, &payload).await {
-                    warn!(error = %error, "Failed to post firmware heartbeat update");
+        maybe_process_firmware_job(
+            &client,
+            &config,
+            &mut firmware,
+            &mut firmware_job_memory,
+            |firmware_state| {
+                let client = client.clone();
+                let config = config.clone();
+                let camera_id = camera_id.clone();
+                let onvif_summary = onvif_summary.clone();
+                let telemetry = telemetry.clone();
+                async move {
+                    let timestamp = Utc::now().to_rfc3339();
+                    let payload = build_camera_heartbeat_payload(
+                        &camera_id,
+                        &timestamp,
+                        &onvif_summary,
+                        &telemetry,
+                        &firmware_state,
+                    );
+                    if let Err(error) = post_heartbeat(&client, &config, &payload).await {
+                        warn!(error = %error, "Failed to post firmware heartbeat update");
+                    }
                 }
-            }
-        })
+            },
+        )
         .await;
 
         let timestamp = Utc::now().to_rfc3339();
@@ -1471,6 +1583,7 @@ pub async fn run_agent_heartbeat_poster(
 
     let heartbeat_interval = Duration::from_secs(30);
     let mut telemetry_sampler = TelemetrySampler::new();
+    let mut firmware_job_memory = FirmwareJobMemory::default();
     loop {
         sleep(heartbeat_interval).await;
         onvif_probe.poll_for_jobs(&client, &config).await;
@@ -1498,26 +1611,32 @@ pub async fn run_agent_heartbeat_poster(
             TelemetryStatus::Operational
         });
         let mut firmware = baseline_firmware_state();
-        maybe_process_firmware_job(&client, &config, &mut firmware, |firmware_state| {
-            let client = client.clone();
-            let config = config.clone();
-            let agent_id = agent_id.clone();
-            let telemetry = telemetry.clone();
-            let camera_status = camera_status.clone();
-            async move {
-                let timestamp = Utc::now().to_rfc3339();
-                let payload = build_agent_heartbeat_payload(
-                    &agent_id,
-                    &timestamp,
-                    camera_status,
-                    &telemetry,
-                    &firmware_state,
-                );
-                if let Err(error) = post_heartbeat(&client, &config, &payload).await {
-                    warn!(error = %error, "Failed to post firmware heartbeat update");
+        maybe_process_firmware_job(
+            &client,
+            &config,
+            &mut firmware,
+            &mut firmware_job_memory,
+            |firmware_state| {
+                let client = client.clone();
+                let config = config.clone();
+                let agent_id = agent_id.clone();
+                let telemetry = telemetry.clone();
+                let camera_status = camera_status.clone();
+                async move {
+                    let timestamp = Utc::now().to_rfc3339();
+                    let payload = build_agent_heartbeat_payload(
+                        &agent_id,
+                        &timestamp,
+                        camera_status,
+                        &telemetry,
+                        &firmware_state,
+                    );
+                    if let Err(error) = post_heartbeat(&client, &config, &payload).await {
+                        warn!(error = %error, "Failed to post firmware heartbeat update");
+                    }
                 }
-            }
-        })
+            },
+        )
         .await;
 
         let timestamp = Utc::now().to_rfc3339();
@@ -1895,10 +2014,11 @@ fn first_bool(value: &Value, keys: &[&str]) -> Option<bool> {
 mod tests {
     use super::{
         baseline_firmware_state_from_paths, build_agent_heartbeat_payload,
-        build_heartbeat_telemetry, build_idle_firmware_state, normalize_config_update,
-        pick_firmware_updater_cmd, pick_installed_firmware_version, try_fallback_paths,
-        FallbackOutcome, MemoryUsageMb, OnvifProbeJobCommand, OnvifProbeJobResponse,
-        OnvifProbeManager, TelemetryCapabilities, TelemetryStatus, DEFAULT_FIRMWARE_UPDATER_CMD,
+        build_heartbeat_telemetry, build_idle_firmware_state, firmware_versions_match,
+        normalize_config_update, pick_firmware_updater_cmd, pick_installed_firmware_version,
+        try_fallback_paths, FallbackOutcome, FirmwareJobMemory, MemoryUsageMb,
+        OnvifProbeJobCommand, OnvifProbeJobResponse, OnvifProbeManager, TelemetryCapabilities,
+        TelemetryStatus, DEFAULT_FIRMWARE_UPDATER_CMD,
     };
     use serde_json::{json, Value};
     use std::fs;
@@ -2048,6 +2168,50 @@ mod tests {
         assert_eq!(second.status.as_deref(), Some("idle"));
 
         fs::remove_dir_all(&dir).expect("cleanup");
+    }
+
+    #[test]
+    fn firmware_job_memory_reuses_terminal_state_for_same_job_id() {
+        let mut memory = FirmwareJobMemory::default();
+        let mut state = build_idle_firmware_state(Some("1.1.2".to_string()), true);
+        state.job_id = Some(7);
+        state.target_version = Some("1.1.3".to_string());
+        state.status = Some("succeeded".to_string());
+        state.finished_at = Some("2026-03-22T14:58:16Z".to_string());
+
+        memory.remember_terminal_state(&state);
+
+        let duplicate = memory
+            .duplicate_terminal_state(7, Some("1.1.3".to_string()), true)
+            .expect("duplicate terminal state");
+
+        assert_eq!(duplicate.job_id, Some(7));
+        assert_eq!(duplicate.target_version.as_deref(), Some("1.1.3"));
+        assert_eq!(duplicate.status.as_deref(), Some("succeeded"));
+        assert_eq!(duplicate.current_version.as_deref(), Some("1.1.3"));
+        assert_eq!(duplicate.can_rollback, Some(true));
+    }
+
+    #[test]
+    fn firmware_job_memory_ignores_non_terminal_state() {
+        let mut memory = FirmwareJobMemory::default();
+        let mut state = build_idle_firmware_state(Some("1.1.2".to_string()), false);
+        state.job_id = Some(7);
+        state.target_version = Some("1.1.3".to_string());
+        state.status = Some("installing".to_string());
+
+        memory.remember_terminal_state(&state);
+
+        assert!(memory.duplicate_terminal_state(7, None, false).is_none());
+    }
+
+    #[test]
+    fn firmware_version_match_normalizes_optional_v_prefix() {
+        assert!(firmware_versions_match(Some("1.1.3"), Some("1.1.3")));
+        assert!(firmware_versions_match(Some("1.1.3"), Some("v1.1.3")));
+        assert!(firmware_versions_match(Some(" v1.1.3 "), Some("1.1.3")));
+        assert!(!firmware_versions_match(Some("1.1.2"), Some("1.1.3")));
+        assert!(!firmware_versions_match(Some("1.1.3"), None));
     }
 
     #[test]
