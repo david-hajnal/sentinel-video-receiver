@@ -54,15 +54,19 @@ impl EventBus {
     }
 
     pub async fn publish(&self, ev: Event) {
-        let mut guard = self.inner.lock().await;
+        let subscribers = {
+            let mut guard = self.inner.lock().await;
 
-        // Fan-out; drop subscribers that are closed.
-        guard.retain(|tx| !tx.is_closed());
+            // Fan-out only to live subscribers.
+            guard.retain(|tx| !tx.is_closed());
+            guard.clone()
+        };
 
-        for tx in guard.iter() {
-            // non-blocking: if subscriber queue is full, we drop the event for that subscriber
-            let _ = tx.try_send(ev.clone());
+        for tx in subscribers {
+            let _ = tx.send(ev.clone()).await;
         }
+
+        self.inner.lock().await.retain(|tx| !tx.is_closed());
     }
 }
 
@@ -133,5 +137,104 @@ impl MotionStateBus {
     /// Get current snapshot of motion state
     pub fn current(&self) -> MotionState {
         self.tx.borrow().clone()
+    }
+
+    /// Clear active motion state for a specific camera.
+    pub fn clear_camera(&self, camera_id: &str) {
+        self.tx.send_if_modified(|state| {
+            let before = state.len();
+            state.retain(|_, metadata| metadata.camera_id != camera_id);
+            state.len() != before
+        });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Event, EventBus, MotionEvent, MotionMetadata, MotionStateBus};
+    use chrono::Utc;
+    use tokio::time::{timeout, Duration};
+
+    #[tokio::test]
+    async fn publish_waits_instead_of_dropping_when_queue_is_full() {
+        let bus = EventBus::new(1);
+        let mut rx = bus.subscribe().await;
+
+        bus.publish(Event::Motion(MotionEvent {
+            rule: "rule-1".to_string(),
+            active: true,
+            ts: Utc::now(),
+            camera_id: "cam-1".to_string(),
+            event_id: "evt-1".to_string(),
+        }))
+        .await;
+
+        let bus_clone = bus.clone();
+        let publish_task = tokio::spawn(async move {
+            bus_clone
+                .publish(Event::Motion(MotionEvent {
+                    rule: "rule-1".to_string(),
+                    active: false,
+                    ts: Utc::now(),
+                    camera_id: "cam-1".to_string(),
+                    event_id: "evt-1".to_string(),
+                }))
+                .await;
+        });
+
+        tokio::task::yield_now().await;
+        assert!(!publish_task.is_finished());
+
+        let first_recv = timeout(Duration::from_secs(1), rx.recv())
+            .await
+            .expect("first recv should complete")
+            .expect("first event should exist");
+        let Event::Motion(first_motion) = first_recv;
+        assert!(first_motion.active);
+
+        timeout(Duration::from_secs(1), publish_task)
+            .await
+            .expect("publish task should unblock")
+            .expect("publish task should succeed");
+
+        let second_recv = timeout(Duration::from_secs(1), rx.recv())
+            .await
+            .expect("second recv should complete")
+            .expect("second event should exist");
+        let Event::Motion(second_motion) = second_recv;
+        assert!(!second_motion.active);
+    }
+
+    #[test]
+    fn clear_camera_removes_only_matching_motion_state() {
+        let (bus, _rx) = MotionStateBus::new();
+
+        bus.set(
+            "rule-1".to_string(),
+            true,
+            Some(MotionMetadata {
+                camera_id: "cam-1".to_string(),
+                event_id: "evt-1".to_string(),
+            }),
+        );
+        bus.set(
+            "rule-2".to_string(),
+            true,
+            Some(MotionMetadata {
+                camera_id: "cam-2".to_string(),
+                event_id: "evt-2".to_string(),
+            }),
+        );
+
+        bus.clear_camera("cam-1");
+
+        let state = bus.current();
+        assert!(!state.contains_key("rule-1"));
+        assert_eq!(
+            state
+                .get("rule-2")
+                .map(|metadata| metadata.camera_id.as_str()),
+            Some("cam-2")
+        );
     }
 }

@@ -23,7 +23,8 @@ use crate::proto::{Msg, GAP, MOTION, RTP};
 
 #[derive(Clone)]
 pub struct Uplink {
-    tx: mpsc::Sender<Msg>,
+    media_tx: mpsc::Sender<Msg>,
+    motion_tx: mpsc::UnboundedSender<Msg>,
     stats: Arc<UplinkStats>,
 }
 
@@ -110,7 +111,8 @@ impl Uplink {
         stream_camera_map: HashMap<u32, String>,
         stream_ingest: Option<HelloIngestConfig>,
     ) -> Self {
-        let (tx, mut rx) = mpsc::channel::<Msg>(4096);
+        let (media_tx, mut media_rx) = mpsc::channel::<Msg>(4096);
+        let (motion_tx, mut motion_rx) = mpsc::unbounded_channel::<Msg>();
         let stats = Arc::new(UplinkStats::default());
 
         let stats_task = stats.clone();
@@ -186,8 +188,8 @@ impl Uplink {
 
                         let hello_timeout_secs =
                             AgentConfig::runtime_var("INGEST_TLS_HELLO_TIMEOUT_SECS")
-                            .and_then(|v| v.parse::<u64>().ok())
-                            .unwrap_or(10);
+                                .and_then(|v| v.parse::<u64>().ok())
+                                .unwrap_or(10);
                         let hello_ok = match tokio::time::timeout(
                             Duration::from_secs(hello_timeout_secs),
                             read_record(&mut read_half),
@@ -261,6 +263,7 @@ impl Uplink {
                         let mut last_dropped = 0u64;
                         loop {
                             tokio::select! {
+                                biased;
                                 rec = rec_rx.recv() => {
                                     match rec {
                                         Some(Ok(rec)) => {
@@ -293,7 +296,23 @@ impl Uplink {
                                         }
                                     }
                                 }
-                                Some(msg) = rx.recv() => {
+                                Some(msg) = motion_rx.recv() => {
+                                    let event = build_event_payload(&msg);
+                                    let payload = match serde_json::to_vec(&event) {
+                                        Ok(p) => p,
+                                        Err(e) => {
+                                            error!(error = %e, "Failed to serialize MOTION");
+                                            continue;
+                                        }
+                                    };
+                                    if let Err(e) = write_record(&mut write_half, RECORD_EVENT, 0, &payload).await {
+                                        error!(error = %e, "Uplink write failed, reconnecting");
+                                        break;
+                                    }
+                                    sent += 1;
+                                    stats_task.motion_sent.fetch_add(1, Ordering::Relaxed);
+                                }
+                                Some(msg) = media_rx.recv() => {
                                     match msg.msg_type {
                                         RTP => {
                                             if let Err(e) = write_record(&mut write_half, RECORD_RTP, 0, &msg.payload).await {
@@ -302,22 +321,6 @@ impl Uplink {
                                             }
                                             sent += 1;
                                             stats_task.rtp_sent.fetch_add(1, Ordering::Relaxed);
-                                        }
-                                        MOTION => {
-                                            let event = build_event_payload(&msg);
-                                            let payload = match serde_json::to_vec(&event) {
-                                                Ok(p) => p,
-                                                Err(e) => {
-                                                    error!(error = %e, "Failed to serialize MOTION");
-                                                    continue;
-                                                }
-                                            };
-                                            if let Err(e) = write_record(&mut write_half, RECORD_EVENT, 0, &payload).await {
-                                                error!(error = %e, "Uplink write failed, reconnecting");
-                                                break;
-                                            }
-                                            sent += 1;
-                                            stats_task.motion_sent.fetch_add(1, Ordering::Relaxed);
                                         }
                                         GAP => {
                                             if let Err(e) = write_record(&mut write_half, RECORD_GAP, 0, &msg.payload).await {
@@ -377,7 +380,11 @@ impl Uplink {
             }
         });
 
-        Self { tx, stats }
+        Self {
+            media_tx,
+            motion_tx,
+            stats,
+        }
     }
 
     pub fn send_rtp(&self, stream_id: u32, rtp_bytes: Vec<u8>) {
@@ -386,7 +393,7 @@ impl Uplink {
             stream_id,
             payload: rtp_bytes,
         };
-        if let Err(e) = self.tx.try_send(msg) {
+        if let Err(e) = self.media_tx.try_send(msg) {
             let dropped = self.stats.dropped.fetch_add(1, Ordering::Relaxed) + 1;
             if dropped <= 3 || dropped % 100 == 0 {
                 warn!(
@@ -405,7 +412,7 @@ impl Uplink {
             stream_id,
             payload: encode_gap_tls(stream_id, last_seq, new_seq),
         };
-        if let Err(e) = self.tx.try_send(msg) {
+        if let Err(e) = self.media_tx.try_send(msg) {
             let dropped = self.stats.dropped.fetch_add(1, Ordering::Relaxed) + 1;
             if dropped <= 3 || dropped % 100 == 0 {
                 warn!(
@@ -439,16 +446,12 @@ impl Uplink {
             stream_id,
             payload: serde_json::to_vec(&payload).unwrap_or_default(),
         };
-        if let Err(e) = self.tx.try_send(msg) {
-            let dropped = self.stats.dropped.fetch_add(1, Ordering::Relaxed) + 1;
-            if dropped <= 3 || dropped % 20 == 0 {
-                warn!(
-                    stream_id,
-                    dropped_total = dropped,
-                    error = %e,
-                    "Uplink channel full; dropping MOTION"
-                );
-            }
+        if let Err(e) = self.motion_tx.send(msg) {
+            warn!(
+                stream_id,
+                error = %e,
+                "Uplink motion channel closed; dropping MOTION"
+            );
         }
     }
 }

@@ -31,6 +31,9 @@ const DEFAULT_PULL_TIMEOUT: &str = "PT30S";
 const DEFAULT_PULL_LIMIT: u32 = 10;
 const DEFAULT_RESUBSCRIBE_AFTER_ERRORS: u32 = 3;
 const DEFAULT_MIN_POLL_GAP_MS: u64 = 800;
+const DEFAULT_AFTER_SUB_DELAY_MS: u64 = 300;
+const DEFAULT_CONNREFUSED_RETRIES: u32 = 1;
+const DEFAULT_CONNREFUSED_BACKOFF_MS: u64 = 250;
 
 // ---------- tiny env helpers ----------
 fn env_bool(key: &str) -> bool {
@@ -56,6 +59,9 @@ struct OnvifSettings {
     pull_limit: u32,
     resub_after: u32,
     min_poll_gap: Duration,
+    after_sub_delay: Duration,
+    connrefused_retries: u32,
+    connrefused_backoff: Duration,
 }
 
 #[derive(Clone)]
@@ -97,6 +103,19 @@ fn log_debug(msg: impl AsRef<str>) {
     if debug_enabled() {
         debug!("{}", msg.as_ref());
     }
+}
+
+fn is_connectish_error(error: &anyhow::Error) -> bool {
+    if let Some(reqwest_error) = error.downcast_ref::<reqwest::Error>() {
+        if reqwest_error.is_connect() {
+            return true;
+        }
+    }
+
+    let message = error.to_string();
+    message.contains("Connection refused")
+        || message.contains("os error 61")
+        || message.contains("os error 111")
 }
 
 // ---------- WSSE ----------
@@ -424,6 +443,71 @@ async fn renew_subscription(
     Ok(())
 }
 
+async fn create_subscription_with_retry(
+    client: &reqwest::Client,
+    onvif_service: &str,
+    cam: &OnvifCameraConfig,
+    settings: &OnvifSettings,
+    reason: &str,
+) -> Result<(String, Option<String>)> {
+    let mut retries_left = settings.connrefused_retries;
+
+    loop {
+        match create_subscription(
+            client,
+            onvif_service,
+            &cam.user,
+            &cam.pass,
+            &settings.sub_termination,
+        )
+        .await
+        {
+            Ok(subscription) => {
+                if !settings.after_sub_delay.is_zero() {
+                    debug!(
+                        camera_id = %cam.camera_id,
+                        delay_ms = settings.after_sub_delay.as_millis(),
+                        reason,
+                        "Waiting before polling new PullPoint subscription"
+                    );
+                    sleep(settings.after_sub_delay).await;
+                }
+                return Ok(subscription);
+            }
+            Err(error) if is_connectish_error(&error) && retries_left > 0 => {
+                warn!(
+                    error = %error,
+                    camera_id = %cam.camera_id,
+                    backoff_ms = settings.connrefused_backoff.as_millis(),
+                    retries_left,
+                    reason,
+                    "PullPoint subscription failed with connect error; retrying"
+                );
+                retries_left -= 1;
+                sleep(settings.connrefused_backoff).await;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+fn reset_motion_tracking(
+    state: &mut HashMap<String, bool>,
+    event_ids: &mut HashMap<String, String>,
+    motion_state: &MotionStateBus,
+    camera_id: &str,
+) -> (usize, usize, usize) {
+    let tracked_rules = state.len();
+    let active_rules = state.values().filter(|active| **active).count();
+    let tracked_event_ids = event_ids.len();
+
+    state.clear();
+    event_ids.clear();
+    motion_state.clear_camera(camera_id);
+
+    (tracked_rules, active_rules, tracked_event_ids)
+}
+
 // ---------- Public entrypoint used by app.rs ----------
 pub async fn run_onvif_motion_poller(bus: EventBus, motion_state: MotionStateBus) -> Result<()> {
     let cameras = load_onvif_cameras_from_env()?;
@@ -436,7 +520,19 @@ pub async fn run_onvif_motion_poller(bus: EventBus, motion_state: MotionStateBus
             "ONVIF_RESUBSCRIBE_AFTER_ERRORS",
             DEFAULT_RESUBSCRIBE_AFTER_ERRORS,
         ),
-        min_poll_gap: Duration::from_millis(env_u64("ONVIF_MIN_POLL_GAP_MS", DEFAULT_MIN_POLL_GAP_MS)),
+        min_poll_gap: Duration::from_millis(env_u64(
+            "ONVIF_MIN_POLL_GAP_MS",
+            DEFAULT_MIN_POLL_GAP_MS,
+        )),
+        after_sub_delay: Duration::from_millis(env_u64(
+            "ONVIF_AFTER_SUB_DELAY_MS",
+            DEFAULT_AFTER_SUB_DELAY_MS,
+        )),
+        connrefused_retries: env_u32("ONVIF_CONNREFUSED_RETRIES", DEFAULT_CONNREFUSED_RETRIES),
+        connrefused_backoff: Duration::from_millis(env_u64(
+            "ONVIF_CONNREFUSED_BACKOFF_MS",
+            DEFAULT_CONNREFUSED_BACKOFF_MS,
+        )),
     };
 
     let mut handles = Vec::new();
@@ -479,10 +575,8 @@ fn load_onvif_cameras_from_env() -> Result<Vec<OnvifCameraConfig>> {
             .ok_or_else(|| anyhow!("Missing CAM{}_ONVIF_USER", i))?;
         let pass = AgentConfig::runtime_var(&format!("{prefix}PASS"))
             .ok_or_else(|| anyhow!("Missing CAM{}_ONVIF_PASS", i))?;
-        let camera_id =
-            AgentConfig::runtime_var(&format!("CAM{}_CAMERA_ID", i)).unwrap_or_else(|| {
-                format!("cam-{}", i)
-            });
+        let camera_id = AgentConfig::runtime_var(&format!("CAM{}_CAMERA_ID", i))
+            .unwrap_or_else(|| format!("cam-{}", i));
         cams.push(OnvifCameraConfig {
             camera_id,
             host,
@@ -500,8 +594,10 @@ fn load_onvif_cameras_from_env() -> Result<Vec<OnvifCameraConfig>> {
     let port: u16 = AgentConfig::runtime_var("ONVIF_PORT")
         .and_then(|v| v.parse().ok())
         .unwrap_or(2020);
-    let user = AgentConfig::runtime_var("ONVIF_USER").ok_or_else(|| anyhow!("Missing ONVIF_USER"))?;
-    let pass = AgentConfig::runtime_var("ONVIF_PASS").ok_or_else(|| anyhow!("Missing ONVIF_PASS"))?;
+    let user =
+        AgentConfig::runtime_var("ONVIF_USER").ok_or_else(|| anyhow!("Missing ONVIF_USER"))?;
+    let pass =
+        AgentConfig::runtime_var("ONVIF_PASS").ok_or_else(|| anyhow!("Missing ONVIF_PASS"))?;
     let camera_id = AgentConfig::runtime_var("CAMERA_ID")
         .or_else(|| AgentConfig::runtime_var("CAM1_CAMERA_ID"))
         .or_else(|| AgentConfig::runtime_var("ONVIF_HOST"))
@@ -529,8 +625,11 @@ async fn run_onvif_motion_poller_for_camera(
         debug = debug_enabled(),
         dump = dump_enabled(),
         min_poll_gap_ms = settings.min_poll_gap.as_millis(),
+        after_sub_delay_ms = settings.after_sub_delay.as_millis(),
         pull_timeout = %settings.pull_timeout,
         pull_limit = settings.pull_limit,
+        connrefused_retries = settings.connrefused_retries,
+        connrefused_backoff_ms = settings.connrefused_backoff.as_millis(),
         "ONVIF motion poller starting"
     );
 
@@ -553,14 +652,8 @@ async fn run_onvif_motion_poller_for_camera(
     let mut event_ids: HashMap<String, String> = HashMap::new();
 
     // Create subscription
-    let (mut sub_addr, mut sub_id) = create_subscription(
-        &client,
-        &onvif_service,
-        &cam.user,
-        &cam.pass,
-        &settings.sub_termination,
-    )
-    .await?;
+    let (mut sub_addr, mut sub_id) =
+        create_subscription_with_retry(&client, &onvif_service, &cam, &settings, "startup").await?;
 
     info!(
         address = %sub_addr,
@@ -580,7 +673,29 @@ async fn run_onvif_motion_poller_for_camera(
             _ = renew_tick.tick() => {
                 if let Err(e) = renew_subscription(&client, &sub_addr, &sub_id, &cam.user, &cam.pass, &settings.sub_termination).await {
                     warn!(error = %e, camera_id = %cam.camera_id, "Subscription renewal failed, recreating PullPoint");
-                    (sub_addr, sub_id) = create_subscription(&client, &onvif_service, &cam.user, &cam.pass, &settings.sub_termination).await?;
+                    let (tracked_rules, active_rules, tracked_event_ids) = reset_motion_tracking(
+                        &mut state,
+                        &mut event_ids,
+                        &motion_state,
+                        &cam.camera_id,
+                    );
+                    if tracked_rules > 0 || tracked_event_ids > 0 {
+                        warn!(
+                            camera_id = %cam.camera_id,
+                            tracked_rules,
+                            active_rules,
+                            tracked_event_ids,
+                            "Cleared motion tracking state after PullPoint renewal failure"
+                        );
+                    }
+                    (sub_addr, sub_id) = create_subscription_with_retry(
+                        &client,
+                        &onvif_service,
+                        &cam,
+                        &settings,
+                        "renew_failure",
+                    )
+                    .await?;
                     info!(
                         address = %sub_addr,
                         subscription_id = ?sub_id,
@@ -634,8 +749,28 @@ async fn run_onvif_motion_poller_for_camera(
                                 id
                             } else {
                                 // Motion end: reuse existing event_id or generate new one
-                                event_ids.remove(&rule).unwrap_or_else(|| ulid::Ulid::new().to_string())
+                                match event_ids.remove(&rule) {
+                                    Some(id) => id,
+                                    None => {
+                                        let id = ulid::Ulid::new().to_string();
+                                        warn!(
+                                            camera_id = %cam.camera_id,
+                                            rule = %rule,
+                                            event_id = %id,
+                                            "Observed motion end without tracked start"
+                                        );
+                                        id
+                                    }
+                                }
                             };
+
+                            info!(
+                                camera_id = %cam.camera_id,
+                                rule = %rule,
+                                active = is_motion,
+                                event_id = %event_id,
+                                "ONVIF motion edge detected"
+                            );
 
                             // Update motion state (for recorder) with metadata
                             let metadata = if is_motion {
@@ -663,33 +798,39 @@ async fn run_onvif_motion_poller_for_camera(
                         last_pull_done = Some(Instant::now());
 
                         // Classify connect/refused as "subscription endpoint is gone" -> recreate quickly
-                        let mut is_connectish = false;
-                        if let Some(re) = e.downcast_ref::<reqwest::Error>() {
-                            if re.is_connect() {
-                                is_connectish = true;
-                            }
-                        }
-                        let msg = e.to_string();
-                        if msg.contains("Connection refused") || msg.contains("os error 61") {
-                            is_connectish = true;
-                        }
+                        let is_connectish = is_connectish_error(&e);
 
                         consecutive_errors += 1;
                         warn!(
                             error = %e,
+                            camera_id = %cam.camera_id,
                             consecutive = consecutive_errors,
                             threshold = settings.resub_after,
                             "PullMessages error"
                         );
 
                         if is_connectish || consecutive_errors >= settings.resub_after {
-                            warn!("Subscription endpoint dropped, recreating PullPoint");
-                            (sub_addr, sub_id) = create_subscription(
+                            let (tracked_rules, active_rules, tracked_event_ids) =
+                                reset_motion_tracking(
+                                    &mut state,
+                                    &mut event_ids,
+                                    &motion_state,
+                                    &cam.camera_id,
+                                );
+                            warn!(
+                                camera_id = %cam.camera_id,
+                                connectish = is_connectish,
+                                tracked_rules,
+                                active_rules,
+                                tracked_event_ids,
+                                "Subscription endpoint dropped, recreating PullPoint"
+                            );
+                            (sub_addr, sub_id) = create_subscription_with_retry(
                                 &client,
                                 &onvif_service,
-                                &cam.user,
-                                &cam.pass,
-                                &settings.sub_termination,
+                                &cam,
+                                &settings,
+                                "pull_error",
                             )
                             .await?;
                             info!(
@@ -699,8 +840,8 @@ async fn run_onvif_motion_poller_for_camera(
                                 "PullPoint subscription recreated"
                             );
                             consecutive_errors = 0;
-                            // slight backoff to avoid immediate hammering after resubscribe
-                            sleep(Duration::from_millis(300)).await;
+                            // reset pull pacing after subscription continuity is lost
+                            last_pull_done = None;
                         } else {
                             sleep(Duration::from_secs(1)).await;
                         }
@@ -714,11 +855,15 @@ async fn run_onvif_motion_poller_for_camera(
 #[cfg(test)]
 mod tests {
     use super::{
-        debug_enabled, dump_enabled, env_string, env_u32, env_u64, load_onvif_cameras_from_env,
-        DEFAULT_MIN_POLL_GAP_MS, DEFAULT_PULL_LIMIT, DEFAULT_PULL_TIMEOUT,
-        DEFAULT_RENEW_EVERY_SECS, DEFAULT_RESUBSCRIBE_AFTER_ERRORS, DEFAULT_SUB_TERMINATION,
+        debug_enabled, dump_enabled, env_string, env_u32, env_u64, is_connectish_error,
+        load_onvif_cameras_from_env, reset_motion_tracking, DEFAULT_AFTER_SUB_DELAY_MS,
+        DEFAULT_CONNREFUSED_BACKOFF_MS, DEFAULT_CONNREFUSED_RETRIES, DEFAULT_MIN_POLL_GAP_MS,
+        DEFAULT_PULL_LIMIT, DEFAULT_PULL_TIMEOUT, DEFAULT_RENEW_EVERY_SECS,
+        DEFAULT_RESUBSCRIBE_AFTER_ERRORS, DEFAULT_SUB_TERMINATION,
     };
     use crate::config::AgentConfig;
+    use crate::event::{MotionMetadata, MotionStateBus};
+    use anyhow::anyhow;
     use serde_json::json;
     use std::collections::HashMap;
     use std::sync::MutexGuard;
@@ -866,8 +1011,26 @@ mod tests {
             DEFAULT_RENEW_EVERY_SECS
         );
         assert_eq!(
-            env_u32("ONVIF_RESUBSCRIBE_AFTER_ERRORS", DEFAULT_RESUBSCRIBE_AFTER_ERRORS),
+            env_u32(
+                "ONVIF_RESUBSCRIBE_AFTER_ERRORS",
+                DEFAULT_RESUBSCRIBE_AFTER_ERRORS
+            ),
             DEFAULT_RESUBSCRIBE_AFTER_ERRORS
+        );
+        assert_eq!(
+            env_u64("ONVIF_AFTER_SUB_DELAY_MS", DEFAULT_AFTER_SUB_DELAY_MS),
+            4000
+        );
+        assert_eq!(
+            env_u32("ONVIF_CONNREFUSED_RETRIES", DEFAULT_CONNREFUSED_RETRIES),
+            20
+        );
+        assert_eq!(
+            env_u64(
+                "ONVIF_CONNREFUSED_BACKOFF_MS",
+                DEFAULT_CONNREFUSED_BACKOFF_MS
+            ),
+            250
         );
         assert_eq!(
             env_string("ONVIF_SUB_TERMINATION", DEFAULT_SUB_TERMINATION),
@@ -882,5 +1045,52 @@ mod tests {
         assert_eq!(cam.user, "alice");
         assert_eq!(cam.pass, "secret");
         assert_eq!(cam.camera_id, "cam-001");
+    }
+
+    #[test]
+    fn reset_motion_tracking_clears_local_maps_and_matching_camera_state() {
+        let (motion_state, _rx) = MotionStateBus::new();
+        let mut state =
+            HashMap::from([("rule-1".to_string(), true), ("rule-2".to_string(), false)]);
+        let mut event_ids = HashMap::from([
+            ("rule-1".to_string(), "evt-1".to_string()),
+            ("rule-2".to_string(), "evt-2".to_string()),
+        ]);
+
+        motion_state.set(
+            "rule-1".to_string(),
+            true,
+            Some(MotionMetadata {
+                camera_id: "cam-1".to_string(),
+                event_id: "evt-1".to_string(),
+            }),
+        );
+        motion_state.set(
+            "other-rule".to_string(),
+            true,
+            Some(MotionMetadata {
+                camera_id: "cam-2".to_string(),
+                event_id: "evt-9".to_string(),
+            }),
+        );
+
+        let summary = reset_motion_tracking(&mut state, &mut event_ids, &motion_state, "cam-1");
+
+        assert_eq!(summary, (2, 1, 2));
+        assert!(state.is_empty());
+        assert!(event_ids.is_empty());
+
+        let snapshot = motion_state.current();
+        assert!(!snapshot.contains_key("rule-1"));
+        assert!(snapshot.contains_key("other-rule"));
+    }
+
+    #[test]
+    fn connectish_error_detection_handles_connection_refused_text() {
+        assert!(is_connectish_error(&anyhow!("Connection refused")));
+        assert!(is_connectish_error(&anyhow!("socket failed: os error 61")));
+        assert!(!is_connectish_error(&anyhow!(
+            "timed out waiting for response"
+        )));
     }
 }
