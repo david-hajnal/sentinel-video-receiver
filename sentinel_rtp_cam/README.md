@@ -8,8 +8,8 @@ For device install/manage, use the tooling repo: `david-hajnal/sentinel-tooling`
 ## Binaries
 
 - `agent_forward` — forward agent used in production (talks to server ingest).
-- `app` — local receiver/recorder (developer use).
 - `server_ingest` — server-side ingest for forward mode.
+- `dummy_server` — local admin API stub for development.
 - `onvif_motion_pull` — diagnostics/dev helper.
 
 ## Configuration
@@ -27,9 +27,9 @@ these files. Environment variables can still override values for development and
 Use `RUST_LOG` to control verbosity:
 
 ```bash
-RUST_LOG=info cargo run --bin app
-RUST_LOG=debug cargo run --bin app
-RUST_LOG=sentinel_rtp_cam::onvif_motion=debug,info cargo run --bin app
+RUST_LOG=info cargo run --bin agent_forward
+RUST_LOG=debug cargo run --bin agent_forward
+RUST_LOG=sentinel_rtp_cam::onvif_motion=debug,info cargo run --bin agent_forward
 ```
 
 ## Development
@@ -44,6 +44,7 @@ Run specific binaries:
 ```bash
 cargo run --bin agent_forward
 cargo run --bin server_ingest
+cargo run --bin dummy_server
 cargo run --bin onvif_motion_pull
 ```
 

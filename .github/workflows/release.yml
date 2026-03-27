@@ -49,7 +49,6 @@ jobs:
       - name: Build binary with cross
         working-directory: sentinel_rtp_cam
         run: |
-          cross build --release --bin app --target ${{ matrix.target }}
           cross build --release --bin agent_forward --target ${{ matrix.target }}
       
       - name: Extract version
@@ -65,18 +64,16 @@ jobs:
       - name: Package binary
         run: |
           cd sentinel_rtp_cam/target/${{ matrix.target }}/release
-          cp app sentinel_rtp_cam
-          cp agent_forward sentinel_rtp_cam_forward
-          tar -czf sentinel_rtp_cam-${{ steps.version.outputs.VERSION }}-${{ matrix.arch }}.tar.gz sentinel_rtp_cam sentinel_rtp_cam_forward
-          sha256sum sentinel_rtp_cam-${{ steps.version.outputs.VERSION }}-${{ matrix.arch }}.tar.gz > sentinel_rtp_cam-${{ steps.version.outputs.VERSION }}-${{ matrix.arch }}.tar.gz.sha256
+          tar -czf agent_forward-${{ steps.version.outputs.VERSION }}-${{ matrix.arch }}.tar.gz agent_forward
+          sha256sum agent_forward-${{ steps.version.outputs.VERSION }}-${{ matrix.arch }}.tar.gz > agent_forward-${{ steps.version.outputs.VERSION }}-${{ matrix.arch }}.tar.gz.sha256
       
       - name: Upload artifact
         uses: actions/upload-artifact@v6
         with:
-          name: sentinel_rtp_cam-${{ matrix.arch }}
+          name: agent_forward-${{ matrix.arch }}
           path: |
-            sentinel_rtp_cam/target/${{ matrix.target }}/release/sentinel_rtp_cam-*.tar.gz
-            sentinel_rtp_cam/target/${{ matrix.target }}/release/sentinel_rtp_cam-*.sha256
+            sentinel_rtp_cam/target/${{ matrix.target }}/release/agent_forward-*.tar.gz
+            sentinel_rtp_cam/target/${{ matrix.target }}/release/agent_forward-*.sha256
   
   release:
     name: Create Release

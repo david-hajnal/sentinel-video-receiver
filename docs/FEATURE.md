@@ -4,13 +4,6 @@ This document lists implemented features in this repository (current state), not
 
 ## Runtime Components
 
-- `app` (`sentinel_rtp_cam/src/bin/app.rs`)
-  - Local RTSP receiver/recorder runtime.
-  - Uses ONVIF motion events to drive local clip recording.
-  - Integrates with admin server APIs (motion events, clip metadata/file upload, heartbeat).
-  - Supports live config updates from server SSE stream.
-  - Runs periodic disk-space cleanup.
-
 - `agent_forward` (`sentinel_rtp_cam/src/bin/agent_forward.rs`)
   - Forwarding agent runtime for sending camera RTP + motion to ingest.
   - Loads config from local JSON, and also polls remote config (`/api/v1/config`).
@@ -83,20 +76,13 @@ This document lists implemented features in this repository (current state), not
 
 ## Server Integration Features
 
-- Motion posting:
-  - Sends motion events to `/api/events/motion` with retries.
-
-- Clip metadata + file upload:
-  - Metadata post to `/api/clips/metadata`.
-  - Multipart clip upload to `/api/clips/upload`.
-
 - Heartbeat:
-  - Device heartbeat to `/api/heartbeat`.
-  - Agent heartbeat variant includes per-camera status data.
+  - Agent heartbeat includes per-camera status data.
+  - Posts to `/api/v1/heartbeat` with `/api/heartbeat` fallback.
 
-- Server-sent config updates:
-  - Listener for `/api/v1/config/stream?camera_id=...`.
-  - Normalizes modern and legacy config payload shapes.
+- Remote config pull:
+  - Polls `/api/v1/config`.
+  - Uses `x-camera-id` when a camera hint is available.
 
 - Firmware job execution:
   - Polls `/api/agent/firmware/job` (and `/api/v1/agent/firmware/job` fallback).
@@ -131,6 +117,5 @@ This document lists implemented features in this repository (current state), not
 
 ## Operations and Deployment Features
 
-- Systemd service file included (`sentinel_rtp_cam.service`).
-- Release workflow builds and packages production binaries (`app`, `agent_forward`).
+- Release workflow builds and packages `agent_forward`.
 - Update/management flow delegated to `sentinel-tooling` (`sentinel-manage`).
