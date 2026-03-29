@@ -1441,6 +1441,57 @@ mod tests {
     }
 
     #[test]
+    fn agent_heartbeat_payload_uses_resolved_version_after_previous_state_reported_older() {
+        let mut memory = FirmwareJobMemory::default();
+        let mut previous = build_idle_firmware_state(Some("1.1.3".to_string()), true);
+        previous.job_id = Some(11);
+        previous.target_version = Some("1.1.3".to_string());
+        previous.status = Some("succeeded".to_string());
+        previous.finished_at = Some("2026-03-29T10:00:00Z".to_string());
+        memory.remember_terminal_state(&previous);
+
+        let resolved_version = pick_installed_firmware_version(
+            Some("2.0.1".to_string()),
+            Some("1.1.3".to_string()),
+            Some("1.1.3".to_string()),
+        )
+        .expect("resolved version");
+        let firmware = memory
+            .duplicate_terminal_state(11, Some(resolved_version), true)
+            .expect("duplicate terminal state");
+        let telemetry = build_heartbeat_telemetry(
+            TelemetryStatus::Operational,
+            Some(12),
+            Some(MemoryUsageMb {
+                used_mb: 321,
+                total_mb: 2048,
+            }),
+            vec!["model-1".to_string()],
+            TelemetryCapabilities::default(),
+        );
+
+        let payload = build_agent_heartbeat_payload(
+            "agent-1",
+            "2026-03-29T10:00:30Z",
+            vec![json!({
+                "camera_id": "cam-1",
+                "rtsp_ok": true,
+                "rtsp_latency_ms": 5,
+                "rtsp_error": Value::Null,
+                "onvif_probe": {
+                    "status": "never_run",
+                },
+            })],
+            &telemetry,
+            &firmware,
+        );
+
+        assert_eq!(payload["agent_id"], "agent-1");
+        assert_eq!(payload["firmware"]["current_version"], "2.0.1");
+        assert_eq!(payload["firmware"]["status"], "succeeded");
+    }
+
+    #[test]
     fn firmware_version_match_normalizes_optional_v_prefix() {
         assert!(firmware_versions_match(Some("1.1.3"), Some("1.1.3")));
         assert!(firmware_versions_match(Some("1.1.3"), Some("v1.1.3")));
@@ -1453,30 +1504,30 @@ mod tests {
     fn installed_firmware_version_prefers_file_then_runtime_then_env() {
         assert_eq!(
             pick_installed_firmware_version(
-                Some("1.1.1".to_string()),
-                Some("1.1.2".to_string()),
                 Some("1.1.3".to_string()),
+                Some("2.0.1".to_string()),
+                Some("2.0.1".to_string()),
             )
             .as_deref(),
-            Some("1.1.1")
+            Some("1.1.3")
         );
         assert_eq!(
             pick_installed_firmware_version(
                 Some("   ".to_string()),
-                Some("1.1.2".to_string()),
+                Some("2.0.1".to_string()),
                 Some("1.1.3".to_string()),
             )
             .as_deref(),
-            Some("1.1.2")
+            Some("2.0.1")
         );
         assert_eq!(
             pick_installed_firmware_version(
                 None,
                 Some("   ".to_string()),
-                Some("1.1.3".to_string())
+                Some("2.0.1".to_string())
             )
             .as_deref(),
-            Some("1.1.3")
+            Some("2.0.1")
         );
     }
 
