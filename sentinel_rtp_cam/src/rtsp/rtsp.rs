@@ -172,8 +172,14 @@ mod tests {
     #[test]
     fn header_get_is_case_insensitive() {
         let headers = vec![("Content-Length".to_string(), "12".to_string())];
-        assert_eq!(header_get(&headers, "content-length"), Some("12".to_string()));
-        assert_eq!(header_get(&headers, "CONTENT-LENGTH"), Some("12".to_string()));
+        assert_eq!(
+            header_get(&headers, "content-length"),
+            Some("12".to_string())
+        );
+        assert_eq!(
+            header_get(&headers, "CONTENT-LENGTH"),
+            Some("12".to_string())
+        );
     }
 
     #[tokio::test]

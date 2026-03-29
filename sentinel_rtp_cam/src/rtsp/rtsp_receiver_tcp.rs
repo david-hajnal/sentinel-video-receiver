@@ -34,13 +34,16 @@ impl TcpInterleavedReceiverConfig {
     pub fn from_env_defaults() -> Result<Self> {
         let rtsp_url =
             AgentConfig::runtime_var("RTSP_URL").ok_or_else(|| anyhow!("Missing RTSP_URL"))?;
-        let host = AgentConfig::runtime_var("RTSP_HOST").ok_or_else(|| anyhow!("Missing RTSP_HOST"))?;
+        let host =
+            AgentConfig::runtime_var("RTSP_HOST").ok_or_else(|| anyhow!("Missing RTSP_HOST"))?;
         let port: u16 = AgentConfig::runtime_var("RTSP_PORT")
             .and_then(|v| v.parse().ok())
             .unwrap_or(554);
 
-        let user = AgentConfig::runtime_var("RTSP_USER").ok_or_else(|| anyhow!("Missing RTSP_USER"))?;
-        let pass = AgentConfig::runtime_var("RTSP_PASS").ok_or_else(|| anyhow!("Missing RTSP_PASS"))?;
+        let user =
+            AgentConfig::runtime_var("RTSP_USER").ok_or_else(|| anyhow!("Missing RTSP_USER"))?;
+        let pass =
+            AgentConfig::runtime_var("RTSP_PASS").ok_or_else(|| anyhow!("Missing RTSP_PASS"))?;
 
         Ok(Self {
             rtsp_url,

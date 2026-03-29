@@ -245,7 +245,12 @@ impl ClipRecorder {
                     }
                 }
             }
-            State::Armed { rule, camera_id, event_id, armed_at } => {
+            State::Armed {
+                rule,
+                camera_id,
+                event_id,
+                armed_at,
+            } => {
                 if has_active_motion {
                     // Merge subsequent motion events into the first while armed.
                     debug!(
@@ -271,7 +276,11 @@ impl ClipRecorder {
                 }
                 // Stay armed until IDR arrives to ensure we always record something
             }
-            State::Recording { stop_at, started_at, .. } => {
+            State::Recording {
+                stop_at,
+                started_at,
+                ..
+            } => {
                 if has_active_motion {
                     // Motion continues or new motion started -> clear stop deadline (extend recording)
                     if stop_at.is_some() {
@@ -432,7 +441,13 @@ impl ClipRecorder {
                 let hard_due = hard_stop_at.map(|t| now >= t).unwrap_or(false);
                 (
                     stop_due || hard_due,
-                    if hard_due { "hard_stop" } else if stop_due { "stop_at" } else { "none" },
+                    if hard_due {
+                        "hard_stop"
+                    } else if stop_due {
+                        "stop_at"
+                    } else {
+                        "none"
+                    },
                     hard_due,
                 )
             }
@@ -440,7 +455,10 @@ impl ClipRecorder {
         };
 
         if should_stop {
-            info!(reason = stop_reason, "Stop deadline reached, finalizing clip");
+            info!(
+                reason = stop_reason,
+                "Stop deadline reached, finalizing clip"
+            );
             self.stop_recording().await?;
             if hard_due {
                 self.rearm_if_motion_active().await?;
@@ -499,7 +517,15 @@ impl ClipRecorder {
             );
 
             let _ = self
-                .write_sidecar_json(&final_path, &camera_id, &event_id, &rule, file_size, started_at_utc, ended_at)
+                .write_sidecar_json(
+                    &final_path,
+                    &camera_id,
+                    &event_id,
+                    &rule,
+                    file_size,
+                    started_at_utc,
+                    ended_at,
+                )
                 .await;
 
             if let Some(tx) = &self.clip_meta_tx {
@@ -538,11 +564,7 @@ impl ClipRecorder {
                 event_id: sticky.event_id.clone(),
                 armed_at: Instant::now(),
             };
-        } else if let Some((rule, meta)) = self
-            .last_motion_state
-            .iter()
-            .min_by_key(|(k, _)| *k)
-        {
+        } else if let Some((rule, meta)) = self.last_motion_state.iter().min_by_key(|(k, _)| *k) {
             info!(
                 rule = %rule,
                 camera_id = %meta.camera_id,
@@ -605,7 +627,10 @@ impl ClipRecorder {
     async fn cleanup_stale_parts(&self) -> Result<()> {
         use std::time::SystemTime;
         let cutoff = SystemTime::now() - self.cfg.stale_part_max_age;
-        debug!(cutoff_secs = self.cfg.stale_part_max_age.as_secs(), "Scanning for stale .part clips");
+        debug!(
+            cutoff_secs = self.cfg.stale_part_max_age.as_secs(),
+            "Scanning for stale .part clips"
+        );
 
         let mut read_dir = tokio::fs::read_dir(&self.cfg.output_dir).await?;
         while let Some(entry) = read_dir.next_entry().await? {

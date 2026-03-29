@@ -3,9 +3,9 @@ use serde_json::Value;
 use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
-use std::sync::{OnceLock, RwLock};
 #[cfg(test)]
 use std::sync::Mutex;
+use std::sync::{OnceLock, RwLock};
 use std::time::Duration;
 use url::Url;
 
@@ -181,31 +181,55 @@ impl AgentConfig {
         set_map_if_value(&mut map, "SERVER_BEARER_TOKEN", server.get("bearer_token"));
         set_map_if_unset(&mut map, "AGENT_TOKEN", server.get("bearer_token"));
         set_map_if_unset(&mut map, "SERVER_TOKEN", server.get("bearer_token"));
-        set_map_if_value(&mut map, "SERVER_RETRY_INTERVAL_SECS", server.get("retry_interval_secs"));
+        set_map_if_value(
+            &mut map,
+            "SERVER_RETRY_INTERVAL_SECS",
+            server.get("retry_interval_secs"),
+        );
         set_map_if_value(&mut map, "SERVER_MAX_RETRIES", server.get("max_retries"));
 
         let cleanup = value.get("cleanup").unwrap_or(&Value::Null);
-        set_map_if_value(&mut map, "CLIP_CLEANUP_INTERVAL_SECS", cleanup.get("interval_secs"));
-        set_map_if_value(&mut map, "CLIP_MIN_FREE_BYTES", cleanup.get("min_free_bytes"));
+        set_map_if_value(
+            &mut map,
+            "CLIP_CLEANUP_INTERVAL_SECS",
+            cleanup.get("interval_secs"),
+        );
+        set_map_if_value(
+            &mut map,
+            "CLIP_MIN_FREE_BYTES",
+            cleanup.get("min_free_bytes"),
+        );
 
         let ingest = value.get("ingest").unwrap_or(&Value::Null);
         set_map_if_unset(&mut map, "CLIP_DIR", ingest.get("clip_dir"));
         set_map_if_value(&mut map, "CLIP_PRE_SECS", ingest.get("clip_pre_secs"));
         set_map_if_value(&mut map, "CLIP_POST_SECS", ingest.get("clip_post_secs"));
         set_map_if_value(&mut map, "CLIP_RING_SECS", ingest.get("clip_ring_secs"));
-        set_map_if_unset(&mut map, "CLIP_STALE_PART_SECS", ingest.get("clip_stale_part_secs"));
+        set_map_if_unset(
+            &mut map,
+            "CLIP_STALE_PART_SECS",
+            ingest.get("clip_stale_part_secs"),
+        );
         set_map_if_unset(&mut map, "CLIP_MAX_SECS", ingest.get("clip_max_secs"));
 
         let forward = value.get("forward_agent").unwrap_or(&Value::Null);
         set_map_if_value(&mut map, "AGENT_MODE", forward.get("mode"));
         set_map_if_value(&mut map, "SERVER_ADDR", forward.get("server_addr"));
-        set_map_if_value(&mut map, "MOTION_MERGE_SECS", forward.get("motion_merge_secs"));
+        set_map_if_value(
+            &mut map,
+            "MOTION_MERGE_SECS",
+            forward.get("motion_merge_secs"),
+        );
 
         let logging = value.get("logging").unwrap_or(&Value::Null);
         set_map_if_value(&mut map, "RUST_LOG", logging.get("rust_log"));
 
         let version = value.get("version").unwrap_or(&Value::Null);
-        set_map_if_value(&mut map, "SENTINEL_VERSION", version.get("sentinel_version"));
+        set_map_if_value(
+            &mut map,
+            "SENTINEL_VERSION",
+            version.get("sentinel_version"),
+        );
 
         if let Some(cameras) = value.get("cameras").and_then(|v| v.as_array()) {
             for (idx, cam) in cameras.iter().enumerate() {
@@ -244,7 +268,11 @@ impl AgentConfig {
                 set_map_if_string(&mut map, &format!("{prefix}ONVIF_PORT"), onvif_port(onvif));
                 set_map_if_value(&mut map, &format!("{prefix}ONVIF_USER"), user);
                 set_map_if_value(&mut map, &format!("{prefix}ONVIF_PASS"), pass);
-                set_map_if_value(&mut map, &format!("{prefix}ONVIF_DEBUG"), onvif.get("debug"));
+                set_map_if_value(
+                    &mut map,
+                    &format!("{prefix}ONVIF_DEBUG"),
+                    onvif.get("debug"),
+                );
                 set_map_if_value(
                     &mut map,
                     &format!("{prefix}ONVIF_DUMP_XML"),
@@ -295,7 +323,11 @@ impl AgentConfig {
                     &format!("{prefix}ONVIF_CONNREFUSED_BACKOFF_MS"),
                     onvif.get("connrefused_backoff_ms"),
                 );
-                set_map_if_value(&mut map, &format!("{prefix}MOTION_ENABLED"), motion.get("enabled"));
+                set_map_if_value(
+                    &mut map,
+                    &format!("{prefix}MOTION_ENABLED"),
+                    motion.get("enabled"),
+                );
                 set_map_if_value(
                     &mut map,
                     &format!("{prefix}LOCAL_CLIP_ENABLED"),
@@ -321,7 +353,11 @@ impl AgentConfig {
                 set_map_if_unset(&mut map, "CAMERA_ID", cam_id);
                 set_map_if_unset(&mut map, "AGENT_ID", cam_agent_id);
                 set_map_if_unset(&mut map, "MOTION_ENABLED", motion.get("enabled"));
-                set_map_if_unset(&mut map, "LOCAL_CLIP_ENABLED", features.get("local_clip_enabled"));
+                set_map_if_unset(
+                    &mut map,
+                    "LOCAL_CLIP_ENABLED",
+                    features.get("local_clip_enabled"),
+                );
                 set_map_if_unset(
                     &mut map,
                     "RTSP_RECEIVER_ENABLED",
@@ -340,8 +376,16 @@ impl AgentConfig {
                 set_map_if_unset(&mut map, "ONVIF_PASS", pass);
                 set_map_if_unset(&mut map, "ONVIF_DEBUG", onvif.get("debug"));
                 set_map_if_unset(&mut map, "ONVIF_DUMP_XML", onvif.get("dump_xml"));
-                set_map_if_unset(&mut map, "ONVIF_SUB_TERMINATION", onvif.get("sub_termination"));
-                set_map_if_unset(&mut map, "ONVIF_RENEW_EVERY_SECS", onvif.get("renew_every_secs"));
+                set_map_if_unset(
+                    &mut map,
+                    "ONVIF_SUB_TERMINATION",
+                    onvif.get("sub_termination"),
+                );
+                set_map_if_unset(
+                    &mut map,
+                    "ONVIF_RENEW_EVERY_SECS",
+                    onvif.get("renew_every_secs"),
+                );
                 set_map_if_unset(&mut map, "ONVIF_PULL_TIMEOUT", onvif.get("pull_timeout"));
                 set_map_if_unset(&mut map, "ONVIF_PULL_LIMIT", onvif.get("pull_limit"));
                 set_map_if_unset(
@@ -349,8 +393,16 @@ impl AgentConfig {
                     "ONVIF_RESUBSCRIBE_AFTER_ERRORS",
                     onvif.get("resubscribe_after_errors"),
                 );
-                set_map_if_unset(&mut map, "ONVIF_MIN_POLL_GAP_MS", onvif.get("min_poll_gap_ms"));
-                set_map_if_unset(&mut map, "ONVIF_AFTER_SUB_DELAY_MS", onvif.get("after_sub_delay_ms"));
+                set_map_if_unset(
+                    &mut map,
+                    "ONVIF_MIN_POLL_GAP_MS",
+                    onvif.get("min_poll_gap_ms"),
+                );
+                set_map_if_unset(
+                    &mut map,
+                    "ONVIF_AFTER_SUB_DELAY_MS",
+                    onvif.get("after_sub_delay_ms"),
+                );
                 set_map_if_unset(
                     &mut map,
                     "ONVIF_CONNREFUSED_RETRIES",
@@ -375,7 +427,10 @@ impl AgentConfig {
     }
 
     pub fn runtime_var(key: &str) -> Option<String> {
-        overrides_map().read().ok().and_then(|m| m.get(key).cloned())
+        overrides_map()
+            .read()
+            .ok()
+            .and_then(|m| m.get(key).cloned())
     }
 
     pub fn runtime_bool(key: &str, default: bool) -> bool {
@@ -872,7 +927,6 @@ impl Default for AgentConfig {
     }
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::AgentConfig;
@@ -923,10 +977,22 @@ mod tests {
             AgentConfig::runtime_var("CLIP_DIR").as_deref(),
             Some("/var/lib/sentinel_rtp_cam/clips")
         );
-        assert_eq!(AgentConfig::runtime_var("CLIP_MAX_SECS").as_deref(), Some("30"));
-        assert_eq!(AgentConfig::runtime_var("CLIP_POST_SECS").as_deref(), Some("120"));
-        assert_eq!(AgentConfig::runtime_var("CLIP_PRE_SECS").as_deref(), Some("2"));
-        assert_eq!(AgentConfig::runtime_var("CLIP_RING_SECS").as_deref(), Some("15"));
+        assert_eq!(
+            AgentConfig::runtime_var("CLIP_MAX_SECS").as_deref(),
+            Some("30")
+        );
+        assert_eq!(
+            AgentConfig::runtime_var("CLIP_POST_SECS").as_deref(),
+            Some("120")
+        );
+        assert_eq!(
+            AgentConfig::runtime_var("CLIP_PRE_SECS").as_deref(),
+            Some("2")
+        );
+        assert_eq!(
+            AgentConfig::runtime_var("CLIP_RING_SECS").as_deref(),
+            Some("15")
+        );
         assert_eq!(
             AgentConfig::runtime_var("CLIP_STALE_PART_SECS").as_deref(),
             Some("3600")
