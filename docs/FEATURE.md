@@ -4,7 +4,7 @@ This document lists implemented features in this repository (current state), not
 
 ## Runtime Components
 
-- `agent_forward` (`sentinel_rtp_cam/src/bin/agent_forward.rs`)
+- `sentinel-agent` (`sentinel_rtp_cam/src/bin/agent_forward.rs`)
   - Forwarding agent runtime for sending camera RTP + motion to ingest.
   - Loads config from local JSON, and also polls remote config (`/api/v1/config`).
   - Supports up to 4 camera slots (`CAM1..CAM4`) for forwarding.
@@ -117,5 +117,5 @@ This document lists implemented features in this repository (current state), not
 
 ## Operations and Deployment Features
 
-- Release workflow builds and packages `agent_forward`.
+- Release workflow builds and packages `sentinel-agent`.
 - Update/management flow delegated to `sentinel-tooling` (`sentinel-manage`).

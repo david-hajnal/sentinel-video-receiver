@@ -2,6 +2,23 @@
 name = "sentinel_rtp_cam"
 version = "0.1.0"
 edition = "2021"
+autobins = false
+
+[[bin]]
+name = "sentinel-agent"
+path = "src/bin/agent_forward.rs"
+
+[[bin]]
+name = "server_ingest"
+path = "src/bin/server_ingest.rs"
+
+[[bin]]
+name = "dummy_server"
+path = "src/bin/dummy_server.rs"
+
+[[bin]]
+name = "onvif_motion_pull"
+path = "src/bin/onvif_motion_pull.rs"
 
 [dependencies]
 # Error handling - using thiserror for typed errors, keeping anyhow for quick prototyping

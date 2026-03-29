@@ -17,7 +17,8 @@ use crate::config::{agent_config::ServerConfig, AgentConfig};
 use crate::onvif::{run_onvif_capability_probe, OnvifProbeCameraConfig};
 
 const FIRMWARE_VERSION_PATH: &str = "/etc/sentinel_rtp_cam/firmware-version";
-const FIRMWARE_BACKUP_BINARY_PATH: &str = "/usr/local/bin/agent_forward.prev";
+const FIRMWARE_BACKUP_BINARY_PATH: &str = "/usr/local/bin/sentinel-agent.prev";
+const LEGACY_FIRMWARE_BACKUP_BINARY_PATH_ALT: &str = "/usr/local/bin/agent_forward.prev";
 const LEGACY_FIRMWARE_BACKUP_BINARY_PATH: &str = "/usr/local/bin/sentinel_rtp_cam.prev";
 const DEFAULT_FIRMWARE_UPDATER_CMD: &str = "/usr/local/bin/sentinel-firmware-update";
 const PROC_STAT_PATH: &str = "/proc/stat";
@@ -677,19 +678,20 @@ fn build_idle_firmware_state(
     }
 }
 
-fn backup_binary_exists(primary_path: &Path, legacy_path: &Path) -> bool {
-    primary_path.exists() || legacy_path.exists()
+fn backup_binary_exists(primary_path: &Path, legacy_paths: &[&Path]) -> bool {
+    primary_path.exists() || legacy_paths.iter().any(|path| path.exists())
 }
 
 #[cfg(test)]
 fn baseline_firmware_state_from_paths(
     version_path: &Path,
     backup_path: &Path,
+    backup_path_alt: &Path,
     legacy_backup_path: &Path,
 ) -> FirmwareHeartbeatState {
     build_idle_firmware_state(
         read_installed_firmware_version_from_path(version_path),
-        backup_binary_exists(backup_path, legacy_backup_path),
+        backup_binary_exists(backup_path, &[backup_path_alt, legacy_backup_path]),
     )
 }
 
@@ -698,7 +700,10 @@ fn baseline_firmware_state() -> FirmwareHeartbeatState {
         read_installed_firmware_version(),
         backup_binary_exists(
             Path::new(FIRMWARE_BACKUP_BINARY_PATH),
-            Path::new(LEGACY_FIRMWARE_BACKUP_BINARY_PATH),
+            &[
+                Path::new(LEGACY_FIRMWARE_BACKUP_BINARY_PATH_ALT),
+                Path::new(LEGACY_FIRMWARE_BACKUP_BINARY_PATH),
+            ],
         ),
     )
 }
@@ -1300,13 +1305,18 @@ mod tests {
         let dir = unique_test_dir("firmware-state");
         fs::create_dir_all(&dir).expect("temp dir");
         let version_path = dir.join("firmware-version");
-        let backup_path = dir.join("agent_forward.prev");
+        let backup_path = dir.join("sentinel-agent.prev");
+        let backup_path_alt = dir.join("agent_forward.prev");
         let legacy_backup_path = dir.join("sentinel_rtp_cam.prev");
         fs::write(&version_path, "0.6.4\n").expect("version file");
         fs::write(&backup_path, "").expect("backup file");
 
-        let state =
-            baseline_firmware_state_from_paths(&version_path, &backup_path, &legacy_backup_path);
+        let state = baseline_firmware_state_from_paths(
+            &version_path,
+            &backup_path,
+            &backup_path_alt,
+            &legacy_backup_path,
+        );
 
         assert_eq!(state.current_version.as_deref(), Some("0.6.4"));
         assert!(state.target_version.is_none());
@@ -1321,11 +1331,16 @@ mod tests {
         let dir = unique_test_dir("firmware-empty");
         fs::create_dir_all(&dir).expect("temp dir");
         let version_path = dir.join("firmware-version");
-        let backup_path = dir.join("agent_forward.prev");
+        let backup_path = dir.join("sentinel-agent.prev");
+        let backup_path_alt = dir.join("agent_forward.prev");
         let legacy_backup_path = dir.join("sentinel_rtp_cam.prev");
 
-        let state =
-            baseline_firmware_state_from_paths(&version_path, &backup_path, &legacy_backup_path);
+        let state = baseline_firmware_state_from_paths(
+            &version_path,
+            &backup_path,
+            &backup_path_alt,
+            &legacy_backup_path,
+        );
 
         assert_eq!(state.current_version, None);
         assert!(state.target_version.is_none());
@@ -1340,18 +1355,27 @@ mod tests {
         let dir = unique_test_dir("firmware-refresh");
         fs::create_dir_all(&dir).expect("temp dir");
         let version_path = dir.join("firmware-version");
-        let backup_path = dir.join("agent_forward.prev");
+        let backup_path = dir.join("sentinel-agent.prev");
+        let backup_path_alt = dir.join("agent_forward.prev");
         let legacy_backup_path = dir.join("sentinel_rtp_cam.prev");
 
         fs::write(&version_path, "1.1.1\n").expect("initial version");
-        let first =
-            baseline_firmware_state_from_paths(&version_path, &backup_path, &legacy_backup_path);
+        let first = baseline_firmware_state_from_paths(
+            &version_path,
+            &backup_path,
+            &backup_path_alt,
+            &legacy_backup_path,
+        );
         assert_eq!(first.current_version.as_deref(), Some("1.1.1"));
         assert_eq!(first.status.as_deref(), Some("idle"));
 
         fs::write(&version_path, "1.1.2\n").expect("updated version");
-        let second =
-            baseline_firmware_state_from_paths(&version_path, &backup_path, &legacy_backup_path);
+        let second = baseline_firmware_state_from_paths(
+            &version_path,
+            &backup_path,
+            &backup_path_alt,
+            &legacy_backup_path,
+        );
         assert_eq!(second.current_version.as_deref(), Some("1.1.2"));
         assert_eq!(second.status.as_deref(), Some("idle"));
 
@@ -1363,13 +1387,18 @@ mod tests {
         let dir = unique_test_dir("firmware-legacy-backup");
         fs::create_dir_all(&dir).expect("temp dir");
         let version_path = dir.join("firmware-version");
-        let backup_path = dir.join("agent_forward.prev");
+        let backup_path = dir.join("sentinel-agent.prev");
+        let backup_path_alt = dir.join("agent_forward.prev");
         let legacy_backup_path = dir.join("sentinel_rtp_cam.prev");
         fs::write(&version_path, "2.0.0\n").expect("version file");
         fs::write(&legacy_backup_path, "").expect("legacy backup file");
 
-        let state =
-            baseline_firmware_state_from_paths(&version_path, &backup_path, &legacy_backup_path);
+        let state = baseline_firmware_state_from_paths(
+            &version_path,
+            &backup_path,
+            &backup_path_alt,
+            &legacy_backup_path,
+        );
 
         assert_eq!(state.current_version.as_deref(), Some("2.0.0"));
         assert_eq!(state.can_rollback, Some(true));
@@ -1381,25 +1410,33 @@ mod tests {
     fn backup_binary_exists_accepts_current_or_legacy_path() {
         let dir = unique_test_dir("backup-exists");
         fs::create_dir_all(&dir).expect("temp dir");
-        let backup_path = dir.join("agent_forward.prev");
+        let backup_path = dir.join("sentinel-agent.prev");
+        let backup_path_alt = dir.join("agent_forward.prev");
         let legacy_backup_path = dir.join("sentinel_rtp_cam.prev");
 
         assert!(!super::backup_binary_exists(
             &backup_path,
-            &legacy_backup_path
+            &[&backup_path_alt, &legacy_backup_path]
         ));
 
         fs::write(&backup_path, "").expect("backup file");
         assert!(super::backup_binary_exists(
             &backup_path,
-            &legacy_backup_path
+            &[&backup_path_alt, &legacy_backup_path]
         ));
         fs::remove_file(&backup_path).expect("remove current backup");
+
+        fs::write(&backup_path_alt, "").expect("legacy alt backup file");
+        assert!(super::backup_binary_exists(
+            &backup_path,
+            &[&backup_path_alt, &legacy_backup_path]
+        ));
+        fs::remove_file(&backup_path_alt).expect("remove legacy alt backup");
 
         fs::write(&legacy_backup_path, "").expect("legacy backup file");
         assert!(super::backup_binary_exists(
             &backup_path,
-            &legacy_backup_path
+            &[&backup_path_alt, &legacy_backup_path]
         ));
 
         fs::remove_dir_all(&dir).expect("cleanup");
