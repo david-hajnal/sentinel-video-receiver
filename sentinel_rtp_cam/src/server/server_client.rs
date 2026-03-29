@@ -735,7 +735,9 @@ async fn post_heartbeat(
     let base = config.base_url.trim_end_matches('/');
     let posted = try_fallback_paths(&["/api/v1/heartbeat", "/api/heartbeat"], |path| {
         let url = format!("{base}{path}");
+        let payload_json = payload.to_string();
         async move {
+            info!(url = %url, payload = %payload_json, "Sending agent heartbeat");
             let response = client
                 .post(&url)
                 .bearer_auth(&config.bearer_token)
