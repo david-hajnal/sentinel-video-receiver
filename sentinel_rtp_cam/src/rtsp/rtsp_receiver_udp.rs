@@ -273,6 +273,32 @@ pub async fn run_udp_receiver(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::AgentConfig;
+    use serde_json::json;
+    use std::collections::HashMap;
+    use std::sync::MutexGuard;
+
+    struct EnvGuard {
+        _lock: MutexGuard<'static, ()>,
+        saved: HashMap<String, String>,
+    }
+
+    impl EnvGuard {
+        fn new() -> Self {
+            let lock = AgentConfig::runtime_test_lock()
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner());
+            let saved = AgentConfig::runtime_snapshot();
+            AgentConfig::clear_runtime_overrides();
+            Self { _lock: lock, saved }
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            AgentConfig::runtime_restore(std::mem::take(&mut self.saved));
+        }
+    }
 
     #[test]
     fn unquote_strips_single_and_double_quotes() {
@@ -316,5 +342,59 @@ mod tests {
 
         cfg.user = "user".to_string();
         assert!(cfg.has_auth());
+    }
+
+    #[test]
+    fn header_value_matches_keys_case_insensitively() {
+        let headers = vec![("TrAnSpOrT".to_string(), "value".to_string())];
+        assert_eq!(header_value(&headers, "transport"), Some("value"));
+        assert_eq!(header_value(&headers, "TRANSPORT"), Some("value"));
+    }
+
+    #[test]
+    fn from_env_prefers_udp_specific_values_and_unquotes_strings() {
+        let _guard = EnvGuard::new();
+        AgentConfig::runtime_restore(HashMap::from([
+            ("UDP_RTSP_HOST".to_string(), "\"udp-host.local\"".to_string()),
+            ("UDP_RTSP_PORT".to_string(), "8554".to_string()),
+            ("UDP_RTSP_PATH".to_string(), "'stream-main'".to_string()),
+            ("UDP_RTP_PORT".to_string(), "6000".to_string()),
+            ("UDP_RTCP_PORT".to_string(), "6001".to_string()),
+            ("UDP_RTSP_USER".to_string(), "\"udp-user\"".to_string()),
+            ("UDP_RTSP_PASS".to_string(), "'udp-pass'".to_string()),
+            ("RTSP_HOST".to_string(), "fallback.local".to_string()),
+            ("RTSP_USER".to_string(), "fallback-user".to_string()),
+            ("RTSP_PASS".to_string(), "fallback-pass".to_string()),
+        ]));
+
+        let cfg = UdpReceiverConfig::from_env();
+        assert_eq!(cfg.host, "udp-host.local");
+        assert_eq!(cfg.port, 8554);
+        assert_eq!(cfg.path, "stream-main");
+        assert_eq!(cfg.rtp_port, 6000);
+        assert_eq!(cfg.rtcp_port, 6001);
+        assert_eq!(cfg.user, "udp-user");
+        assert_eq!(cfg.pass, "udp-pass");
+    }
+
+    #[test]
+    fn from_env_falls_back_to_general_rtsp_values() {
+        let _guard = EnvGuard::new();
+        AgentConfig::apply_json_env_overrides(&json!({
+            "cameras": [{
+                "user": "general-user",
+                "pass": "general-pass",
+                "rtsp": {
+                    "url": "rtsp://general.local/general-stream"
+                }
+            }]
+        }));
+
+        let cfg = UdpReceiverConfig::from_env();
+        assert_eq!(cfg.host, "general.local");
+        assert_eq!(cfg.port, 554);
+        assert_eq!(cfg.path, "/general-stream");
+        assert_eq!(cfg.user, "general-user");
+        assert_eq!(cfg.pass, "general-pass");
     }
 }

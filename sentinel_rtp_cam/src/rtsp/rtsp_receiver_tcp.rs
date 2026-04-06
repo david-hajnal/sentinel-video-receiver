@@ -230,6 +230,32 @@ pub async fn run_tcp_interleaved_receiver(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::AgentConfig;
+    use serde_json::json;
+    use std::collections::HashMap;
+    use std::sync::MutexGuard;
+
+    struct EnvGuard {
+        _lock: MutexGuard<'static, ()>,
+        saved: HashMap<String, String>,
+    }
+
+    impl EnvGuard {
+        fn new() -> Self {
+            let lock = AgentConfig::runtime_test_lock()
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner());
+            let saved = AgentConfig::runtime_snapshot();
+            AgentConfig::clear_runtime_overrides();
+            Self { _lock: lock, saved }
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            AgentConfig::runtime_restore(std::mem::take(&mut self.saved));
+        }
+    }
 
     #[test]
     fn parse_interleaved_channels_extracts_rtp_and_rtcp_channels() {
@@ -259,5 +285,37 @@ mod tests {
     #[test]
     fn basic_auth_value_builds_expected_header() {
         assert_eq!(basic_auth_value("user", "pass"), "Basic dXNlcjpwYXNz");
+    }
+
+    #[test]
+    fn from_env_defaults_reads_required_fields_and_applies_defaults() {
+        let _guard = EnvGuard::new();
+        AgentConfig::apply_json_env_overrides(&json!({
+            "cameras": [{
+                "user": "alice",
+                "pass": "secret",
+                "rtsp": {
+                    "url": "rtsp://cam.local/live"
+                }
+            }]
+        }));
+
+        let cfg = TcpInterleavedReceiverConfig::from_env_defaults().expect("config");
+        assert_eq!(cfg.rtsp_url, "rtsp://cam.local/live");
+        assert_eq!(cfg.host, "cam.local");
+        assert_eq!(cfg.port, 554);
+        assert_eq!(cfg.user, "alice");
+        assert_eq!(cfg.pass, "secret");
+        assert_eq!(cfg.play_range, "npt=0.000-");
+        assert_eq!(cfg.interleaved_request, "RTP/AVP/TCP;unicast;interleaved=0-1;mode=play");
+        assert!(cfg.require_idr_sync);
+    }
+
+    #[test]
+    fn from_env_defaults_errors_when_rtsp_url_missing() {
+        let _guard = EnvGuard::new();
+
+        let err = TcpInterleavedReceiverConfig::from_env_defaults().unwrap_err();
+        assert!(err.to_string().contains("Missing RTSP_URL"));
     }
 }

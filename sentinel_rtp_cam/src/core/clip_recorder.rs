@@ -791,11 +791,12 @@ impl ClipRecorder {
 
 #[cfg(test)]
 mod tests {
-    use super::{ClipRecorder, ClipRecorderConfig, State};
+    use super::{ClipMeta, ClipRecorder, ClipRecorderConfig, State};
     use crate::event::{MotionMetadata, MotionState};
     use chrono::{Duration as ChronoDuration, Utc};
     use std::path::PathBuf;
     use std::time::Duration;
+    use tokio::sync::mpsc;
     use tokio::time::Instant;
     use ulid::Ulid;
 
@@ -828,6 +829,21 @@ mod tests {
 
     fn idr_nal() -> Vec<u8> {
         vec![0, 0, 0, 1, 0x65, 0x88, 0x84]
+    }
+
+    async fn start_recording(
+        recorder: &mut ClipRecorder,
+        rule: &str,
+        camera_id: &str,
+        event_id: &str,
+    ) {
+        recorder
+            .on_motion_state_change(&active_motion_state(rule, camera_id, event_id))
+            .await
+            .expect("arm recorder");
+        recorder.on_nal(sps_nal()).await.expect("feed sps");
+        recorder.on_nal(pps_nal()).await.expect("feed pps");
+        recorder.on_nal(idr_nal()).await.expect("feed idr");
     }
 
     #[tokio::test]
@@ -984,6 +1000,161 @@ mod tests {
         );
 
         drop(recorder);
+        let _ = tokio::fs::remove_dir_all(&output_dir).await;
+    }
+
+    #[tokio::test]
+    async fn idr_without_parameter_sets_does_not_start_recording() {
+        let output_dir = test_output_dir("no_param_sets");
+        let mut recorder = ClipRecorder::new(ClipRecorderConfig {
+            output_dir: output_dir.clone(),
+            ..ClipRecorderConfig::default()
+        });
+
+        recorder
+            .on_motion_state_change(&active_motion_state("rule-a", "cam-1", "evt-1"))
+            .await
+            .expect("arm recorder");
+        recorder.on_nal(idr_nal()).await.expect("feed idr");
+
+        assert!(matches!(recorder.state, State::Armed { .. }));
+
+        let _ = tokio::fs::remove_dir_all(&output_dir).await;
+    }
+
+    #[tokio::test]
+    async fn motion_restart_within_post_roll_keeps_original_event_id() {
+        let output_dir = test_output_dir("restart_post_roll");
+        let mut recorder = ClipRecorder::new(ClipRecorderConfig {
+            output_dir: output_dir.clone(),
+            post_roll: Duration::from_secs(2),
+            min_clip_duration: Duration::from_secs(1),
+            ..ClipRecorderConfig::default()
+        });
+
+        start_recording(&mut recorder, "rule-a", "cam-1", "evt-1").await;
+        recorder
+            .on_motion_state_change(&MotionState::new())
+            .await
+            .expect("handle motion end");
+
+        recorder
+            .on_motion_state_change(&active_motion_state("rule-a", "cam-1", "evt-2"))
+            .await
+            .expect("handle motion restart");
+
+        match &recorder.state {
+            State::Recording {
+                event_id, stop_at, ..
+            } => {
+                assert_eq!(event_id, "evt-1");
+                assert!(stop_at.is_none());
+            }
+            _ => panic!("recorder should keep recording"),
+        }
+
+        drop(recorder);
+        let _ = tokio::fs::remove_dir_all(&output_dir).await;
+    }
+
+    #[tokio::test]
+    async fn stop_recording_writes_sidecar_and_emits_clip_meta() {
+        let output_dir = test_output_dir("stop_recording");
+        let (tx, mut rx) = mpsc::channel::<ClipMeta>(1);
+        let mut recorder = ClipRecorder::new(ClipRecorderConfig {
+            output_dir: output_dir.clone(),
+            ..ClipRecorderConfig::default()
+        })
+        .with_clip_meta_tx(tx);
+
+        start_recording(&mut recorder, "rule-a", "cam-1", "evt-1").await;
+        recorder.stop_recording().await.expect("stop recording");
+
+        assert!(matches!(recorder.state, State::Idle));
+
+        let meta = rx.recv().await.expect("clip meta");
+        assert_eq!(meta.camera_id, "cam-1");
+        assert_eq!(meta.event_id, "evt-1");
+        assert_eq!(meta.rule, "rule-a");
+        assert!(tokio::fs::metadata(&meta.file_path).await.is_ok());
+
+        let sidecar_path = meta.file_path.with_extension("json");
+        let sidecar: serde_json::Value = serde_json::from_slice(
+            &tokio::fs::read(&sidecar_path).await.expect("read sidecar"),
+        )
+        .expect("parse sidecar");
+        assert_eq!(sidecar["camera_id"], "cam-1");
+        assert_eq!(sidecar["event_id"], "evt-1");
+        assert_eq!(sidecar["rule"], "rule-a");
+
+        let _ = tokio::fs::remove_dir_all(&output_dir).await;
+    }
+
+    #[tokio::test]
+    async fn new_motion_after_stop_starts_new_recording() {
+        let output_dir = test_output_dir("new_motion_after_stop");
+        let mut recorder = ClipRecorder::new(ClipRecorderConfig {
+            output_dir: output_dir.clone(),
+            ..ClipRecorderConfig::default()
+        });
+
+        start_recording(&mut recorder, "rule-a", "cam-1", "evt-1").await;
+        recorder.stop_recording().await.expect("stop first recording");
+        recorder
+            .on_motion_state_change(&MotionState::new())
+            .await
+            .expect("clear sticky motion");
+
+        start_recording(&mut recorder, "rule-a", "cam-1", "evt-2").await;
+
+        match &recorder.state {
+            State::Recording { event_id, .. } => assert_eq!(event_id, "evt-2"),
+            _ => panic!("recorder should be recording new event"),
+        }
+
+        drop(recorder);
+        let _ = tokio::fs::remove_dir_all(&output_dir).await;
+    }
+
+    #[tokio::test]
+    async fn cleanup_old_clips_removes_oldest_files_and_sidecars_when_total_size_exceeded() {
+        let output_dir = test_output_dir("cleanup_total_size");
+        let recorder = ClipRecorder::new(ClipRecorderConfig {
+            output_dir: output_dir.clone(),
+            max_total_bytes: Some(15),
+            ..ClipRecorderConfig::default()
+        });
+
+        let oldest = output_dir.join("oldest.h264");
+        let middle = output_dir.join("middle.h264");
+        let newest = output_dir.join("newest.h264");
+
+        tokio::fs::write(&oldest, vec![1u8; 10]).await.expect("write oldest");
+        tokio::fs::write(oldest.with_extension("json"), b"{}")
+            .await
+            .expect("write oldest sidecar");
+        tokio::time::sleep(Duration::from_millis(1100)).await;
+
+        tokio::fs::write(&middle, vec![2u8; 10]).await.expect("write middle");
+        tokio::fs::write(middle.with_extension("json"), b"{}")
+            .await
+            .expect("write middle sidecar");
+        tokio::time::sleep(Duration::from_millis(1100)).await;
+
+        tokio::fs::write(&newest, vec![3u8; 10]).await.expect("write newest");
+        tokio::fs::write(newest.with_extension("json"), b"{}")
+            .await
+            .expect("write newest sidecar");
+
+        recorder.cleanup_old_clips().await.expect("cleanup old clips");
+
+        assert!(tokio::fs::metadata(&oldest).await.is_err());
+        assert!(tokio::fs::metadata(oldest.with_extension("json")).await.is_err());
+        assert!(tokio::fs::metadata(&middle).await.is_err());
+        assert!(tokio::fs::metadata(middle.with_extension("json")).await.is_err());
+        assert!(tokio::fs::metadata(&newest).await.is_ok());
+        assert!(tokio::fs::metadata(newest.with_extension("json")).await.is_ok());
+
         let _ = tokio::fs::remove_dir_all(&output_dir).await;
     }
 }

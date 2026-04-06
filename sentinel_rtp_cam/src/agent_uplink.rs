@@ -576,8 +576,43 @@ fn build_streams_info(
 
 #[cfg(test)]
 mod tests {
-    use super::{build_streams_info, HelloIngestConfig};
+    use super::{
+        build_event_payload, build_streams_info, encode_gap_tls, load_tls_config, read_record,
+        resolve_server_name, write_record, HelloIngestConfig, RECORD_EVENT,
+    };
+    use crate::config::AgentConfig;
+    use crate::proto::Msg;
+    use serde_json::json;
     use std::collections::HashMap;
+    use std::sync::MutexGuard;
+    use tokio::io::duplex;
+    use ulid::Ulid;
+
+    struct EnvGuard {
+        _lock: MutexGuard<'static, ()>,
+        saved: HashMap<String, String>,
+    }
+
+    impl EnvGuard {
+        fn new() -> Self {
+            let lock = AgentConfig::runtime_test_lock()
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner());
+            let saved = AgentConfig::runtime_snapshot();
+            AgentConfig::clear_runtime_overrides();
+            Self { _lock: lock, saved }
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            AgentConfig::runtime_restore(std::mem::take(&mut self.saved));
+        }
+    }
+
+    fn test_path(name: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!("sentinel-agent-uplink-{name}-{}", Ulid::new()))
+    }
 
     #[test]
     fn build_streams_info_includes_ingest_override_when_present() {
@@ -646,6 +681,115 @@ mod tests {
             clip_max_secs: None,
         };
         assert!(!non_empty.is_empty());
+    }
+
+    #[test]
+    fn build_event_payload_preserves_legacy_motion_fields() {
+        let payload = json!({
+            "rule": "zone-a",
+            "active": true,
+            "ts": "2026-04-06T08:15:30Z",
+            "camera_id": "cam-7",
+            "event_id": "evt-123",
+        });
+        let msg = Msg {
+            msg_type: RECORD_EVENT as u16,
+            stream_id: 7,
+            payload: serde_json::to_vec(&payload).expect("serialize payload"),
+        };
+
+        let event = build_event_payload(&msg);
+
+        assert_eq!(event.stream_id, "7");
+        assert_eq!(event.event_type, "motion");
+        assert_eq!(event.state, "start");
+        assert_eq!(event.rule.as_deref(), Some("zone-a"));
+        assert_eq!(event.camera_id.as_deref(), Some("cam-7"));
+        assert_eq!(event.event_id.as_deref(), Some("evt-123"));
+        assert_eq!(event.event_ts_unix_ms, 1_775_463_330_000);
+    }
+
+    #[test]
+    fn build_event_payload_generates_fallback_values_for_invalid_payload() {
+        let msg = Msg {
+            msg_type: RECORD_EVENT as u16,
+            stream_id: 42,
+            payload: b"{not-json".to_vec(),
+        };
+
+        let event = build_event_payload(&msg);
+
+        assert_eq!(event.stream_id, "42");
+        assert_eq!(event.state, "stop");
+        assert_eq!(event.rule.as_deref(), Some("motion"));
+        assert!(event.camera_id.is_none());
+        assert!(event.event_ts_unix_ms > 0);
+        assert!(
+            event
+                .event_id
+                .as_deref()
+                .is_some_and(|id| id.starts_with("stream42-"))
+        );
+    }
+
+    #[test]
+    fn encode_gap_tls_uses_big_endian_layout() {
+        let encoded = encode_gap_tls(9, 0x1234, 0xABCD);
+        assert_eq!(encoded, vec![0, 0, 0, 9, 0x12, 0x34, 0xAB, 0xCD]);
+    }
+
+    #[tokio::test]
+    async fn read_and_write_record_roundtrip() {
+        let (mut a, mut b) = duplex(1024);
+        let payload = b"hello".to_vec();
+
+        tokio::spawn(async move {
+            write_record(&mut a, RECORD_EVENT, 3, &payload).await.unwrap();
+        });
+
+        let record = read_record(&mut b).await.unwrap();
+        assert_eq!(record.record_type, RECORD_EVENT);
+        assert_eq!(record.flags, 3);
+        assert_eq!(record.payload, b"hello".to_vec());
+    }
+
+    #[test]
+    fn resolve_server_name_prefers_runtime_override() {
+        let _guard = EnvGuard::new();
+        AgentConfig::runtime_restore(HashMap::from([(
+            "INGEST_TLS_SERVER_NAME".to_string(),
+            "override.example".to_string(),
+        )]));
+
+        let server_name = resolve_server_name("10.0.0.5:7443").expect("server name");
+        match server_name {
+            rustls::pki_types::ServerName::DnsName(name) => {
+                assert_eq!(name.as_ref(), "override.example");
+            }
+            other => panic!("expected DNS server name, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn resolve_server_name_uses_ip_from_server_addr_when_no_override() {
+        let _guard = EnvGuard::new();
+
+        let server_name = resolve_server_name("127.0.0.1:7443").expect("server name");
+        assert!(matches!(
+            server_name,
+            rustls::pki_types::ServerName::IpAddress(_)
+        ));
+    }
+
+    #[test]
+    fn load_tls_config_rejects_empty_ca_bundle() {
+        let ca_path = test_path("empty-ca");
+        std::fs::write(&ca_path, "").expect("write empty ca bundle");
+
+        let err = load_tls_config(&ca_path).expect_err("empty CA bundle should fail");
+        assert!(err.to_string().contains("no CA certs found"));
+
+        let _ = std::fs::remove_file(&ca_path);
     }
 }
 
