@@ -368,8 +368,44 @@ async fn cleanup_stale_parts(dir: &PathBuf, stale_part_secs: u64) -> Result<()> 
 
 #[cfg(test)]
 mod tests {
-    use super::should_finalize_clip;
+    use super::{
+        cleanup_stale_parts, should_finalize_clip, try_start_clip, AccessUnit, StreamConfig,
+    };
+    use std::collections::VecDeque;
+    use std::path::PathBuf;
     use std::time::{Duration, Instant};
+    use tokio::fs;
+    use ulid::Ulid;
+
+    fn test_dir(name: &str) -> PathBuf {
+        std::env::temp_dir().join(format!("sentinel_server_pipeline_{name}_{}", Ulid::new()))
+    }
+
+    fn stream_config(clip_dir: PathBuf) -> StreamConfig {
+        StreamConfig {
+            stream_id: 7,
+            clip_dir,
+            ring_secs: 10,
+            pre_secs: 2,
+            post_secs: 3,
+            stale_part_secs: 1,
+            max_clip_secs: Some(9),
+        }
+    }
+
+    fn annexb(nal_header: u8, payload: &[u8]) -> Vec<u8> {
+        let mut out = vec![0, 0, 0, 1, nal_header];
+        out.extend_from_slice(payload);
+        out
+    }
+
+    fn access_unit(nals: Vec<Vec<u8>>, has_idr: bool) -> AccessUnit {
+        AccessUnit {
+            ts: Instant::now(),
+            nals,
+            has_idr,
+        }
+    }
 
     #[test]
     fn post_secs_deadline_finalizes_clip() {
@@ -392,5 +428,84 @@ mod tests {
         let stop_at = now + Duration::from_secs(10);
         let hard_stop_at = Some(now + Duration::from_secs(5));
         assert!(!should_finalize_clip(now, stop_at, hard_stop_at));
+    }
+
+    #[tokio::test]
+    async fn try_start_clip_returns_none_without_usable_idr_or_parameter_sets() {
+        let clip_dir = test_dir("start_none");
+        fs::create_dir_all(&clip_dir).await.unwrap();
+        let cfg = stream_config(clip_dir.clone());
+        let ring_snapshot = Some(VecDeque::from([access_unit(
+            vec![annexb(0x41, &[0x01])],
+            false,
+        )]));
+
+        let clip = try_start_clip(&cfg, "rule-a", &ring_snapshot, None, None)
+            .await
+            .unwrap();
+
+        assert!(clip.is_none());
+
+        fs::remove_dir_all(&clip_dir).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn try_start_clip_writes_from_first_idr_and_prefixes_sps_pps() {
+        let clip_dir = test_dir("start_preroll");
+        fs::create_dir_all(&clip_dir).await.unwrap();
+        let cfg = stream_config(clip_dir.clone());
+
+        let pre_idr = annexb(0x41, &[0x10]);
+        let idr = annexb(0x65, &[0x20]);
+        let post_idr = annexb(0x41, &[0x30]);
+        let sps = annexb(0x67, &[0x01, 0x02]);
+        let pps = annexb(0x68, &[0x03, 0x04]);
+        let ring_snapshot = Some(VecDeque::from([
+            access_unit(vec![pre_idr.clone()], false),
+            access_unit(vec![idr.clone()], true),
+            access_unit(vec![post_idr.clone()], false),
+        ]));
+
+        let mut clip = try_start_clip(&cfg, "rule-a", &ring_snapshot, Some(&sps), Some(&pps))
+            .await
+            .unwrap()
+            .expect("clip should start");
+        let part_path = clip.writer.part_path().clone();
+        clip.writer.flush().await.unwrap();
+
+        let bytes = fs::read(&part_path).await.unwrap();
+        let mut expected = Vec::new();
+        expected.extend_from_slice(&sps);
+        expected.extend_from_slice(&pps);
+        expected.extend_from_slice(&idr);
+        expected.extend_from_slice(&post_idr);
+
+        assert_eq!(bytes, expected);
+        assert!(!bytes.windows(pre_idr.len()).any(|window| window == pre_idr));
+
+        fs::remove_dir_all(&clip_dir).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn cleanup_stale_parts_removes_only_old_part_files() {
+        let clip_dir = test_dir("cleanup");
+        fs::create_dir_all(&clip_dir).await.unwrap();
+
+        let stale_part = clip_dir.join("old.h264.part");
+        let fresh_part = clip_dir.join("fresh.h264.part");
+        let non_part = clip_dir.join("keep.h264");
+
+        fs::write(&stale_part, b"old").await.unwrap();
+        tokio::time::sleep(Duration::from_millis(1_100)).await;
+        fs::write(&fresh_part, b"fresh").await.unwrap();
+        fs::write(&non_part, b"keep").await.unwrap();
+
+        cleanup_stale_parts(&clip_dir, 1).await.unwrap();
+
+        assert!(fs::metadata(&stale_part).await.is_err());
+        assert!(fs::metadata(&fresh_part).await.is_ok());
+        assert!(fs::metadata(&non_part).await.is_ok());
+
+        fs::remove_dir_all(&clip_dir).await.unwrap();
     }
 }

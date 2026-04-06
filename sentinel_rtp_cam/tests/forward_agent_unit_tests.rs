@@ -7,7 +7,7 @@ use serde_json::json;
 use sentinel_rtp_cam::event::MotionEvent;
 use sentinel_rtp_cam::forward_agent::{
     basic_auth_value, build_stream_maps, forward_motion_event, load_cameras_from_env,
-    parse_rtsp_url, CamConfig, MotionSender,
+    load_uplink_ingest_config_from_env, parse_rtsp_url, CamConfig, MotionSender,
 };
 use sentinel_rtp_cam::AgentConfig;
 
@@ -19,7 +19,9 @@ struct EnvGuard {
 
 impl EnvGuard {
     fn new(config: serde_json::Value) -> Self {
-        let lock = ENV_LOCK.lock().unwrap();
+        let lock = ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
         AgentConfig::clear_runtime_overrides();
         AgentConfig::apply_json_env_overrides(&config);
         Self { _lock: lock }
@@ -135,6 +137,38 @@ fn load_cameras_from_env_falls_back_to_global_camera_id() {
     let cams = load_cameras_from_env().unwrap();
     assert_eq!(cams.len(), 1);
     assert_eq!(cams[0].camera_id, "cam-global");
+}
+
+#[test]
+fn load_uplink_ingest_config_from_env_returns_none_when_all_values_absent() {
+    let _guard = EnvGuard::new(json!({
+        "server": {
+            "bearer_token": "test-token"
+        }
+    }));
+
+    assert!(load_uplink_ingest_config_from_env().is_none());
+}
+
+#[test]
+fn load_uplink_ingest_config_from_env_reads_present_values() {
+    let _guard = EnvGuard::new(json!({
+        "server": {
+            "bearer_token": "test-token"
+        },
+        "ingest": {
+            "clip_pre_secs": 3,
+            "clip_post_secs": 7,
+            "clip_max_secs": 30
+        }
+    }));
+
+    let ingest = load_uplink_ingest_config_from_env().expect("ingest config should be present");
+    assert_eq!(ingest.clip_pre_secs, Some(3));
+    assert_eq!(ingest.clip_post_secs, Some(7));
+    assert_eq!(ingest.clip_ring_secs, None);
+    assert_eq!(ingest.clip_stale_part_secs, None);
+    assert_eq!(ingest.clip_max_secs, Some(30));
 }
 
 #[test]

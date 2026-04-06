@@ -98,3 +98,44 @@ impl<'a> RtpPacket<'a> {
         })
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::RtpPacket;
+
+    #[test]
+    fn parse_supports_csrc_extension_and_padding() {
+        let packet = [
+            0xB1, 0xE0, 0x12, 0x34, 0x01, 0x02, 0x03, 0x04, 0xAA, 0xBB, 0xCC, 0xDD, 0x11,
+            0x22, 0x33, 0x44, 0xBE, 0xDE, 0x00, 0x01, 0xDE, 0xAD, 0xBE, 0xEF, 0x09, 0x08,
+            0x07, 0x00, 0x00, 0x00, 0x04,
+        ];
+
+        let parsed = RtpPacket::parse(&packet).unwrap();
+
+        assert_eq!(parsed.version, 2);
+        assert!(parsed.padding);
+        assert!(parsed.extension);
+        assert_eq!(parsed.csrc_count, 1);
+        assert!(parsed.marker);
+        assert_eq!(parsed.payload_type, 96);
+        assert_eq!(parsed.sequence_number, 0x1234);
+        assert_eq!(parsed.timestamp, 0x0102_0304);
+        assert_eq!(parsed.ssrc, 0xAABB_CCDD);
+        assert_eq!(parsed.payload, &[0x09, 0x08, 0x07]);
+    }
+
+    #[test]
+    fn parse_rejects_invalid_rtp_version() {
+        let packet = [0x00, 0x60, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1];
+        let err = RtpPacket::parse(&packet).unwrap_err();
+        assert!(err.to_string().contains("Unsupported RTP version"));
+    }
+
+    #[test]
+    fn parse_rejects_invalid_padding_length() {
+        let packet = [0xA0, 0x60, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1, 0xAA, 0xBB, 0x04];
+        let err = RtpPacket::parse(&packet).unwrap_err();
+        assert!(err.to_string().contains("Invalid RTP padding length"));
+    }
+}

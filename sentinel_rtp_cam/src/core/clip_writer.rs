@@ -80,3 +80,99 @@ impl ClipWriter {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::ClipWriter;
+    use std::path::PathBuf;
+    use tokio::fs;
+    use ulid::Ulid;
+
+    fn test_dir(name: &str) -> PathBuf {
+        std::env::temp_dir().join(format!("sentinel_clip_writer_{name}_{}", Ulid::new()))
+    }
+
+    fn test_paths(name: &str) -> (PathBuf, PathBuf, PathBuf) {
+        let dir = test_dir(name);
+        let part_path = dir.join("clip.h264.part");
+        let final_path = dir.join("clip.h264");
+        (dir, part_path, final_path)
+    }
+
+    #[tokio::test]
+    async fn create_initializes_part_file_and_zero_byte_accounting() {
+        let (dir, part_path, final_path) = test_paths("create");
+        fs::create_dir_all(&dir).await.unwrap();
+
+        let writer = ClipWriter::create(part_path.clone(), final_path, 64 * 1024)
+            .await
+            .unwrap();
+
+        assert_eq!(writer.part_path(), &part_path);
+        assert_eq!(writer.total_bytes(), 0);
+        assert!(fs::metadata(&part_path).await.unwrap().is_file());
+
+        fs::remove_dir_all(&dir).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn write_nal_updates_total_bytes_before_flush_and_preserves_payload() {
+        let (dir, part_path, final_path) = test_paths("write");
+        fs::create_dir_all(&dir).await.unwrap();
+
+        let nal = vec![0, 0, 0, 1, 0x65, 0x88, 0x99];
+        let mut writer = ClipWriter::create(part_path.clone(), final_path, 64 * 1024)
+            .await
+            .unwrap();
+        writer.write_nal(&nal).await.unwrap();
+
+        assert_eq!(writer.total_bytes(), nal.len() as u64);
+
+        writer.flush().await.unwrap();
+        assert_eq!(fs::read(&part_path).await.unwrap(), nal);
+        assert_eq!(writer.total_bytes(), nal.len() as u64);
+
+        fs::remove_dir_all(&dir).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn write_nal_threshold_rollover_keeps_data_buffered_until_flush() {
+        let (dir, part_path, final_path) = test_paths("threshold");
+        fs::create_dir_all(&dir).await.unwrap();
+
+        let nal = vec![0xAB; 20_000];
+        let mut writer = ClipWriter::create(part_path.clone(), final_path.clone(), 1)
+            .await
+            .unwrap();
+        writer.write_nal(&nal).await.unwrap();
+
+        assert_eq!(writer.total_bytes(), nal.len() as u64);
+        assert!(fs::metadata(&part_path).await.unwrap().is_file());
+        assert!(fs::metadata(&final_path).await.is_err());
+
+        writer.flush().await.unwrap();
+        assert_eq!(fs::read(&part_path).await.unwrap(), nal);
+
+        fs::remove_dir_all(&dir).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn finalize_renames_part_file_and_preserves_contents() {
+        let (dir, part_path, final_path) = test_paths("finalize");
+        fs::create_dir_all(&dir).await.unwrap();
+
+        let nal = vec![0, 0, 0, 1, 0x41, 0x9A];
+        let mut writer = ClipWriter::create(part_path.clone(), final_path.clone(), 64 * 1024)
+            .await
+            .unwrap();
+        writer.write_nal(&nal).await.unwrap();
+
+        let got_final_path = writer.finalize().await.unwrap();
+
+        assert_eq!(got_final_path, final_path);
+        assert!(fs::metadata(&part_path).await.is_err());
+        assert_eq!(fs::read(&final_path).await.unwrap(), nal);
+
+        fs::remove_dir_all(&dir).await.unwrap();
+    }
+}
