@@ -37,6 +37,47 @@ fn runtime_i64(name: &str) -> Option<i64> {
     runtime_var(name).and_then(|v| v.parse::<i64>().ok())
 }
 
+fn config_version_value(value: &Value) -> Option<Value> {
+    value
+        .get("config_version")
+        .filter(|v| !v.is_null())
+        .cloned()
+}
+
+fn config_camera_id(value: &Value) -> Option<&str> {
+    value
+        .get("camera_id")
+        .or_else(|| value.get("id"))
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+}
+
+fn build_camera_heartbeat_targets(
+    cams: &[CamConfig],
+    config_value: &Value,
+) -> Vec<CameraHeartbeatTarget> {
+    let camera_versions: HashMap<_, _> = config_value
+        .get("cameras")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|camera| {
+            Some((
+                config_camera_id(camera)?.to_string(),
+                config_version_value(camera),
+            ))
+        })
+        .collect();
+
+    cams.iter()
+        .map(|cam| CameraHeartbeatTarget {
+            camera_id: cam.camera_id.clone(),
+            rtsp_url: cam.rtsp_url.clone(),
+            config_version: camera_versions.get(&cam.camera_id).cloned().flatten(),
+        })
+        .collect()
+}
+
 async fn try_pull_remote_config(
     client: &reqwest::Client,
     base_url: &str,
@@ -138,10 +179,11 @@ async fn main() -> Result<()> {
     let http_client = reqwest::Client::builder()
         .timeout(Duration::from_secs(10))
         .build()?;
+    let applied_config_version: Arc<RwLock<Option<Value>>> = Arc::new(RwLock::new(None));
     let camera_targets: Arc<RwLock<Vec<CameraHeartbeatTarget>>> = Arc::new(RwLock::new(Vec::new()));
     let mut last_status = Instant::now() - Duration::from_secs(120);
     let mut last_pull = Instant::now() - Duration::from_secs(120);
-    let (server_addr, cams) = loop {
+    let (server_addr, cams, config_value) = loop {
         let server_value = match AgentConfig::load_server_json(&server_source_path) {
             Ok(value) => value,
             Err(e) => {
@@ -155,7 +197,7 @@ async fn main() -> Result<()> {
                 serde_json::Value::Object(Default::default())
             }
         };
-        let camera_value = match AgentConfig::load_camera_json(&camera_config_path) {
+        let mut camera_value = match AgentConfig::load_camera_json(&camera_config_path) {
             Ok(value) => value,
             Err(e) => {
                 if last_status.elapsed() > Duration::from_secs(30) {
@@ -168,11 +210,12 @@ async fn main() -> Result<()> {
                 serde_json::Value::Object(Default::default())
             }
         };
-        let config_value = AgentConfig::merge_server_camera_configs(&camera_value, &server_value);
+        let mut config_value =
+            AgentConfig::merge_server_camera_configs(&camera_value, &server_value);
         AgentConfig::apply_json_env_overrides(&config_value);
 
-        let server_addr = runtime_var("SERVER_ADDR");
-        let cams = match load_cameras_from_env() {
+        let mut server_addr = runtime_var("SERVER_ADDR");
+        let mut cams = match load_cameras_from_env() {
             Ok(cams) => cams,
             Err(e) => {
                 if last_status.elapsed() > Duration::from_secs(30) {
@@ -201,6 +244,30 @@ async fn main() -> Result<()> {
                 {
                     Ok(true) => {
                         info!("Pulled config from server; reloading");
+                        match AgentConfig::load_camera_json(&camera_config_path) {
+                            Ok(value) => {
+                                camera_value = value;
+                                config_value = AgentConfig::merge_server_camera_configs(
+                                    &camera_value,
+                                    &server_value,
+                                );
+                                AgentConfig::apply_json_env_overrides(&config_value);
+                                server_addr = runtime_var("SERVER_ADDR");
+                                cams = match load_cameras_from_env() {
+                                    Ok(cams) => cams,
+                                    Err(e) => {
+                                        warn!(
+                                            error = %e,
+                                            "Reloaded config is still incomplete after pull"
+                                        );
+                                        Vec::new()
+                                    }
+                                };
+                            }
+                            Err(e) => {
+                                warn!(error = %e, "Failed to reload camera config after pull");
+                            }
+                        }
                     }
                     Ok(false) => {
                         if last_status.elapsed() > Duration::from_secs(30) {
@@ -219,7 +286,7 @@ async fn main() -> Result<()> {
 
         let ready = server_addr.is_some() && !cams.is_empty();
         if ready {
-            break (server_addr.unwrap(), cams);
+            break (server_addr.unwrap(), cams, config_value);
         }
 
         if last_status.elapsed() > Duration::from_secs(30) {
@@ -240,14 +307,9 @@ async fn main() -> Result<()> {
 
     {
         let mut guard = camera_targets.write().await;
-        *guard = cams
-            .iter()
-            .map(|cam| CameraHeartbeatTarget {
-                camera_id: cam.camera_id.clone(),
-                rtsp_url: cam.rtsp_url.clone(),
-            })
-            .collect();
+        *guard = build_camera_heartbeat_targets(&cams, &config_value);
     }
+    *applied_config_version.write().await = config_version_value(&config_value);
 
     let agent_id = cams
         .first()
@@ -270,6 +332,7 @@ async fn main() -> Result<()> {
     );
     if runtime_var("SERVER_BASE_URL").is_some() && runtime_var("SERVER_BEARER_TOKEN").is_some() {
         let server_cfg = AgentConfig::from_env().server;
+        let applied_config_version = applied_config_version.clone();
         let camera_targets = camera_targets.clone();
         let heartbeat_agent_id = agent_id.clone();
         let onvif_probe = onvif_probe.clone();
@@ -277,6 +340,7 @@ async fn main() -> Result<()> {
             if let Err(error) = run_agent_heartbeat_poster(
                 server_cfg,
                 heartbeat_agent_id,
+                applied_config_version,
                 camera_targets,
                 onvif_probe,
             )
@@ -644,6 +708,7 @@ mod tests {
     fn multi_camera_env_maps_test2_to_stream_two() {
         let _guard = EnvGuard::new();
         AgentConfig::apply_json_env_overrides(&json!({
+            "config_version": 3,
             "agent_id": "01KH1V1AMEP4NDDDJ0SRV067TW",
             "server": {
                 "bearer_token": "agent-token"
@@ -651,6 +716,7 @@ mod tests {
             "cameras": [
                 {
                     "id": "ABLAK",
+                    "config_version": 11,
                     "rtsp": {
                         "url": "rtsp://192.168.1.187:554/stream2",
                         "stream_id": 1
@@ -659,6 +725,7 @@ mod tests {
                 },
                 {
                     "id": "aff8812b-c6be-4e59-aefd-40b59b425d92",
+                    "config_version": 12,
                     "rtsp": {
                         "url": "rtsp://192.168.1.189:554/stream2",
                         "stream_id": 2
@@ -681,6 +748,29 @@ mod tests {
             resolve_stream_id("aff8812b-c6be-4e59-aefd-40b59b425d92", &camera_to_stream),
             2
         );
+
+        let targets = build_camera_heartbeat_targets(
+            &cams,
+            &json!({
+                "config_version": 3,
+                "cameras": [
+                    {
+                        "id": "ABLAK",
+                        "config_version": 11
+                    },
+                    {
+                        "id": "aff8812b-c6be-4e59-aefd-40b59b425d92",
+                        "config_version": 12
+                    }
+                ]
+            }),
+        );
+        assert_eq!(
+            config_version_value(&json!({ "config_version": 3 })),
+            Some(json!(3))
+        );
+        assert_eq!(targets[0].config_version, Some(json!(11)));
+        assert_eq!(targets[1].config_version, Some(json!(12)));
     }
 
     async fn read_request(stream: &mut TcpStream) -> String {
@@ -733,16 +823,19 @@ mod tests {
                 } else {
                     let body = json!({
                         "config": {
+                            "config_version": 3,
                             "server": {
                                 "bearer_token": "remote-token"
                             },
                             "cameras": [
                                 {
                                     "id": "ABLAK",
+                                    "config_version": 11,
                                     "rtsp": { "url": "rtsp://192.168.1.187:554/stream2", "stream_id": 1 }
                                 },
                                 {
                                     "id": "aff8812b-c6be-4e59-aefd-40b59b425d92",
+                                    "config_version": 12,
                                     "rtsp": { "url": "rtsp://192.168.1.189/stream2", "stream_id": 2 }
                                 }
                             ]
@@ -801,10 +894,81 @@ mod tests {
         );
         let written = AgentConfig::load_camera_json(&camera_path).expect("read camera config");
         assert!(written.get("server").is_none());
+        assert_eq!(written["config_version"], 3);
+        assert_eq!(written["cameras"][0]["config_version"], 11);
         assert_eq!(
             written["cameras"][1]["id"],
             "aff8812b-c6be-4e59-aefd-40b59b425d92"
         );
+
+        fs::remove_dir_all(dir).expect("remove test dir");
+    }
+
+    #[tokio::test]
+    async fn remote_config_pull_updates_applied_versions_for_next_heartbeat() {
+        let _guard = EnvGuard::new();
+        let dir = unique_test_dir("pull-config-version");
+        fs::create_dir_all(&dir).expect("test dir");
+        let camera_path = dir.join("camera.json");
+        let server_path = dir.join("server.json");
+        AgentConfig::write_json_file(
+            &server_path,
+            &json!({
+                "server": {
+                    "bearer_token": "agent-token"
+                }
+            }),
+        )
+        .expect("write server config");
+        AgentConfig::write_json_file(
+            &camera_path,
+            &json!({
+                "config_version": 2,
+                "camera_id": "ABLAK",
+                "cameras": [{
+                    "id": "ABLAK",
+                    "config_version": 10,
+                    "rtsp": { "url": "rtsp://192.168.1.187:554/stream2", "stream_id": 1 }
+                }]
+            }),
+        )
+        .expect("write starting camera config");
+        let (base_url, requests) = spawn_config_server().await;
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(5))
+            .build()
+            .expect("http client");
+
+        let pulled = try_pull_remote_config(
+            &client,
+            &base_url,
+            "agent-token",
+            Some("ABLAK".to_string()),
+            &server_path,
+            &camera_path,
+        )
+        .await
+        .expect("pull config");
+
+        assert!(pulled);
+        assert_eq!(
+            requests.await.expect("request log"),
+            vec![None, Some("ABLAK".to_string())]
+        );
+
+        let server_value = AgentConfig::load_server_json(&server_path).expect("read server config");
+        let camera_value = AgentConfig::load_camera_json(&camera_path).expect("read camera config");
+        let merged = AgentConfig::merge_server_camera_configs(&camera_value, &server_value);
+        AgentConfig::apply_json_env_overrides(&merged);
+        let cams = load_cameras_from_env().expect("load cameras from merged config");
+        let targets = build_camera_heartbeat_targets(&cams, &merged);
+
+        assert_eq!(config_version_value(&merged), Some(json!(3)));
+        assert_eq!(targets.len(), 2);
+        assert_eq!(targets[0].camera_id, "ABLAK");
+        assert_eq!(targets[0].config_version, Some(json!(11)));
+        assert_eq!(targets[1].camera_id, "aff8812b-c6be-4e59-aefd-40b59b425d92");
+        assert_eq!(targets[1].config_version, Some(json!(12)));
 
         fs::remove_dir_all(dir).expect("remove test dir");
     }

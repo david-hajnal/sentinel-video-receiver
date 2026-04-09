@@ -803,6 +803,7 @@ fn baseline_firmware_state() -> FirmwareHeartbeatState {
 fn build_agent_heartbeat_payload(
     agent_id: &str,
     timestamp: &str,
+    config_version: Option<&Value>,
     cameras: Vec<Value>,
     telemetry: &HeartbeatTelemetry,
     firmware: &FirmwareHeartbeatState,
@@ -811,6 +812,7 @@ fn build_agent_heartbeat_payload(
     let mut payload = json!({
         "agent_id": agent_id,
         "timestamp": timestamp,
+        "config_version": config_version.cloned(),
         "telemetry": telemetry.as_json(),
         "cameras": cameras,
     });
@@ -1540,6 +1542,7 @@ where
 pub struct CameraHeartbeatTarget {
     pub camera_id: String,
     pub rtsp_url: String,
+    pub config_version: Option<Value>,
 }
 
 async fn check_rtsp_reachability(rtsp_url: &str) -> (bool, Option<i64>, Option<String>) {
@@ -1569,6 +1572,7 @@ async fn check_rtsp_reachability(rtsp_url: &str) -> (bool, Option<i64>, Option<S
 pub async fn run_agent_heartbeat_poster(
     config: ServerConfig,
     agent_id: String,
+    applied_config_version: Arc<RwLock<Option<Value>>>,
     cameras: Arc<RwLock<Vec<CameraHeartbeatTarget>>>,
     onvif_probe: OnvifProbeManager,
 ) -> Result<()> {
@@ -1591,6 +1595,7 @@ pub async fn run_agent_heartbeat_poster(
         onvif_probe.poll_for_jobs(&client, &config).await;
 
         let camera_snapshot = cameras.read().await.clone();
+        let applied_config_version_snapshot = applied_config_version.read().await.clone();
         let mut camera_status = Vec::new();
         let mut any_camera_impaired = false;
         for cam in camera_snapshot {
@@ -1601,6 +1606,7 @@ pub async fn run_agent_heartbeat_poster(
             let onvif_summary = onvif_probe.summary_for(&cam.camera_id).await;
             camera_status.push(json!({
                 "camera_id": cam.camera_id,
+                "config_version": cam.config_version,
                 "rtsp_ok": ok,
                 "rtsp_latency_ms": latency_ms,
                 "rtsp_error": error,
@@ -1619,6 +1625,7 @@ pub async fn run_agent_heartbeat_poster(
                 let client = client.clone();
                 let config = config.clone();
                 let agent_id = agent_id.clone();
+                let applied_config_version_snapshot = applied_config_version_snapshot.clone();
                 let telemetry = telemetry.clone();
                 let camera_status = camera_status.clone();
                 let firmware = restart_report_firmware.clone();
@@ -1627,6 +1634,7 @@ pub async fn run_agent_heartbeat_poster(
                     let payload = build_agent_heartbeat_payload(
                         &agent_id,
                         &timestamp,
+                        applied_config_version_snapshot.as_ref(),
                         camera_status,
                         &telemetry,
                         &firmware,
@@ -1657,6 +1665,7 @@ pub async fn run_agent_heartbeat_poster(
                     let client = client.clone();
                     let config = config.clone();
                     let agent_id = agent_id.clone();
+                    let applied_config_version_snapshot = applied_config_version_snapshot.clone();
                     let telemetry = telemetry.clone();
                     let camera_status = camera_status.clone();
                     let firmware = firmware.clone();
@@ -1665,6 +1674,7 @@ pub async fn run_agent_heartbeat_poster(
                         let payload = build_agent_heartbeat_payload(
                             &agent_id,
                             &timestamp,
+                            applied_config_version_snapshot.as_ref(),
                             camera_status,
                             &telemetry,
                             &firmware,
@@ -1689,6 +1699,7 @@ pub async fn run_agent_heartbeat_poster(
                 let client = client.clone();
                 let config = config.clone();
                 let agent_id = agent_id.clone();
+                let applied_config_version_snapshot = applied_config_version_snapshot.clone();
                 let telemetry = telemetry.clone();
                 let camera_status = camera_status.clone();
                 let restart_for_payload = restart_for_payload.clone();
@@ -1697,6 +1708,7 @@ pub async fn run_agent_heartbeat_poster(
                     let payload = build_agent_heartbeat_payload(
                         &agent_id,
                         &timestamp,
+                        applied_config_version_snapshot.as_ref(),
                         camera_status,
                         &telemetry,
                         &firmware_state,
@@ -1714,6 +1726,7 @@ pub async fn run_agent_heartbeat_poster(
         let payload = build_agent_heartbeat_payload(
             &agent_id,
             &timestamp,
+            applied_config_version_snapshot.as_ref(),
             camera_status,
             &telemetry,
             &firmware,
@@ -1748,6 +1761,7 @@ mod tests {
         RestartJobResponse, RestartMarkerReportOutcome, RestartProcessOutcome,
         TelemetryCapabilities, TelemetryStatus, DEFAULT_FIRMWARE_UPDATER_CMD, RESTART_EXIT_CODE,
     };
+    use serde::Deserialize;
     use serde_json::{json, Value};
     use std::fs;
     use std::sync::{Arc, Mutex};
@@ -1974,6 +1988,7 @@ mod tests {
         let payload = build_agent_heartbeat_payload(
             "agent-1",
             "2026-03-29T10:00:30Z",
+            None,
             vec![json!({
                 "camera_id": "cam-1",
                 "rtsp_ok": true,
@@ -2086,6 +2101,7 @@ mod tests {
         let payload = build_agent_heartbeat_payload(
             "agent-1",
             "2026-03-21T18:00:00Z",
+            None,
             vec![json!({
                 "camera_id": "cam-1",
                 "rtsp_ok": true,
@@ -2107,7 +2123,106 @@ mod tests {
         assert_eq!(payload["firmware"]["status"], "idle");
         assert_eq!(payload["firmware"]["can_rollback"], true);
         assert_eq!(payload["firmware"]["target_version"], Value::Null);
+        assert_eq!(payload["config_version"], Value::Null);
         assert_eq!(payload["cameras"][0]["camera_id"], "cam-1");
+    }
+
+    #[test]
+    fn agent_heartbeat_payload_includes_config_versions_when_present() {
+        let telemetry = build_heartbeat_telemetry(
+            TelemetryStatus::Operational,
+            Some(12),
+            Some(MemoryUsageMb {
+                used_mb: 321,
+                total_mb: 2048,
+            }),
+            vec!["model-1".to_string()],
+            TelemetryCapabilities::default(),
+        );
+        let firmware = build_idle_firmware_state(Some("1.1.2".to_string()), true);
+        let payload = build_agent_heartbeat_payload(
+            "agent-1",
+            "2026-04-09T10:00:00Z",
+            Some(&json!(42)),
+            vec![json!({
+                "camera_id": "cam-1",
+                "config_version": 7,
+                "rtsp_ok": true,
+                "rtsp_latency_ms": 5,
+                "rtsp_error": Value::Null,
+                "onvif_probe": {
+                    "status": "never_run",
+                },
+            })],
+            &telemetry,
+            &firmware,
+            None,
+        );
+
+        assert_eq!(payload["config_version"], 42);
+        assert_eq!(payload["cameras"][0]["config_version"], 7);
+    }
+
+    #[derive(Deserialize)]
+    struct LegacyHeartbeatPayload {
+        agent_id: String,
+        timestamp: String,
+        telemetry: Value,
+        cameras: Vec<LegacyCameraPayload>,
+    }
+
+    #[derive(Deserialize)]
+    struct LegacyCameraPayload {
+        camera_id: String,
+        rtsp_ok: bool,
+        rtsp_latency_ms: Option<i64>,
+        rtsp_error: Option<String>,
+        onvif_probe: Value,
+    }
+
+    #[test]
+    fn agent_heartbeat_payload_stays_compatible_with_legacy_server_payload_shape() {
+        let telemetry = build_heartbeat_telemetry(
+            TelemetryStatus::Operational,
+            Some(12),
+            Some(MemoryUsageMb {
+                used_mb: 321,
+                total_mb: 2048,
+            }),
+            vec!["model-1".to_string()],
+            TelemetryCapabilities::default(),
+        );
+        let firmware = build_idle_firmware_state(Some("1.1.2".to_string()), true);
+        let payload = build_agent_heartbeat_payload(
+            "agent-1",
+            "2026-04-09T10:00:00Z",
+            Some(&json!(42)),
+            vec![json!({
+                "camera_id": "cam-1",
+                "config_version": 7,
+                "rtsp_ok": true,
+                "rtsp_latency_ms": 5,
+                "rtsp_error": Value::Null,
+                "onvif_probe": {
+                    "status": "never_run",
+                },
+            })],
+            &telemetry,
+            &firmware,
+            None,
+        );
+
+        let legacy: LegacyHeartbeatPayload =
+            serde_json::from_value(payload).expect("legacy payload should deserialize");
+        assert_eq!(legacy.agent_id, "agent-1");
+        assert_eq!(legacy.timestamp, "2026-04-09T10:00:00Z");
+        assert_eq!(legacy.telemetry["status"], "operational");
+        assert_eq!(legacy.cameras.len(), 1);
+        assert_eq!(legacy.cameras[0].camera_id, "cam-1");
+        assert!(legacy.cameras[0].rtsp_ok);
+        assert_eq!(legacy.cameras[0].rtsp_latency_ms, Some(5));
+        assert_eq!(legacy.cameras[0].rtsp_error, None);
+        assert_eq!(legacy.cameras[0].onvif_probe["status"], "never_run");
     }
 
     #[test]
@@ -2134,6 +2249,7 @@ mod tests {
         let payload = build_agent_heartbeat_payload(
             "agent-1",
             "2026-04-09T10:00:00Z",
+            None,
             Vec::new(),
             &telemetry,
             &firmware,

@@ -1079,10 +1079,9 @@ mod tests {
         assert!(tokio::fs::metadata(&meta.file_path).await.is_ok());
 
         let sidecar_path = meta.file_path.with_extension("json");
-        let sidecar: serde_json::Value = serde_json::from_slice(
-            &tokio::fs::read(&sidecar_path).await.expect("read sidecar"),
-        )
-        .expect("parse sidecar");
+        let sidecar: serde_json::Value =
+            serde_json::from_slice(&tokio::fs::read(&sidecar_path).await.expect("read sidecar"))
+                .expect("parse sidecar");
         assert_eq!(sidecar["camera_id"], "cam-1");
         assert_eq!(sidecar["event_id"], "evt-1");
         assert_eq!(sidecar["rule"], "rule-a");
@@ -1099,7 +1098,10 @@ mod tests {
         });
 
         start_recording(&mut recorder, "rule-a", "cam-1", "evt-1").await;
-        recorder.stop_recording().await.expect("stop first recording");
+        recorder
+            .stop_recording()
+            .await
+            .expect("stop first recording");
         recorder
             .on_motion_state_change(&MotionState::new())
             .await
@@ -1129,31 +1131,46 @@ mod tests {
         let middle = output_dir.join("middle.h264");
         let newest = output_dir.join("newest.h264");
 
-        tokio::fs::write(&oldest, vec![1u8; 10]).await.expect("write oldest");
+        tokio::fs::write(&oldest, vec![1u8; 10])
+            .await
+            .expect("write oldest");
         tokio::fs::write(oldest.with_extension("json"), b"{}")
             .await
             .expect("write oldest sidecar");
         tokio::time::sleep(Duration::from_millis(1100)).await;
 
-        tokio::fs::write(&middle, vec![2u8; 10]).await.expect("write middle");
+        tokio::fs::write(&middle, vec![2u8; 10])
+            .await
+            .expect("write middle");
         tokio::fs::write(middle.with_extension("json"), b"{}")
             .await
             .expect("write middle sidecar");
         tokio::time::sleep(Duration::from_millis(1100)).await;
 
-        tokio::fs::write(&newest, vec![3u8; 10]).await.expect("write newest");
+        tokio::fs::write(&newest, vec![3u8; 10])
+            .await
+            .expect("write newest");
         tokio::fs::write(newest.with_extension("json"), b"{}")
             .await
             .expect("write newest sidecar");
 
-        recorder.cleanup_old_clips().await.expect("cleanup old clips");
+        recorder
+            .cleanup_old_clips()
+            .await
+            .expect("cleanup old clips");
 
         assert!(tokio::fs::metadata(&oldest).await.is_err());
-        assert!(tokio::fs::metadata(oldest.with_extension("json")).await.is_err());
+        assert!(tokio::fs::metadata(oldest.with_extension("json"))
+            .await
+            .is_err());
         assert!(tokio::fs::metadata(&middle).await.is_err());
-        assert!(tokio::fs::metadata(middle.with_extension("json")).await.is_err());
+        assert!(tokio::fs::metadata(middle.with_extension("json"))
+            .await
+            .is_err());
         assert!(tokio::fs::metadata(&newest).await.is_ok());
-        assert!(tokio::fs::metadata(newest.with_extension("json")).await.is_ok());
+        assert!(tokio::fs::metadata(newest.with_extension("json"))
+            .await
+            .is_ok());
 
         let _ = tokio::fs::remove_dir_all(&output_dir).await;
     }

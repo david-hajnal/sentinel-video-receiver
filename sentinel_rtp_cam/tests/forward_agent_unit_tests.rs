@@ -19,9 +19,7 @@ struct EnvGuard {
 
 impl EnvGuard {
     fn new(config: serde_json::Value) -> Self {
-        let lock = ENV_LOCK
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner());
+        let lock = ENV_LOCK.lock().unwrap_or_else(|poison| poison.into_inner());
         AgentConfig::clear_runtime_overrides();
         AgentConfig::apply_json_env_overrides(&config);
         Self { _lock: lock }

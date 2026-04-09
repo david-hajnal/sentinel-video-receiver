@@ -355,7 +355,10 @@ mod tests {
     fn from_env_prefers_udp_specific_values_and_unquotes_strings() {
         let _guard = EnvGuard::new();
         AgentConfig::runtime_restore(HashMap::from([
-            ("UDP_RTSP_HOST".to_string(), "\"udp-host.local\"".to_string()),
+            (
+                "UDP_RTSP_HOST".to_string(),
+                "\"udp-host.local\"".to_string(),
+            ),
             ("UDP_RTSP_PORT".to_string(), "8554".to_string()),
             ("UDP_RTSP_PATH".to_string(), "'stream-main'".to_string()),
             ("UDP_RTP_PORT".to_string(), "6000".to_string()),

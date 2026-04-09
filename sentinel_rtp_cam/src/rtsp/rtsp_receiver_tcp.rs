@@ -307,7 +307,10 @@ mod tests {
         assert_eq!(cfg.user, "alice");
         assert_eq!(cfg.pass, "secret");
         assert_eq!(cfg.play_range, "npt=0.000-");
-        assert_eq!(cfg.interleaved_request, "RTP/AVP/TCP;unicast;interleaved=0-1;mode=play");
+        assert_eq!(
+            cfg.interleaved_request,
+            "RTP/AVP/TCP;unicast;interleaved=0-1;mode=play"
+        );
         assert!(cfg.require_idr_sync);
     }
 

@@ -29,7 +29,10 @@ mod tests {
     #[test]
     fn annexb_from_raw_nal_prefixes_start_code() {
         let raw = [0x65, 0x88, 0x84];
-        assert_eq!(annexb_from_raw_nal(&raw), vec![0, 0, 0, 1, 0x65, 0x88, 0x84]);
+        assert_eq!(
+            annexb_from_raw_nal(&raw),
+            vec![0, 0, 0, 1, 0x65, 0x88, 0x84]
+        );
     }
 
     #[test]
