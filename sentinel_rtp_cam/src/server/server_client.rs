@@ -1,9 +1,10 @@
 use anyhow::Result;
 use chrono::Utc;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
 use std::fs;
+use std::io::Write;
 use std::path::Path;
 use std::sync::Arc;
 use tokio::net::TcpStream;
@@ -21,6 +22,8 @@ const FIRMWARE_BACKUP_BINARY_PATH: &str = "/usr/local/bin/sentinel-agent.prev";
 const LEGACY_FIRMWARE_BACKUP_BINARY_PATH_ALT: &str = "/usr/local/bin/agent_forward.prev";
 const LEGACY_FIRMWARE_BACKUP_BINARY_PATH: &str = "/usr/local/bin/sentinel_rtp_cam.prev";
 const DEFAULT_FIRMWARE_UPDATER_CMD: &str = "/usr/local/bin/sentinel-firmware-update";
+const RESTART_JOB_MARKER_PATH: &str = "/var/lib/sentinel_rtp_cam/restart-job.json";
+const RESTART_EXIT_CODE: i32 = 75;
 const PROC_STAT_PATH: &str = "/proc/stat";
 const PROC_MEMINFO_PATH: &str = "/proc/meminfo";
 
@@ -37,6 +40,24 @@ struct FirmwareJobCommand {
 #[derive(Debug, Deserialize)]
 struct FirmwareJobResponse {
     job: Option<FirmwareJobCommand>,
+}
+
+#[derive(Debug, Deserialize, Clone, PartialEq, Eq)]
+struct RestartJobCommand {
+    job_id: i64,
+    action: String,
+    status: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct RestartJobResponse {
+    job: Option<RestartJobCommand>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct RestartJobMarker {
+    job_id: i64,
+    started_at: String,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -66,6 +87,33 @@ struct FirmwareHeartbeatState {
 #[derive(Debug, Default)]
 struct FirmwareJobMemory {
     last_terminal_state: Option<FirmwareHeartbeatState>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct RestartHeartbeatState {
+    job_id: Option<i64>,
+    status: Option<String>,
+    error: Option<String>,
+    started_at: Option<String>,
+    finished_at: Option<String>,
+}
+
+#[derive(Debug, Default)]
+struct RestartJobMemory {
+    handled_job_ids: HashSet<i64>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RestartProcessOutcome {
+    Continue,
+    ExitNonZero,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum RestartMarkerReportOutcome {
+    Missing,
+    Pending,
+    Reported(RestartHeartbeatState),
 }
 
 #[allow(dead_code)]
@@ -540,6 +588,50 @@ impl FirmwareJobMemory {
     }
 }
 
+impl RestartHeartbeatState {
+    fn as_json(&self) -> Option<Value> {
+        if self.job_id.is_none()
+            && self.status.is_none()
+            && self.error.is_none()
+            && self.started_at.is_none()
+            && self.finished_at.is_none()
+        {
+            return None;
+        }
+
+        Some(json!({
+            "job_id": self.job_id,
+            "status": self.status,
+            "error": self.error,
+            "started_at": self.started_at,
+            "finished_at": self.finished_at,
+        }))
+    }
+}
+
+impl RestartJobMemory {
+    fn is_handled(&self, job_id: i64) -> bool {
+        self.handled_job_ids.contains(&job_id)
+    }
+
+    fn mark_handled(&mut self, job_id: i64) {
+        self.handled_job_ids.insert(job_id);
+    }
+}
+
+impl RestartProcessOutcome {
+    fn should_exit(self) -> bool {
+        self == Self::ExitNonZero
+    }
+
+    fn exit_code(self) -> i32 {
+        match self {
+            Self::Continue => 0,
+            Self::ExitNonZero => RESTART_EXIT_CODE,
+        }
+    }
+}
+
 fn sanitize_active_models<I>(models: I) -> Vec<String>
 where
     I: IntoIterator<Item = String>,
@@ -714,6 +806,7 @@ fn build_agent_heartbeat_payload(
     cameras: Vec<Value>,
     telemetry: &HeartbeatTelemetry,
     firmware: &FirmwareHeartbeatState,
+    restart: Option<&RestartHeartbeatState>,
 ) -> Value {
     let mut payload = json!({
         "agent_id": agent_id,
@@ -723,6 +816,9 @@ fn build_agent_heartbeat_payload(
     });
     if let Some(firmware_payload) = firmware.as_json() {
         payload["firmware"] = firmware_payload;
+    }
+    if let Some(restart_payload) = restart.and_then(RestartHeartbeatState::as_json) {
+        payload["restart"] = restart_payload;
     }
     payload
 }
@@ -757,6 +853,297 @@ async fn post_heartbeat(
     } else {
         Err(anyhow::anyhow!("No heartbeat endpoint available"))
     }
+}
+
+fn restarting_state(job_id: i64, started_at: String) -> RestartHeartbeatState {
+    RestartHeartbeatState {
+        job_id: Some(job_id),
+        status: Some("restarting".to_string()),
+        error: None,
+        started_at: Some(started_at),
+        finished_at: None,
+    }
+}
+
+fn terminal_restart_state(
+    job_id: i64,
+    status: &str,
+    error: Option<String>,
+    started_at: Option<String>,
+    finished_at: String,
+) -> RestartHeartbeatState {
+    RestartHeartbeatState {
+        job_id: Some(job_id),
+        status: Some(status.to_string()),
+        error,
+        started_at,
+        finished_at: Some(finished_at),
+    }
+}
+
+#[cfg(test)]
+fn read_restart_job_marker(path: &Path) -> Result<RestartJobMarker> {
+    let raw = fs::read_to_string(path)?;
+    serde_json::from_str(&raw).map_err(Into::into)
+}
+
+fn write_restart_job_marker(path: &Path, marker: &RestartJobMarker) -> Result<()> {
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    fs::create_dir_all(parent)?;
+    let filename = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("restart-job.json");
+    let nanos = Utc::now().timestamp_nanos_opt().unwrap_or_default();
+    let tmp_path = parent.join(format!(".{filename}.tmp.{}-{nanos}", std::process::id()));
+
+    let mut file = fs::File::create(&tmp_path)?;
+    serde_json::to_writer(&mut file, marker)?;
+    file.write_all(b"\n")?;
+    file.sync_all()?;
+    fs::rename(&tmp_path, path)?;
+    Ok(())
+}
+
+fn remove_restart_job_marker(path: &Path) -> Result<()> {
+    match fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn restart_marker_state_from_raw(raw: &str, finished_at: &str) -> Option<RestartHeartbeatState> {
+    match serde_json::from_str::<RestartJobMarker>(raw) {
+        Ok(marker) => Some(terminal_restart_state(
+            marker.job_id,
+            "succeeded",
+            None,
+            Some(marker.started_at),
+            finished_at.to_string(),
+        )),
+        Err(marker_error) => {
+            let value: Value = serde_json::from_str(raw).ok()?;
+            let job_id = value.get("job_id")?.as_i64()?;
+            let started_at = value
+                .get("started_at")
+                .and_then(Value::as_str)
+                .map(ToString::to_string);
+            Some(terminal_restart_state(
+                job_id,
+                "failed",
+                Some(format!("Failed to parse restart marker: {marker_error}")),
+                started_at,
+                finished_at.to_string(),
+            ))
+        }
+    }
+}
+
+async fn maybe_report_restart_completion_marker<R, Fut>(
+    marker_path: &Path,
+    mut report: R,
+) -> RestartMarkerReportOutcome
+where
+    R: FnMut(RestartHeartbeatState) -> Fut,
+    Fut: std::future::Future<Output = Result<()>>,
+{
+    let raw = match fs::read_to_string(marker_path) {
+        Ok(raw) => raw,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return RestartMarkerReportOutcome::Missing;
+        }
+        Err(error) => {
+            warn!(
+                path = %marker_path.display(),
+                error = %error,
+                "Failed to read restart completion marker"
+            );
+            return RestartMarkerReportOutcome::Pending;
+        }
+    };
+
+    let finished_at = Utc::now().to_rfc3339();
+    let Some(state) = restart_marker_state_from_raw(&raw, &finished_at) else {
+        warn!(
+            path = %marker_path.display(),
+            "Restart completion marker could not be parsed and had no recoverable job_id"
+        );
+        if let Err(error) = remove_restart_job_marker(marker_path) {
+            warn!(
+                path = %marker_path.display(),
+                error = %error,
+                "Failed to remove unreadable restart completion marker"
+            );
+        }
+        return RestartMarkerReportOutcome::Missing;
+    };
+
+    if let Err(error) = report(state.clone()).await {
+        warn!(
+            job_id = ?state.job_id,
+            error = %error,
+            "Failed to report restart completion marker"
+        );
+        return RestartMarkerReportOutcome::Pending;
+    }
+
+    if let Err(error) = remove_restart_job_marker(marker_path) {
+        warn!(
+            path = %marker_path.display(),
+            error = %error,
+            "Failed to remove restart completion marker after successful report"
+        );
+    }
+    RestartMarkerReportOutcome::Reported(state)
+}
+
+async fn fetch_restart_job_command(
+    client: &reqwest::Client,
+    config: &ServerConfig,
+) -> Result<Option<RestartJobCommand>> {
+    let base = config.base_url.trim_end_matches('/');
+    let payload = try_fallback_paths(
+        &["/api/v1/agent/restart/job", "/api/agent/restart/job"],
+        |path| {
+            let url = format!("{base}{path}");
+            async move {
+                let response = client
+                    .get(&url)
+                    .bearer_auth(&config.bearer_token)
+                    .send()
+                    .await?;
+                if response.status() == reqwest::StatusCode::NOT_FOUND {
+                    return Ok(FallbackOutcome::NotFound);
+                }
+                let response = response.error_for_status()?;
+                let payload: RestartJobResponse = response.json().await?;
+                Ok(FallbackOutcome::Success(payload))
+            }
+        },
+    )
+    .await?;
+    Ok(payload.and_then(|payload| payload.job))
+}
+
+async fn process_restart_job_command<R, Fut>(
+    job: &RestartJobCommand,
+    marker_path: &Path,
+    memory: &mut RestartJobMemory,
+    mut report: R,
+) -> RestartProcessOutcome
+where
+    R: FnMut(RestartHeartbeatState) -> Fut,
+    Fut: std::future::Future<Output = Result<()>>,
+{
+    if memory.is_handled(job.job_id) {
+        info!(
+            job_id = job.job_id,
+            action = %job.action,
+            "Skipping restart job already handled in this process"
+        );
+        return RestartProcessOutcome::Continue;
+    }
+
+    if job.status != "pending" {
+        info!(
+            job_id = job.job_id,
+            status = %job.status,
+            "Skipping non-pending restart job"
+        );
+        return RestartProcessOutcome::Continue;
+    }
+
+    let started_at = Utc::now().to_rfc3339();
+    if job.action != "restart" {
+        let failed = terminal_restart_state(
+            job.job_id,
+            "failed",
+            Some(format!("Unsupported restart job action: {}", job.action)),
+            Some(started_at.clone()),
+            started_at,
+        );
+        match report(failed).await {
+            Ok(()) => memory.mark_handled(job.job_id),
+            Err(error) => warn!(
+                job_id = job.job_id,
+                error = %error,
+                "Failed to report unsupported restart job action"
+            ),
+        }
+        return RestartProcessOutcome::Continue;
+    }
+
+    let restarting = restarting_state(job.job_id, started_at.clone());
+    if let Err(error) = report(restarting).await {
+        warn!(
+            job_id = job.job_id,
+            error = %error,
+            "Failed to report restart job before exiting"
+        );
+        return RestartProcessOutcome::Continue;
+    }
+
+    let marker = RestartJobMarker {
+        job_id: job.job_id,
+        started_at: started_at.clone(),
+    };
+    if let Err(error) = write_restart_job_marker(marker_path, &marker) {
+        let failed_at = Utc::now().to_rfc3339();
+        let failed = terminal_restart_state(
+            job.job_id,
+            "failed",
+            Some(format!("Failed to persist restart marker: {error}")),
+            Some(started_at),
+            failed_at,
+        );
+        match report(failed).await {
+            Ok(()) => memory.mark_handled(job.job_id),
+            Err(report_error) => warn!(
+                job_id = job.job_id,
+                error = %report_error,
+                "Failed to report restart marker write failure"
+            ),
+        }
+        return RestartProcessOutcome::Continue;
+    }
+
+    memory.mark_handled(job.job_id);
+    info!(
+        job_id = job.job_id,
+        path = %marker_path.display(),
+        "Restart job accepted; exiting for service-managed restart"
+    );
+    RestartProcessOutcome::ExitNonZero
+}
+
+async fn maybe_process_restart_job<R, Fut>(
+    client: &reqwest::Client,
+    config: &ServerConfig,
+    marker_path: &Path,
+    memory: &mut RestartJobMemory,
+    report: R,
+) -> RestartProcessOutcome
+where
+    R: FnMut(RestartHeartbeatState) -> Fut,
+    Fut: std::future::Future<Output = Result<()>>,
+{
+    let job = match fetch_restart_job_command(client, config).await {
+        Ok(job) => job,
+        Err(error) => {
+            warn!(error = %error, "Failed to poll restart job command");
+            return RestartProcessOutcome::Continue;
+        }
+    };
+
+    let Some(job) = job else {
+        return RestartProcessOutcome::Continue;
+    };
+
+    process_restart_job_command(&job, marker_path, memory, report).await
 }
 
 fn pending_firmware_status(job: &FirmwareJobCommand) -> &'static str {
@@ -1198,6 +1585,7 @@ pub async fn run_agent_heartbeat_poster(
     let heartbeat_interval = Duration::from_secs(30);
     let mut telemetry_sampler = TelemetrySampler::new();
     let mut firmware_job_memory = FirmwareJobMemory::default();
+    let mut restart_job_memory = RestartJobMemory::default();
     loop {
         sleep(heartbeat_interval).await;
         onvif_probe.poll_for_jobs(&client, &config).await;
@@ -1225,6 +1613,73 @@ pub async fn run_agent_heartbeat_poster(
             TelemetryStatus::Operational
         });
         let mut firmware = baseline_firmware_state();
+        let restart_report_firmware = firmware.clone();
+        let restart_marker_outcome =
+            maybe_report_restart_completion_marker(Path::new(RESTART_JOB_MARKER_PATH), |restart| {
+                let client = client.clone();
+                let config = config.clone();
+                let agent_id = agent_id.clone();
+                let telemetry = telemetry.clone();
+                let camera_status = camera_status.clone();
+                let firmware = restart_report_firmware.clone();
+                async move {
+                    let timestamp = Utc::now().to_rfc3339();
+                    let payload = build_agent_heartbeat_payload(
+                        &agent_id,
+                        &timestamp,
+                        camera_status,
+                        &telemetry,
+                        &firmware,
+                        Some(&restart),
+                    );
+                    post_heartbeat(&client, &config, &payload).await
+                }
+            })
+            .await;
+        let restart_for_payload = match &restart_marker_outcome {
+            RestartMarkerReportOutcome::Reported(state) => {
+                if let Some(job_id) = state.job_id {
+                    restart_job_memory.mark_handled(job_id);
+                }
+                Some(state.clone())
+            }
+            RestartMarkerReportOutcome::Missing => None,
+            RestartMarkerReportOutcome::Pending => None,
+        };
+
+        if restart_marker_outcome != RestartMarkerReportOutcome::Pending {
+            let restart_outcome = maybe_process_restart_job(
+                &client,
+                &config,
+                Path::new(RESTART_JOB_MARKER_PATH),
+                &mut restart_job_memory,
+                |restart| {
+                    let client = client.clone();
+                    let config = config.clone();
+                    let agent_id = agent_id.clone();
+                    let telemetry = telemetry.clone();
+                    let camera_status = camera_status.clone();
+                    let firmware = firmware.clone();
+                    async move {
+                        let timestamp = Utc::now().to_rfc3339();
+                        let payload = build_agent_heartbeat_payload(
+                            &agent_id,
+                            &timestamp,
+                            camera_status,
+                            &telemetry,
+                            &firmware,
+                            Some(&restart),
+                        );
+                        post_heartbeat(&client, &config, &payload).await
+                    }
+                },
+            )
+            .await;
+            if restart_outcome.should_exit() {
+                std::process::exit(restart_outcome.exit_code());
+            }
+        }
+
         maybe_process_firmware_job(
             &client,
             &config,
@@ -1236,6 +1691,7 @@ pub async fn run_agent_heartbeat_poster(
                 let agent_id = agent_id.clone();
                 let telemetry = telemetry.clone();
                 let camera_status = camera_status.clone();
+                let restart_for_payload = restart_for_payload.clone();
                 async move {
                     let timestamp = Utc::now().to_rfc3339();
                     let payload = build_agent_heartbeat_payload(
@@ -1244,6 +1700,7 @@ pub async fn run_agent_heartbeat_poster(
                         camera_status,
                         &telemetry,
                         &firmware_state,
+                        restart_for_payload.as_ref(),
                     );
                     if let Err(error) = post_heartbeat(&client, &config, &payload).await {
                         warn!(error = %error, "Failed to post firmware heartbeat update");
@@ -1260,6 +1717,7 @@ pub async fn run_agent_heartbeat_poster(
             camera_status,
             &telemetry,
             &firmware,
+            restart_for_payload.as_ref(),
         );
 
         let config_clone = config.clone();
@@ -1282,13 +1740,17 @@ mod tests {
     use super::{
         baseline_firmware_state_from_paths, build_agent_heartbeat_payload,
         build_heartbeat_telemetry, build_idle_firmware_state, firmware_versions_match,
-        pick_firmware_updater_cmd, pick_installed_firmware_version, try_fallback_paths,
-        FallbackOutcome, FirmwareJobMemory, MemoryUsageMb, OnvifProbeJobCommand,
-        OnvifProbeJobResponse, OnvifProbeManager, TelemetryCapabilities, TelemetryStatus,
-        DEFAULT_FIRMWARE_UPDATER_CMD,
+        maybe_report_restart_completion_marker, pick_firmware_updater_cmd,
+        pick_installed_firmware_version, process_restart_job_command, read_restart_job_marker,
+        try_fallback_paths, write_restart_job_marker, FallbackOutcome, FirmwareJobMemory,
+        MemoryUsageMb, OnvifProbeJobCommand, OnvifProbeJobResponse, OnvifProbeManager,
+        RestartHeartbeatState, RestartJobCommand, RestartJobMarker, RestartJobMemory,
+        RestartJobResponse, RestartMarkerReportOutcome, RestartProcessOutcome,
+        TelemetryCapabilities, TelemetryStatus, DEFAULT_FIRMWARE_UPDATER_CMD, RESTART_EXIT_CODE,
     };
     use serde_json::{json, Value};
     use std::fs;
+    use std::sync::{Arc, Mutex};
     use std::time::{SystemTime, UNIX_EPOCH};
 
     fn unique_test_dir(name: &str) -> std::path::PathBuf {
@@ -1523,6 +1985,7 @@ mod tests {
             })],
             &telemetry,
             &firmware,
+            None,
         );
 
         assert_eq!(payload["agent_id"], "agent-1");
@@ -1634,6 +2097,7 @@ mod tests {
             })],
             &telemetry,
             &firmware,
+            None,
         );
 
         assert_eq!(payload["agent_id"], "agent-1");
@@ -1644,6 +2108,263 @@ mod tests {
         assert_eq!(payload["firmware"]["can_rollback"], true);
         assert_eq!(payload["firmware"]["target_version"], Value::Null);
         assert_eq!(payload["cameras"][0]["camera_id"], "cam-1");
+    }
+
+    #[test]
+    fn agent_heartbeat_payload_includes_restart_state_when_present() {
+        let telemetry = build_heartbeat_telemetry(
+            TelemetryStatus::Operational,
+            Some(12),
+            Some(MemoryUsageMb {
+                used_mb: 321,
+                total_mb: 2048,
+            }),
+            vec!["model-1".to_string()],
+            TelemetryCapabilities::default(),
+        );
+        let firmware = build_idle_firmware_state(Some("1.1.2".to_string()), true);
+        let restart = RestartHeartbeatState {
+            job_id: Some(88),
+            status: Some("restarting".to_string()),
+            error: None,
+            started_at: Some("2026-04-09T10:00:00Z".to_string()),
+            finished_at: None,
+        };
+
+        let payload = build_agent_heartbeat_payload(
+            "agent-1",
+            "2026-04-09T10:00:00Z",
+            Vec::new(),
+            &telemetry,
+            &firmware,
+            Some(&restart),
+        );
+
+        assert_eq!(payload["restart"]["job_id"], 88);
+        assert_eq!(payload["restart"]["status"], "restarting");
+        assert_eq!(payload["restart"]["error"], Value::Null);
+        assert_eq!(payload["restart"]["started_at"], "2026-04-09T10:00:00Z");
+        assert_eq!(payload["restart"]["finished_at"], Value::Null);
+    }
+
+    #[test]
+    fn restart_job_response_parses_null_and_pending_job() {
+        let empty: RestartJobResponse =
+            serde_json::from_value(json!({ "job": Value::Null })).expect("empty response");
+        assert!(empty.job.is_none());
+
+        let pending: RestartJobResponse = serde_json::from_value(json!({
+            "job": {
+                "job_id": 44,
+                "action": "restart",
+                "status": "pending",
+            },
+        }))
+        .expect("pending response");
+        let job = pending.job.expect("job exists");
+
+        assert_eq!(job.job_id, 44);
+        assert_eq!(job.action, "restart");
+        assert_eq!(job.status, "pending");
+    }
+
+    #[test]
+    fn restart_marker_write_read_round_trip() {
+        let dir = unique_test_dir("restart-marker-round-trip");
+        fs::create_dir_all(&dir).expect("temp dir");
+        let marker_path = dir.join("restart-job.json");
+        let marker = RestartJobMarker {
+            job_id: 55,
+            started_at: "2026-04-09T10:00:00Z".to_string(),
+        };
+
+        write_restart_job_marker(&marker_path, &marker).expect("write marker");
+        let read = read_restart_job_marker(&marker_path).expect("read marker");
+
+        assert_eq!(read, marker);
+        fs::remove_dir_all(&dir).expect("cleanup");
+    }
+
+    #[tokio::test]
+    async fn unsupported_restart_action_reports_failed_state() {
+        let dir = unique_test_dir("restart-unsupported");
+        fs::create_dir_all(&dir).expect("temp dir");
+        let marker_path = dir.join("restart-job.json");
+        let job = RestartJobCommand {
+            job_id: 66,
+            action: "poweroff".to_string(),
+            status: "pending".to_string(),
+        };
+        let mut memory = RestartJobMemory::default();
+        let reported = Arc::new(Mutex::new(Vec::new()));
+        let reported_for_closure = reported.clone();
+
+        let outcome =
+            process_restart_job_command(&job, &marker_path, &mut memory, move |restart| {
+                let reported = reported_for_closure.clone();
+                async move {
+                    reported.lock().expect("reported states").push(restart);
+                    Ok(())
+                }
+            })
+            .await;
+
+        assert_eq!(outcome, RestartProcessOutcome::Continue);
+        assert!(memory.is_handled(66));
+        assert!(!marker_path.exists());
+        let reported = reported.lock().expect("reported states");
+        assert_eq!(reported.len(), 1);
+        assert_eq!(reported[0].job_id, Some(66));
+        assert_eq!(reported[0].status.as_deref(), Some("failed"));
+        assert!(reported[0]
+            .error
+            .as_deref()
+            .expect("error")
+            .contains("Unsupported restart job action"));
+        assert!(reported[0].finished_at.is_some());
+
+        fs::remove_dir_all(&dir).expect("cleanup");
+    }
+
+    #[tokio::test]
+    async fn restart_execution_writes_marker_and_plans_nonzero_exit() {
+        let dir = unique_test_dir("restart-execution");
+        fs::create_dir_all(&dir).expect("temp dir");
+        let marker_path = dir.join("restart-job.json");
+        let job = RestartJobCommand {
+            job_id: 77,
+            action: "restart".to_string(),
+            status: "pending".to_string(),
+        };
+        let mut memory = RestartJobMemory::default();
+        let reported = Arc::new(Mutex::new(Vec::new()));
+        let reported_for_closure = reported.clone();
+
+        let outcome =
+            process_restart_job_command(&job, &marker_path, &mut memory, move |restart| {
+                let reported = reported_for_closure.clone();
+                async move {
+                    reported.lock().expect("reported states").push(restart);
+                    Ok(())
+                }
+            })
+            .await;
+
+        assert_eq!(outcome, RestartProcessOutcome::ExitNonZero);
+        assert!(outcome.should_exit());
+        assert_eq!(outcome.exit_code(), RESTART_EXIT_CODE);
+        assert!(memory.is_handled(77));
+        let marker = read_restart_job_marker(&marker_path).expect("read marker");
+        assert_eq!(marker.job_id, 77);
+        assert!(!marker.started_at.is_empty());
+
+        let reported = reported.lock().expect("reported states");
+        assert_eq!(reported.len(), 1);
+        assert_eq!(reported[0].job_id, Some(77));
+        assert_eq!(reported[0].status.as_deref(), Some("restarting"));
+        assert!(reported[0].finished_at.is_none());
+
+        fs::remove_dir_all(&dir).expect("cleanup");
+    }
+
+    #[tokio::test]
+    async fn restart_completion_marker_deletes_only_after_successful_heartbeat() {
+        let dir = unique_test_dir("restart-completion");
+        fs::create_dir_all(&dir).expect("temp dir");
+        let marker_path = dir.join("restart-job.json");
+        let marker = RestartJobMarker {
+            job_id: 88,
+            started_at: "2026-04-09T10:00:00Z".to_string(),
+        };
+        write_restart_job_marker(&marker_path, &marker).expect("write marker");
+
+        let failed_reports = Arc::new(Mutex::new(Vec::new()));
+        let failed_reports_for_closure = failed_reports.clone();
+        let failed_outcome = maybe_report_restart_completion_marker(&marker_path, move |restart| {
+            let failed_reports = failed_reports_for_closure.clone();
+            async move {
+                failed_reports.lock().expect("failed reports").push(restart);
+                Err(anyhow::anyhow!("heartbeat unavailable"))
+            }
+        })
+        .await;
+
+        assert_eq!(failed_outcome, RestartMarkerReportOutcome::Pending);
+        assert!(marker_path.exists());
+        let failed_reports = failed_reports.lock().expect("failed reports");
+        assert_eq!(failed_reports.len(), 1);
+        assert_eq!(failed_reports[0].job_id, Some(88));
+        assert_eq!(failed_reports[0].status.as_deref(), Some("succeeded"));
+        drop(failed_reports);
+
+        let successful_reports = Arc::new(Mutex::new(Vec::new()));
+        let successful_reports_for_closure = successful_reports.clone();
+        let success_outcome =
+            maybe_report_restart_completion_marker(&marker_path, move |restart| {
+                let successful_reports = successful_reports_for_closure.clone();
+                async move {
+                    successful_reports
+                        .lock()
+                        .expect("successful reports")
+                        .push(restart);
+                    Ok(())
+                }
+            })
+            .await;
+
+        let RestartMarkerReportOutcome::Reported(reported_state) = success_outcome else {
+            panic!("expected reported marker");
+        };
+        assert_eq!(reported_state.job_id, Some(88));
+        assert_eq!(reported_state.status.as_deref(), Some("succeeded"));
+        assert_eq!(
+            reported_state.started_at.as_deref(),
+            Some("2026-04-09T10:00:00Z")
+        );
+        assert!(reported_state.finished_at.is_some());
+        assert!(!marker_path.exists());
+        let successful_reports = successful_reports.lock().expect("successful reports");
+        assert_eq!(successful_reports.len(), 1);
+
+        fs::remove_dir_all(&dir).expect("cleanup");
+    }
+
+    #[tokio::test]
+    async fn malformed_restart_marker_with_job_id_reports_failed_then_deletes() {
+        let dir = unique_test_dir("restart-malformed");
+        fs::create_dir_all(&dir).expect("temp dir");
+        let marker_path = dir.join("restart-job.json");
+        fs::write(&marker_path, r#"{"job_id":99}"#).expect("malformed marker");
+        let reports = Arc::new(Mutex::new(Vec::new()));
+        let reports_for_closure = reports.clone();
+
+        let outcome = maybe_report_restart_completion_marker(&marker_path, move |restart| {
+            let reports = reports_for_closure.clone();
+            async move {
+                reports.lock().expect("reports").push(restart);
+                Ok(())
+            }
+        })
+        .await;
+
+        let RestartMarkerReportOutcome::Reported(state) = outcome else {
+            panic!("expected reported malformed marker");
+        };
+        assert_eq!(state.job_id, Some(99));
+        assert_eq!(state.status.as_deref(), Some("failed"));
+        assert!(state
+            .error
+            .as_deref()
+            .expect("error")
+            .contains("Failed to parse restart marker"));
+        assert!(state.finished_at.is_some());
+        assert!(!marker_path.exists());
+
+        let reports = reports.lock().expect("reports");
+        assert_eq!(reports.len(), 1);
+        assert_eq!(reports[0], state);
+
+        fs::remove_dir_all(&dir).expect("cleanup");
     }
 
     #[tokio::test]
