@@ -51,6 +51,10 @@ fn env_string(key: &str, default: &str) -> String {
     AgentConfig::runtime_var(key).unwrap_or_else(|| default.to_string())
 }
 
+fn runtime_bool(key: &str, default: bool) -> bool {
+    AgentConfig::runtime_bool(key, default)
+}
+
 #[derive(Clone)]
 struct OnvifSettings {
     sub_termination: String,
@@ -562,12 +566,21 @@ pub async fn run_onvif_motion_poller(bus: EventBus, motion_state: MotionStateBus
 
 fn load_onvif_cameras_from_env() -> Result<Vec<OnvifCameraConfig>> {
     let mut cams = Vec::new();
+    let mut saw_configured_slot = false;
     for i in 1..=4 {
         let prefix = format!("CAM{}_ONVIF_", i);
         let host = match AgentConfig::runtime_var(&format!("{prefix}HOST")) {
             Some(v) if !v.trim().is_empty() => v,
             _ => continue,
         };
+        saw_configured_slot = true;
+        let motion_enabled = runtime_bool(
+            &format!("CAM{}_MOTION_ENABLED", i),
+            runtime_bool("MOTION_ENABLED", true),
+        );
+        if !motion_enabled {
+            continue;
+        }
         let port: u16 = AgentConfig::runtime_var(&format!("{prefix}PORT"))
             .and_then(|v| v.parse().ok())
             .unwrap_or(2020);
@@ -586,11 +599,14 @@ fn load_onvif_cameras_from_env() -> Result<Vec<OnvifCameraConfig>> {
         });
     }
 
-    if !cams.is_empty() {
+    if saw_configured_slot {
         return Ok(cams);
     }
 
     let host = env_string("ONVIF_HOST", "192.168.1.187");
+    if !runtime_bool("MOTION_ENABLED", true) {
+        return Ok(Vec::new());
+    }
     let port: u16 = AgentConfig::runtime_var("ONVIF_PORT")
         .and_then(|v| v.parse().ok())
         .unwrap_or(2020);
@@ -917,6 +933,68 @@ mod tests {
         assert_eq!(cam.port, 3030);
         assert_eq!(cam.user, "alice");
         assert_eq!(cam.pass, "secret");
+    }
+
+    #[test]
+    fn onvif_loader_skips_camera_slots_with_motion_disabled() {
+        let _guard = EnvGuard::new();
+
+        let cfg = json!({
+            "cameras": [
+                {
+                    "id": "ABLAK",
+                    "user": "alice",
+                    "pass": "secret",
+                    "motion": {
+                        "enabled": true
+                    },
+                    "onvif": {
+                        "url": "http://10.20.30.40:3030/onvif/service"
+                    }
+                },
+                {
+                    "id": "Room",
+                    "user": "bob",
+                    "pass": "secret2",
+                    "motion": {
+                        "enabled": false
+                    },
+                    "onvif": {
+                        "url": "http://10.20.30.41:2020/onvif/service"
+                    }
+                }
+            ]
+        });
+        AgentConfig::apply_json_env_overrides(&cfg);
+
+        let cameras = load_onvif_cameras_from_env().expect("load onvif cameras from env");
+        assert_eq!(cameras.len(), 1);
+        assert_eq!(cameras[0].camera_id, "ABLAK");
+    }
+
+    #[test]
+    fn onvif_loader_respects_global_motion_disabled_for_single_camera() {
+        let _guard = EnvGuard::new();
+
+        let cfg = json!({
+            "cameras": [
+                {
+                    "id": "cam-from-json",
+                    "user": "alice",
+                    "pass": "secret",
+                    "motion": {
+                        "enabled": false
+                    },
+                    "onvif": {
+                        "url": "http://10.20.30.40:3030/onvif/service"
+                    }
+                }
+            ]
+        });
+        AgentConfig::apply_json_env_overrides(&cfg);
+
+        let cameras = load_onvif_cameras_from_env().expect("load onvif cameras from env");
+        assert!(cameras.is_empty());
     }
 
     #[test]
