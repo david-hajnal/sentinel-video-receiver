@@ -168,6 +168,21 @@ impl AgentConfig {
         Self::write_json_file(path, &current)
     }
 
+    /// Merge a remote camera config into camera.json.
+    ///
+    /// Canonical remote configs carry cameras[]; when one arrives, stale legacy
+    /// top-level camera fields must not survive from an older local file.
+    pub fn merge_remote_camera_json(path: &Path, update: &Value) -> std::io::Result<()> {
+        let mut current = Self::load_json_value_with_default(path, Self::default_camera_json())?;
+        let mut update = update.clone();
+        if has_canonical_cameras(&update) {
+            strip_top_level_legacy_camera_fields(&mut current);
+            strip_top_level_legacy_camera_fields(&mut update);
+        }
+        merge_value(&mut current, &update);
+        Self::write_json_file(path, &current)
+    }
+
     /// Build and install runtime key-value overrides from JSON.
     pub fn install_runtime_overrides(value: &Value) {
         let mut map = HashMap::new();
@@ -808,6 +823,77 @@ fn merge_value(base: &mut Value, update: &Value) {
     }
 }
 
+fn has_canonical_cameras(value: &Value) -> bool {
+    value.get("cameras").and_then(Value::as_array).is_some()
+}
+
+fn strip_top_level_legacy_camera_fields(value: &mut Value) {
+    let Some(map) = value.as_object_mut() else {
+        return;
+    };
+    let legacy_keys = [
+        "camera_id",
+        "user",
+        "pass",
+        "stream_id",
+        "transport",
+        "motion",
+        "features",
+        "local_clip_enabled",
+        "rtsp_receiver_enabled",
+        "rtsp",
+        "rtsp_url",
+        "rtsp_host",
+        "rtsp_port",
+        "rtsp_path",
+        "rtsp_user",
+        "rtsp_pass",
+        "rtp_port",
+        "rtcp_port",
+        "onvif",
+        "onvif_url",
+        "onvif_host",
+        "onvif_port",
+        "onvif_user",
+        "onvif_pass",
+        "onvif_debug",
+        "onvif_dump_xml",
+        "onvif_sub_termination",
+        "onvif_renew_every_secs",
+        "onvif_pull_timeout",
+        "onvif_pull_limit",
+        "onvif_resubscribe_after_errors",
+        "onvif_min_poll_gap_ms",
+        "onvif_after_sub_delay_ms",
+        "onvif_connrefused_retries",
+        "onvif_connrefused_backoff_ms",
+        "cam1_camera_id",
+        "cam1_stream_id",
+        "cam1_transport",
+        "cam1_rtsp_url",
+        "cam1_rtsp_user",
+        "cam1_rtsp_pass",
+        "cam1_rtp_port",
+        "cam1_rtcp_port",
+        "cam2_camera_id",
+        "cam2_stream_id",
+        "cam2_transport",
+        "cam2_rtsp_url",
+        "cam2_rtsp_user",
+        "cam2_rtsp_pass",
+        "cam2_rtp_port",
+        "cam2_rtcp_port",
+    ];
+    let keys_to_remove: Vec<String> = map
+        .keys()
+        .filter(|key| legacy_keys.contains(&key.to_lowercase().as_str()))
+        .cloned()
+        .collect();
+    for key in keys_to_remove {
+        map.remove(&key);
+    }
+}
+
 fn has_non_null(value: &Value) -> bool {
     match value {
         Value::Null => false,
@@ -932,7 +1018,9 @@ mod tests {
     use super::AgentConfig;
     use serde_json::json;
     use std::collections::HashMap;
+    use std::fs;
     use std::sync::MutexGuard;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     struct EnvGuard {
         _lock: MutexGuard<'static, ()>,
@@ -954,6 +1042,17 @@ mod tests {
         fn drop(&mut self) {
             AgentConfig::runtime_restore(std::mem::take(&mut self.saved));
         }
+    }
+
+    fn unique_test_dir(name: &str) -> std::path::PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time")
+            .as_nanos();
+        std::env::temp_dir().join(format!(
+            "sentinel-agent-config-{name}-{}-{nanos}",
+            std::process::id()
+        ))
     }
 
     #[test]
@@ -997,5 +1096,50 @@ mod tests {
             AgentConfig::runtime_var("CLIP_STALE_PART_SECS").as_deref(),
             Some("3600")
         );
+    }
+
+    #[test]
+    fn merge_remote_camera_json_strips_stale_top_level_legacy_camera_fields() {
+        let dir = unique_test_dir("canonical-remote");
+        fs::create_dir_all(&dir).expect("test dir");
+        let camera_path = dir.join("camera.json");
+        AgentConfig::write_json_file(
+            &camera_path,
+            &json!({
+                "camera_id": "ABLAK",
+                "rtsp_url": "rtsp://192.168.1.187:554/stream2",
+                "onvif": { "host": "192.168.1.187", "port": 2020 },
+                "cameras": [{
+                    "id": "ABLAK",
+                    "rtsp": { "url": "rtsp://192.168.1.187:554/stream2", "stream_id": 1 }
+                }],
+                "cleanup": { "min_free_bytes": 12345 }
+            }),
+        )
+        .expect("write stale camera config");
+
+        AgentConfig::merge_remote_camera_json(
+            &camera_path,
+            &json!({
+                "cameras": [{
+                    "id": "aff8812b-c6be-4e59-aefd-40b59b425d92",
+                    "rtsp": { "url": "rtsp://192.168.1.189/stream2", "stream_id": 1 },
+                    "onvif": { "url": "http://192.168.1.189:2020/onvif/service" }
+                }]
+            }),
+        )
+        .expect("merge remote config");
+
+        let written = AgentConfig::load_camera_json(&camera_path).expect("read written config");
+        assert!(written.get("camera_id").is_none());
+        assert!(written.get("rtsp_url").is_none());
+        assert!(written.get("onvif").is_none());
+        assert_eq!(
+            written["cameras"][0]["id"],
+            "aff8812b-c6be-4e59-aefd-40b59b425d92"
+        );
+        assert_eq!(written["cleanup"]["min_free_bytes"], 12345);
+
+        fs::remove_dir_all(dir).expect("remove test dir");
     }
 }

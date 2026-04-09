@@ -46,16 +46,19 @@ async fn try_pull_remote_config(
     camera_path: &PathBuf,
 ) -> Result<bool> {
     let url = format!("{}/api/v1/config", base_url.trim_end_matches('/'));
-    let mut resp = {
-        let mut req = client.get(&url).bearer_auth(bearer_token);
+    let mut resp = client.get(&url).bearer_auth(bearer_token).send().await?;
+    let should_retry_with_hint =
+        camera_hint.is_some() && should_retry_config_pull_with_hint(resp.status());
+    if should_retry_with_hint {
+        warn!("Agent config pull failed; retrying with camera hint");
         if let Some(hint) = camera_hint.as_deref() {
-            req = req.header("x-camera-id", hint);
+            resp = client
+                .get(&url)
+                .bearer_auth(bearer_token)
+                .header("x-camera-id", hint)
+                .send()
+                .await?;
         }
-        req.send().await?
-    };
-    if resp.status() == reqwest::StatusCode::NOT_FOUND && camera_hint.is_some() {
-        warn!("Config pull failed for hinted camera; retrying without hint");
-        resp = client.get(&url).bearer_auth(bearer_token).send().await?;
     }
     if !resp.status().is_success() {
         warn!(
@@ -75,13 +78,16 @@ async fn try_pull_remote_config(
     if let Some(obj) = camera_update.as_object_mut() {
         obj.remove("server");
     }
-    AgentConfig::merge_json_file_with_default(
-        camera_path,
-        &camera_update,
-        AgentConfig::default_camera_json(),
-    )?;
+    AgentConfig::merge_remote_camera_json(camera_path, &camera_update)?;
 
     Ok(true)
+}
+
+fn should_retry_config_pull_with_hint(status: reqwest::StatusCode) -> bool {
+    matches!(
+        status,
+        reqwest::StatusCode::BAD_REQUEST | reqwest::StatusCode::NOT_FOUND
+    )
 }
 
 #[tokio::main]
@@ -596,4 +602,151 @@ async fn run_camera(cam: CamConfig, uplink: Uplink, cancel: CancellationToken) -
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+    use std::fs;
+    use std::time::{SystemTime, UNIX_EPOCH};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::{TcpListener, TcpStream};
+
+    fn unique_test_dir(name: &str) -> std::path::PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time")
+            .as_nanos();
+        std::env::temp_dir().join(format!(
+            "sentinel-agent-forward-{name}-{}-{nanos}",
+            std::process::id()
+        ))
+    }
+
+    async fn read_request(stream: &mut TcpStream) -> String {
+        let mut request = Vec::new();
+        let mut buf = [0_u8; 1024];
+        loop {
+            let n = stream.read(&mut buf).await.expect("read request");
+            if n == 0 {
+                break;
+            }
+            request.extend_from_slice(&buf[..n]);
+            if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                break;
+            }
+        }
+        String::from_utf8_lossy(&request).into_owned()
+    }
+
+    fn camera_hint_header(request: &str) -> Option<String> {
+        request.lines().find_map(|line| {
+            let (name, value) = line.split_once(':')?;
+            if name.eq_ignore_ascii_case("x-camera-id") {
+                Some(value.trim().to_string())
+            } else {
+                None
+            }
+        })
+    }
+
+    fn http_response(status: &str, body: &str) -> String {
+        format!(
+            "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+            body.len()
+        )
+    }
+
+    async fn spawn_config_server() -> (String, tokio::task::JoinHandle<Vec<Option<String>>>) {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test server");
+        let base_url = format!("http://{}", listener.local_addr().expect("local addr"));
+        let handle = tokio::spawn(async move {
+            let mut observed = Vec::new();
+            for attempt in 0..2 {
+                let (mut stream, _) = listener.accept().await.expect("accept request");
+                let request = read_request(&mut stream).await;
+                observed.push(camera_hint_header(&request));
+                let response = if attempt == 0 {
+                    http_response("400 Bad Request", r#"{"error":"camera hint required"}"#)
+                } else {
+                    let body = json!({
+                        "config": {
+                            "server": {
+                                "bearer_token": "remote-token"
+                            },
+                            "cameras": [
+                                {
+                                    "id": "ABLAK",
+                                    "rtsp": { "url": "rtsp://192.168.1.187:554/stream2", "stream_id": 1 }
+                                },
+                                {
+                                    "id": "aff8812b-c6be-4e59-aefd-40b59b425d92",
+                                    "rtsp": { "url": "rtsp://192.168.1.189/stream2", "stream_id": 2 }
+                                }
+                            ]
+                        }
+                    })
+                    .to_string();
+                    http_response("200 OK", &body)
+                };
+                stream
+                    .write_all(response.as_bytes())
+                    .await
+                    .expect("write response");
+            }
+            observed
+        });
+        (base_url, handle)
+    }
+
+    #[tokio::test]
+    async fn remote_config_pull_tries_agent_config_before_camera_hint() {
+        let dir = unique_test_dir("pull-order");
+        fs::create_dir_all(&dir).expect("test dir");
+        let camera_path = dir.join("camera.json");
+        AgentConfig::write_json_file(
+            &camera_path,
+            &json!({
+                "camera_id": "ABLAK",
+                "cameras": [{
+                    "id": "ABLAK",
+                    "rtsp": { "url": "rtsp://192.168.1.187:554/stream2", "stream_id": 1 }
+                }]
+            }),
+        )
+        .expect("write starting camera config");
+        let (base_url, requests) = spawn_config_server().await;
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(5))
+            .build()
+            .expect("http client");
+
+        let pulled = try_pull_remote_config(
+            &client,
+            &base_url,
+            "agent-token",
+            Some("ABLAK".to_string()),
+            &dir.join("server.json"),
+            &camera_path,
+        )
+        .await
+        .expect("pull config");
+
+        assert!(pulled);
+        assert_eq!(
+            requests.await.expect("request log"),
+            vec![None, Some("ABLAK".to_string())]
+        );
+        let written = AgentConfig::load_camera_json(&camera_path).expect("read camera config");
+        assert!(written.get("server").is_none());
+        assert_eq!(
+            written["cameras"][1]["id"],
+            "aff8812b-c6be-4e59-aefd-40b59b425d92"
+        );
+
+        fs::remove_dir_all(dir).expect("remove test dir");
+    }
 }
