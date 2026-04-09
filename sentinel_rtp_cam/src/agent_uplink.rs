@@ -346,7 +346,8 @@ impl Uplink {
                                 Some(msg) = media_rx.recv() => {
                                     match msg.msg_type {
                                         RTP => {
-                                            if let Err(e) = write_record(&mut write_half, RECORD_RTP, 0, &msg.payload).await {
+                                            let payload = encode_rtp_tls(msg.stream_id, &msg.payload);
+                                            if let Err(e) = write_record(&mut write_half, RECORD_RTP, 0, &payload).await {
                                                 error!(error = %e, "Uplink write failed, reconnecting");
                                                 break;
                                             }
@@ -594,12 +595,28 @@ fn generate_nonce() -> String {
     base64::engine::general_purpose::STANDARD.encode(&buf)
 }
 
+fn encode_rtp_tls(stream_id: u32, rtp_bytes: &[u8]) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(4 + rtp_bytes.len());
+    buf.extend_from_slice(&stream_id.to_be_bytes());
+    buf.extend_from_slice(rtp_bytes);
+    buf
+}
+
 fn encode_gap_tls(stream_id: u32, last_seq: u16, new_seq: u16) -> Vec<u8> {
     let mut buf = [0u8; 8];
     buf[0..4].copy_from_slice(&stream_id.to_be_bytes());
     buf[4..6].copy_from_slice(&last_seq.to_be_bytes());
     buf[6..8].copy_from_slice(&new_seq.to_be_bytes());
     buf.to_vec()
+}
+
+fn decode_rtp_tls(buf: &[u8]) -> Result<(u32, Vec<u8>)> {
+    if buf.len() < 4 {
+        return Err(anyhow!("rtp tls payload too short: {}", buf.len()));
+    }
+
+    let stream_id = u32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]);
+    Ok((stream_id, buf[4..].to_vec()))
 }
 
 fn build_streams_info(
@@ -626,11 +643,12 @@ fn build_streams_info(
 #[cfg(test)]
 mod tests {
     use super::{
-        build_event_payload, build_streams_info, encode_gap_tls, load_tls_config, read_record,
-        resolve_server_name, write_record, HelloIngestConfig, HelloPayload, RECORD_EVENT,
+        build_event_payload, build_streams_info, decode_rtp_tls, encode_gap_tls, encode_rtp_tls,
+        load_tls_config, read_record, resolve_server_name, write_record, HelloIngestConfig,
+        HelloPayload, RECORD_EVENT, RECORD_GAP, RECORD_RTP,
     };
     use crate::config::AgentConfig;
-    use crate::proto::Msg;
+    use crate::proto::{Msg, GAP, RTP};
     use serde_json::json;
     use std::collections::HashMap;
     use std::sync::MutexGuard;
@@ -819,6 +837,19 @@ mod tests {
         assert_eq!(encoded, vec![0, 0, 0, 9, 0x12, 0x34, 0xAB, 0xCD]);
     }
 
+    #[test]
+    fn encode_rtp_tls_prefixes_big_endian_stream_id() {
+        let encoded = encode_rtp_tls(9, &[0x80, 0x60, 0x12, 0x34]);
+        assert_eq!(encoded, vec![0, 0, 0, 9, 0x80, 0x60, 0x12, 0x34]);
+    }
+
+    #[test]
+    fn encode_rtp_tls_prefixes_stream_id_two_as_big_endian() {
+        let encoded = encode_rtp_tls(2, &[0x80, 0x60, 0x12, 0x34]);
+        assert_eq!(&encoded[..4], &[0x00, 0x00, 0x00, 0x02]);
+        assert_eq!(&encoded[4..], &[0x80, 0x60, 0x12, 0x34]);
+    }
+
     #[tokio::test]
     async fn read_and_write_record_roundtrip() {
         let (mut a, mut b) = duplex(1024);
@@ -834,6 +865,117 @@ mod tests {
         assert_eq!(record.record_type, RECORD_EVENT);
         assert_eq!(record.flags, 3);
         assert_eq!(record.payload, b"hello".to_vec());
+    }
+
+    #[test]
+    fn decode_rtp_tls_recovers_stream_id_and_rtp_bytes() {
+        let payload = encode_rtp_tls(42, &[0x80, 0x60, 0x12, 0x34]);
+
+        let (stream_id, rtp) = decode_rtp_tls(&payload).expect("decode framed rtp");
+
+        assert_eq!(stream_id, 42);
+        assert_eq!(rtp, vec![0x80, 0x60, 0x12, 0x34]);
+    }
+
+    #[tokio::test]
+    async fn tls_rtp_record_roundtrip_preserves_stream_id_on_wire() {
+        let (mut a, mut b) = duplex(1024);
+        let payload = encode_rtp_tls(7, &[0x80, 0x60, 0x12, 0x34]);
+
+        tokio::spawn(async move {
+            write_record(&mut a, RECORD_RTP, 0, &payload).await.unwrap();
+        });
+
+        let record = read_record(&mut b).await.unwrap();
+        assert_eq!(record.record_type, RECORD_RTP);
+
+        let (stream_id, rtp) = decode_rtp_tls(&record.payload).expect("decode framed rtp");
+        assert_eq!(stream_id, 7);
+        assert_eq!(rtp, vec![0x80, 0x60, 0x12, 0x34]);
+    }
+
+    #[tokio::test]
+    async fn tls_rtp_records_distinguish_different_stream_ids() {
+        let (mut a, mut b) = duplex(1024);
+        let first = encode_rtp_tls(1, &[0x80, 0x60, 0xAA, 0xBB]);
+        let second = encode_rtp_tls(2, &[0x80, 0x60, 0xAA, 0xBB]);
+
+        tokio::spawn(async move {
+            write_record(&mut a, RECORD_RTP, 0, &first).await.unwrap();
+            write_record(&mut a, RECORD_RTP, 0, &second).await.unwrap();
+        });
+
+        let first_record = read_record(&mut b).await.unwrap();
+        let second_record = read_record(&mut b).await.unwrap();
+
+        assert_eq!(first_record.record_type, RECORD_RTP);
+        assert_eq!(second_record.record_type, RECORD_RTP);
+        assert_ne!(first_record.payload, second_record.payload);
+
+        let (first_stream_id, first_rtp) =
+            decode_rtp_tls(&first_record.payload).expect("decode first framed rtp");
+        let (second_stream_id, second_rtp) =
+            decode_rtp_tls(&second_record.payload).expect("decode second framed rtp");
+
+        assert_eq!(first_stream_id, 1);
+        assert_eq!(second_stream_id, 2);
+        assert_eq!(first_rtp, second_rtp);
+    }
+
+    #[test]
+    fn encode_rtp_tls_changes_only_the_stream_prefix_for_identical_rtp_bodies() {
+        let first = encode_rtp_tls(1, &[0x80, 0x60, 0xAA, 0xBB]);
+        let second = encode_rtp_tls(2, &[0x80, 0x60, 0xAA, 0xBB]);
+
+        assert_ne!(&first[..4], &second[..4]);
+        assert_eq!(&first[4..], &second[4..]);
+    }
+
+    #[tokio::test]
+    async fn tls_rtp_write_path_from_msg_is_server_compatible() {
+        let (mut a, mut b) = duplex(1024);
+        let msg = Msg {
+            msg_type: RTP,
+            stream_id: 2,
+            payload: vec![0x80, 0x60, 0x12, 0x34],
+        };
+
+        tokio::spawn(async move {
+            let payload = match msg.msg_type {
+                RTP => encode_rtp_tls(msg.stream_id, &msg.payload),
+                _ => unreachable!("test only covers RTP"),
+            };
+            write_record(&mut a, RECORD_RTP, 0, &payload).await.unwrap();
+        });
+
+        let record = read_record(&mut b).await.unwrap();
+        assert_eq!(record.record_type, RECORD_RTP);
+        assert_eq!(
+            record.payload,
+            vec![0x00, 0x00, 0x00, 0x02, 0x80, 0x60, 0x12, 0x34]
+        );
+
+        let (stream_id, rtp) = decode_rtp_tls(&record.payload).expect("decode framed rtp");
+        assert_eq!(stream_id, 2);
+        assert_eq!(rtp, vec![0x80, 0x60, 0x12, 0x34]);
+    }
+
+    #[tokio::test]
+    async fn gap_tls_record_roundtrip_still_uses_stream_prefixed_payload() {
+        let (mut a, mut b) = duplex(1024);
+        let msg = Msg {
+            msg_type: GAP,
+            stream_id: 9,
+            payload: encode_gap_tls(9, 0x1234, 0xABCD),
+        };
+
+        tokio::spawn(async move {
+            write_record(&mut a, RECORD_GAP, 0, &msg.payload).await.unwrap();
+        });
+
+        let record = read_record(&mut b).await.unwrap();
+        assert_eq!(record.record_type, RECORD_GAP);
+        assert_eq!(record.payload, vec![0, 0, 0, 9, 0x12, 0x34, 0xAB, 0xCD]);
     }
 
     #[test]
