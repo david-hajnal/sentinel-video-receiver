@@ -578,7 +578,7 @@ fn build_streams_info(
 mod tests {
     use super::{
         build_event_payload, build_streams_info, encode_gap_tls, load_tls_config, read_record,
-        resolve_server_name, write_record, HelloIngestConfig, RECORD_EVENT,
+        resolve_server_name, write_record, HelloIngestConfig, HelloPayload, RECORD_EVENT,
     };
     use crate::config::AgentConfig;
     use crate::proto::Msg;
@@ -648,6 +648,40 @@ mod tests {
                 .and_then(|cfg| cfg.clip_post_secs),
             Some(120)
         );
+    }
+
+    #[test]
+    fn build_streams_info_uses_canonical_camera_ids_for_multi_camera_hello() {
+        let mut stream_map = HashMap::new();
+        stream_map.insert(2, "cam2".to_string());
+        stream_map.insert(1, "cam1".to_string());
+        let mut stream_camera_map = HashMap::new();
+        stream_camera_map.insert(1, "ABLAK".to_string());
+        stream_camera_map.insert(2, "aff8812b-c6be-4e59-aefd-40b59b425d92".to_string());
+
+        let streams_info = build_streams_info(&stream_map, &stream_camera_map, None);
+        let streams: Vec<String> = streams_info.iter().map(|s| s.name.clone()).collect();
+        let hello = HelloPayload {
+            agent_id: "01KH1V1AMEP4NDDDJ0SRV067TW".to_string(),
+            token: "agent-token".to_string(),
+            streams,
+            timestamp_unix: 1_775_463_330,
+            nonce: "nonce".to_string(),
+            streams_info,
+        };
+
+        let payload = serde_json::to_value(&hello).expect("serialize hello");
+        assert_eq!(
+            payload["streams_info"][0]["camera_id"].as_str(),
+            Some("ABLAK")
+        );
+        assert_eq!(
+            payload["streams_info"][1]["camera_id"].as_str(),
+            Some("aff8812b-c6be-4e59-aefd-40b59b425d92")
+        );
+        assert_eq!(payload["streams_info"][0]["stream_id"].as_u64(), Some(1));
+        assert_eq!(payload["streams_info"][1]["stream_id"].as_u64(), Some(2));
+        assert!(!payload.to_string().contains("CAM2"));
     }
 
     #[test]
@@ -724,12 +758,10 @@ mod tests {
         assert_eq!(event.rule.as_deref(), Some("motion"));
         assert!(event.camera_id.is_none());
         assert!(event.event_ts_unix_ms > 0);
-        assert!(
-            event
-                .event_id
-                .as_deref()
-                .is_some_and(|id| id.starts_with("stream42-"))
-        );
+        assert!(event
+            .event_id
+            .as_deref()
+            .is_some_and(|id| id.starts_with("stream42-")));
     }
 
     #[test]
@@ -744,7 +776,9 @@ mod tests {
         let payload = b"hello".to_vec();
 
         tokio::spawn(async move {
-            write_record(&mut a, RECORD_EVENT, 3, &payload).await.unwrap();
+            write_record(&mut a, RECORD_EVENT, 3, &payload)
+                .await
+                .unwrap();
         });
 
         let record = read_record(&mut b).await.unwrap();

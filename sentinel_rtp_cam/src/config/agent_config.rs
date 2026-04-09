@@ -1099,6 +1099,59 @@ mod tests {
     }
 
     #[test]
+    fn apply_json_env_overrides_sets_multi_camera_runtime_slots() {
+        let _guard = EnvGuard::new();
+
+        let cfg = json!({
+            "agent_id": "01KH1V1AMEP4NDDDJ0SRV067TW",
+            "server": {
+                "bearer_token": "agent-token"
+            },
+            "cameras": [
+                {
+                    "id": "ABLAK",
+                    "rtsp": {
+                        "url": "rtsp://192.168.1.187:554/stream2",
+                        "stream_id": 1
+                    },
+                    "transport": "udp"
+                },
+                {
+                    "id": "aff8812b-c6be-4e59-aefd-40b59b425d92",
+                    "rtsp": {
+                        "url": "rtsp://192.168.1.189:554/stream2",
+                        "stream_id": 2
+                    },
+                    "transport": "udp"
+                }
+            ]
+        });
+
+        AgentConfig::apply_json_env_overrides(&cfg);
+
+        assert_eq!(
+            AgentConfig::runtime_var("CAM1_CAMERA_ID").as_deref(),
+            Some("ABLAK")
+        );
+        assert_eq!(
+            AgentConfig::runtime_var("CAM1_STREAM_ID").as_deref(),
+            Some("1")
+        );
+        assert_eq!(
+            AgentConfig::runtime_var("CAM2_CAMERA_ID").as_deref(),
+            Some("aff8812b-c6be-4e59-aefd-40b59b425d92")
+        );
+        assert_eq!(
+            AgentConfig::runtime_var("CAM2_STREAM_ID").as_deref(),
+            Some("2")
+        );
+        assert_eq!(
+            AgentConfig::runtime_var("CAM2_RTSP_URL").as_deref(),
+            Some("rtsp://192.168.1.189:554/stream2")
+        );
+    }
+
+    #[test]
     fn merge_remote_camera_json_strips_stale_top_level_legacy_camera_fields() {
         let dir = unique_test_dir("canonical-remote");
         fs::create_dir_all(&dir).expect("test dir");

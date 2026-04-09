@@ -607,11 +607,27 @@ async fn run_camera(cam: CamConfig, uplink: Uplink, cancel: CancellationToken) -
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sentinel_rtp_cam::forward_agent::resolve_stream_id;
     use serde_json::json;
     use std::fs;
     use std::time::{SystemTime, UNIX_EPOCH};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::{TcpListener, TcpStream};
+
+    struct EnvGuard;
+
+    impl EnvGuard {
+        fn new() -> Self {
+            AgentConfig::clear_runtime_overrides();
+            Self
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            AgentConfig::clear_runtime_overrides();
+        }
+    }
 
     fn unique_test_dir(name: &str) -> std::path::PathBuf {
         let nanos = SystemTime::now()
@@ -622,6 +638,49 @@ mod tests {
             "sentinel-agent-forward-{name}-{}-{nanos}",
             std::process::id()
         ))
+    }
+
+    #[test]
+    fn multi_camera_env_maps_test2_to_stream_two() {
+        let _guard = EnvGuard::new();
+        AgentConfig::apply_json_env_overrides(&json!({
+            "agent_id": "01KH1V1AMEP4NDDDJ0SRV067TW",
+            "server": {
+                "bearer_token": "agent-token"
+            },
+            "cameras": [
+                {
+                    "id": "ABLAK",
+                    "rtsp": {
+                        "url": "rtsp://192.168.1.187:554/stream2",
+                        "stream_id": 1
+                    },
+                    "transport": "udp"
+                },
+                {
+                    "id": "aff8812b-c6be-4e59-aefd-40b59b425d92",
+                    "rtsp": {
+                        "url": "rtsp://192.168.1.189:554/stream2",
+                        "stream_id": 2
+                    },
+                    "transport": "udp"
+                }
+            ]
+        }));
+
+        let cams = load_cameras_from_env().expect("load cameras");
+        assert_eq!(cams.len(), 2);
+        assert_eq!(cams[0].camera_id, "ABLAK");
+        assert_eq!(cams[0].stream_id, 1);
+        assert_eq!(cams[1].camera_id, "aff8812b-c6be-4e59-aefd-40b59b425d92");
+        assert_eq!(cams[1].stream_id, 2);
+
+        let (_stream_map, camera_to_stream) = build_stream_maps(&cams);
+        assert_eq!(resolve_stream_id("ABLAK", &camera_to_stream), 1);
+        assert_eq!(
+            resolve_stream_id("aff8812b-c6be-4e59-aefd-40b59b425d92", &camera_to_stream),
+            2
+        );
     }
 
     async fn read_request(stream: &mut TcpStream) -> String {

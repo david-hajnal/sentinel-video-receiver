@@ -178,3 +178,56 @@ pub fn forward_motion_event<S: MotionSender>(
 }
 
 pub use crate::motion_event_latch::MotionEventIdLatch;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::Utc;
+    use std::sync::Mutex;
+
+    #[derive(Debug, Default)]
+    struct RecordingSender {
+        sent: Mutex<Vec<(u32, String)>>,
+    }
+
+    impl MotionSender for RecordingSender {
+        fn send_motion(
+            &self,
+            stream_id: u32,
+            _rule: String,
+            _active: bool,
+            _ts: String,
+            camera_id: String,
+            _event_id: String,
+        ) {
+            self.sent
+                .lock()
+                .expect("sent lock")
+                .push((stream_id, camera_id));
+        }
+    }
+
+    #[test]
+    fn forward_motion_event_uses_matching_multi_camera_stream_id() {
+        let sender = RecordingSender::default();
+        let cam_map = HashMap::from([
+            ("ABLAK".to_string(), 1),
+            ("aff8812b-c6be-4e59-aefd-40b59b425d92".to_string(), 2),
+        ]);
+        let event = MotionEvent {
+            rule: "MyMotionDetectorRule".to_string(),
+            active: true,
+            ts: Utc::now(),
+            camera_id: "aff8812b-c6be-4e59-aefd-40b59b425d92".to_string(),
+            event_id: "01KNRT40GBMBNKHJS8C15AWZS3".to_string(),
+        };
+
+        let stream_id = forward_motion_event(&sender, &cam_map, &event);
+
+        assert_eq!(stream_id, 2);
+        assert_eq!(
+            sender.sent.lock().expect("sent lock").as_slice(),
+            &[(2, "aff8812b-c6be-4e59-aefd-40b59b425d92".to_string())]
+        );
+    }
+}
