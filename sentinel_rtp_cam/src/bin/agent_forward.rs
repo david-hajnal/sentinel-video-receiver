@@ -6,6 +6,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::net::UdpSocket;
 use tokio::sync::RwLock;
+use tokio::task::JoinHandle;
 use tokio::time::sleep;
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
@@ -76,6 +77,208 @@ fn build_camera_heartbeat_targets(
             config_version: camera_versions.get(&cam.camera_id).cloned().flatten(),
         })
         .collect()
+}
+
+#[derive(Debug, Clone)]
+struct DesiredRuntime {
+    server_addr: String,
+    cams: Vec<CamConfig>,
+    config_value: Value,
+}
+
+struct AgentRuntime {
+    config_value: Value,
+    uplink: Uplink,
+    cancel: CancellationToken,
+    tasks: Vec<JoinHandle<()>>,
+}
+
+impl AgentRuntime {
+    fn matches_config(&self, config_value: &Value) -> bool {
+        self.config_value == *config_value
+    }
+
+    async fn stop(self) {
+        self.cancel.cancel();
+        self.uplink.shutdown();
+        for task in self.tasks {
+            task.abort();
+        }
+    }
+}
+
+fn desired_runtime_from_config(config_value: &Value) -> Result<Option<DesiredRuntime>> {
+    let Some(server_addr) = runtime_var("SERVER_ADDR") else {
+        return Ok(None);
+    };
+    let cams = load_cameras_from_env()?;
+    if cams.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(DesiredRuntime {
+        server_addr,
+        cams,
+        config_value: config_value.clone(),
+    }))
+}
+
+fn spawn_task<F>(future: F) -> JoinHandle<()>
+where
+    F: std::future::Future<Output = ()> + Send + 'static,
+{
+    tokio::spawn(future)
+}
+
+fn start_runtime(desired: &DesiredRuntime) -> Result<AgentRuntime> {
+    let applied_config_version: Arc<RwLock<Option<Value>>> =
+        Arc::new(RwLock::new(config_version_value(&desired.config_value)));
+    let camera_targets = Arc::new(RwLock::new(build_camera_heartbeat_targets(
+        &desired.cams,
+        &desired.config_value,
+    )));
+    let agent_id = desired
+        .cams
+        .first()
+        .map(|cam| cam.agent_id.clone())
+        .unwrap_or_else(|| "agent-1".to_string());
+    let onvif_probe_cameras = match load_onvif_probe_cameras_from_env() {
+        Ok(cameras) => cameras,
+        Err(error) => {
+            warn!(
+                error = %error,
+                "Failed to load ONVIF probe camera config; capability probes disabled"
+            );
+            Vec::new()
+        }
+    };
+    let onvif_probe = OnvifProbeManager::new(
+        desired
+            .cams
+            .iter()
+            .map(|cam| cam.camera_id.clone())
+            .collect(),
+        onvif_probe_cameras,
+        Some(agent_id.clone()),
+    );
+    let mut tasks = Vec::new();
+    if runtime_var("SERVER_BASE_URL").is_some() && runtime_var("SERVER_BEARER_TOKEN").is_some() {
+        let server_cfg = AgentConfig::from_env().server;
+        let applied_config_version = applied_config_version.clone();
+        let camera_targets = camera_targets.clone();
+        let heartbeat_agent_id = agent_id.clone();
+        let onvif_probe = onvif_probe.clone();
+        tasks.push(spawn_task(async move {
+            if let Err(error) = run_agent_heartbeat_poster(
+                server_cfg,
+                heartbeat_agent_id,
+                applied_config_version,
+                camera_targets,
+                onvif_probe,
+            )
+            .await
+            {
+                warn!(error = %error, "Agent heartbeat task ended");
+            }
+        }));
+    }
+
+    info!(camera_count = desired.cams.len(), "Loaded camera configs");
+    for cam in &desired.cams {
+        info!(
+            camera_id = %cam.camera_id,
+            stream_id = cam.stream_id,
+            transport = %cam.transport,
+            rtp_port = cam.rtp_port,
+            rtcp_port = cam.rtcp_port,
+            "Camera configured"
+        );
+    }
+
+    let (stream_map, camera_to_stream) = build_stream_maps(&desired.cams);
+    let stream_to_camera: HashMap<u32, String> = camera_to_stream
+        .iter()
+        .map(|(camera_id, stream_id)| (*stream_id, camera_id.clone()))
+        .collect();
+    let agent_token = desired
+        .cams
+        .first()
+        .map(|cam| cam.agent_token.clone())
+        .ok_or_else(|| anyhow!("No cameras configured"))?;
+    let token_mismatch = desired
+        .cams
+        .iter()
+        .any(|cam| cam.agent_token != agent_token);
+    if token_mismatch {
+        bail!("Multiple agent tokens found; single uplink requires a shared token");
+    }
+    let token_prefix: String = agent_token.chars().take(6).collect();
+    let stream_ingest = load_uplink_ingest_config_from_env();
+    info!(
+        server = %desired.server_addr,
+        agent_id = %agent_id,
+        token_prefix = %token_prefix,
+        stream_count = stream_map.len(),
+        clip_pre_secs = ?stream_ingest.as_ref().and_then(|cfg| cfg.clip_pre_secs),
+        clip_post_secs = ?stream_ingest.as_ref().and_then(|cfg| cfg.clip_post_secs),
+        clip_ring_secs = ?stream_ingest.as_ref().and_then(|cfg| cfg.clip_ring_secs),
+        clip_stale_part_secs = ?stream_ingest.as_ref().and_then(|cfg| cfg.clip_stale_part_secs),
+        clip_max_secs = ?stream_ingest.as_ref().and_then(|cfg| cfg.clip_max_secs),
+        "Agent uplink configured"
+    );
+    let uplink = Uplink::connect_and_run(
+        desired.server_addr.clone(),
+        agent_token,
+        agent_id,
+        stream_map,
+        stream_to_camera,
+        stream_ingest,
+    );
+
+    let cancel = CancellationToken::new();
+    for cam in desired.cams.clone() {
+        let uplink = uplink.clone();
+        let cancel = cancel.clone();
+        tasks.push(spawn_task(async move {
+            if let Err(error) = run_camera(cam, uplink, cancel).await {
+                warn!(error = %error, "Camera task ended");
+            }
+        }));
+    }
+
+    let bus = EventBus::new(128);
+    let (motion_state, _rx) = MotionStateBus::new();
+
+    let cam_map = camera_to_stream.clone();
+    let uplink_motion = uplink.clone();
+    let motion_merge_secs = runtime_i64("MOTION_MERGE_SECS")
+        .or_else(|| runtime_i64("CLIP_POST_SECS"))
+        .unwrap_or(0)
+        .max(0);
+    let motion_merge_window = chrono::Duration::seconds(motion_merge_secs);
+    let bus_sub = bus.clone();
+    tasks.push(spawn_task(async move {
+        let mut rx = bus_sub.subscribe().await;
+        let mut latch = MotionEventIdLatch::new_with_grace(motion_merge_window);
+        while let Some(ev) = rx.recv().await {
+            let Event::Motion(motion_event) = ev;
+            let motion_event = latch.normalize(motion_event);
+            let stream_id = forward_motion_event(&uplink_motion, &cam_map, &motion_event);
+            info!(stream_id, motion_event = %motion_event, "Forwarding motion event");
+        }
+    }));
+
+    tasks.push(spawn_task(async move {
+        if let Err(error) = run_onvif_motion_poller(bus, motion_state).await {
+            warn!(error = %error, "ONVIF motion poller ended");
+        }
+    }));
+
+    Ok(AgentRuntime {
+        config_value: desired.config_value.clone(),
+        uplink,
+        cancel,
+        tasks,
+    })
 }
 
 async fn try_pull_remote_config(
@@ -179,11 +382,11 @@ async fn main() -> Result<()> {
     let http_client = reqwest::Client::builder()
         .timeout(Duration::from_secs(10))
         .build()?;
-    let applied_config_version: Arc<RwLock<Option<Value>>> = Arc::new(RwLock::new(None));
-    let camera_targets: Arc<RwLock<Vec<CameraHeartbeatTarget>>> = Arc::new(RwLock::new(Vec::new()));
     let mut last_status = Instant::now() - Duration::from_secs(120);
     let mut last_pull = Instant::now() - Duration::from_secs(120);
-    let (server_addr, cams, config_value) = loop {
+    let mut runtime: Option<AgentRuntime> = None;
+
+    loop {
         let server_value = match AgentConfig::load_server_json(&server_source_path) {
             Ok(value) => value,
             Err(e) => {
@@ -214,14 +417,13 @@ async fn main() -> Result<()> {
             AgentConfig::merge_server_camera_configs(&camera_value, &server_value);
         AgentConfig::apply_json_env_overrides(&config_value);
 
-        let mut server_addr = runtime_var("SERVER_ADDR");
-        let mut cams = match load_cameras_from_env() {
-            Ok(cams) => cams,
+        let mut desired = match desired_runtime_from_config(&config_value) {
+            Ok(desired) => desired,
             Err(e) => {
                 if last_status.elapsed() > Duration::from_secs(30) {
                     warn!(error = %e, "Camera config incomplete; waiting for config");
                 }
-                Vec::new()
+                None
             }
         };
 
@@ -252,15 +454,14 @@ async fn main() -> Result<()> {
                                     &server_value,
                                 );
                                 AgentConfig::apply_json_env_overrides(&config_value);
-                                server_addr = runtime_var("SERVER_ADDR");
-                                cams = match load_cameras_from_env() {
-                                    Ok(cams) => cams,
+                                desired = match desired_runtime_from_config(&config_value) {
+                                    Ok(desired) => desired,
                                     Err(e) => {
                                         warn!(
                                             error = %e,
                                             "Reloaded config is still incomplete after pull"
                                         );
-                                        Vec::new()
+                                        None
                                     }
                                 };
                             }
@@ -284,164 +485,55 @@ async fn main() -> Result<()> {
             last_pull = Instant::now();
         }
 
-        let ready = server_addr.is_some() && !cams.is_empty();
-        if ready {
-            break (server_addr.unwrap(), cams, config_value);
-        }
-
-        if last_status.elapsed() > Duration::from_secs(30) {
-            let server_hint = if server_addr.is_some() {
-                "server_addr=ok"
-            } else {
-                "server_addr=missing"
-            };
-            warn!(
-                camera_count = cams.len(),
-                server_hint, "Agent in standby; waiting for forward config"
-            );
-            last_status = Instant::now();
-        }
-
-        sleep(Duration::from_secs(5)).await;
-    };
-
-    {
-        let mut guard = camera_targets.write().await;
-        *guard = build_camera_heartbeat_targets(&cams, &config_value);
-    }
-    *applied_config_version.write().await = config_version_value(&config_value);
-
-    let agent_id = cams
-        .first()
-        .map(|cam| cam.agent_id.clone())
-        .unwrap_or_else(|| "agent-1".to_string());
-    let onvif_probe_cameras = match load_onvif_probe_cameras_from_env() {
-        Ok(cameras) => cameras,
-        Err(error) => {
-            warn!(
-                error = %error,
-                "Failed to load ONVIF probe camera config; capability probes disabled"
-            );
-            Vec::new()
-        }
-    };
-    let onvif_probe = OnvifProbeManager::new(
-        cams.iter().map(|cam| cam.camera_id.clone()).collect(),
-        onvif_probe_cameras,
-        Some(agent_id.clone()),
-    );
-    if runtime_var("SERVER_BASE_URL").is_some() && runtime_var("SERVER_BEARER_TOKEN").is_some() {
-        let server_cfg = AgentConfig::from_env().server;
-        let applied_config_version = applied_config_version.clone();
-        let camera_targets = camera_targets.clone();
-        let heartbeat_agent_id = agent_id.clone();
-        let onvif_probe = onvif_probe.clone();
-        tokio::spawn(async move {
-            if let Err(error) = run_agent_heartbeat_poster(
-                server_cfg,
-                heartbeat_agent_id,
-                applied_config_version,
-                camera_targets,
-                onvif_probe,
-            )
-            .await
-            {
-                warn!(error = %error, "Agent heartbeat task ended");
+        if let Some(ref desired_runtime) = desired {
+            let needs_restart = runtime
+                .as_ref()
+                .map(|running| !running.matches_config(&desired_runtime.config_value))
+                .unwrap_or(true);
+            if needs_restart {
+                match start_runtime(desired_runtime) {
+                    Ok(new_runtime) => {
+                        if let Some(old_runtime) = runtime.replace(new_runtime) {
+                            old_runtime.stop().await;
+                        }
+                        info!(
+                            camera_count = desired_runtime.cams.len(),
+                            "Applied updated camera config"
+                        );
+                    }
+                    Err(e) => {
+                        warn!(error = %e, "Failed to apply updated camera config");
+                    }
+                }
             }
-        });
-    }
-
-    info!(camera_count = cams.len(), "Loaded camera configs");
-    for cam in &cams {
-        info!(
-            camera_id = %cam.camera_id,
-            stream_id = cam.stream_id,
-            transport = %cam.transport,
-            rtp_port = cam.rtp_port,
-            rtcp_port = cam.rtcp_port,
-            "Camera configured"
-        );
-    }
-
-    let (stream_map, camera_to_stream) = build_stream_maps(&cams);
-    let stream_to_camera: HashMap<u32, String> = camera_to_stream
-        .iter()
-        .map(|(camera_id, stream_id)| (*stream_id, camera_id.clone()))
-        .collect();
-    let agent_token = cams
-        .first()
-        .map(|cam| cam.agent_token.clone())
-        .ok_or_else(|| anyhow!("No cameras configured"))?;
-    let token_mismatch = cams.iter().any(|cam| cam.agent_token != agent_token);
-    if token_mismatch {
-        bail!("Multiple agent tokens found; single uplink requires a shared token");
-    }
-    let token_prefix: String = agent_token.chars().take(6).collect();
-    let stream_ingest = load_uplink_ingest_config_from_env();
-    info!(
-        server = %server_addr,
-        agent_id = %agent_id,
-        token_prefix = %token_prefix,
-        stream_count = stream_map.len(),
-        clip_pre_secs = ?stream_ingest.as_ref().and_then(|cfg| cfg.clip_pre_secs),
-        clip_post_secs = ?stream_ingest.as_ref().and_then(|cfg| cfg.clip_post_secs),
-        clip_ring_secs = ?stream_ingest.as_ref().and_then(|cfg| cfg.clip_ring_secs),
-        clip_stale_part_secs = ?stream_ingest.as_ref().and_then(|cfg| cfg.clip_stale_part_secs),
-        clip_max_secs = ?stream_ingest.as_ref().and_then(|cfg| cfg.clip_max_secs),
-        "Agent uplink configured"
-    );
-    let uplink = Uplink::connect_and_run(
-        server_addr,
-        agent_token,
-        agent_id,
-        stream_map,
-        stream_to_camera,
-        stream_ingest,
-    );
-
-    let cancel = CancellationToken::new();
-
-    for cam in cams.clone() {
-        let uplink = uplink.clone();
-        let cancel = cancel.clone();
-        tokio::spawn(async move {
-            if let Err(e) = run_camera(cam, uplink, cancel).await {
-                warn!(error = %e, "Camera task ended");
+        } else {
+            if let Some(old_runtime) = runtime.take() {
+                old_runtime.stop().await;
+                info!("Config no longer ready; agent entering standby");
             }
-        });
+            if last_status.elapsed() > Duration::from_secs(30) {
+                let server_hint = if runtime_var("SERVER_ADDR").is_some() {
+                    "server_addr=ok"
+                } else {
+                    "server_addr=missing"
+                };
+                warn!(
+                    camera_count = 0,
+                    server_hint, "Agent in standby; waiting for forward config"
+                );
+                last_status = Instant::now();
+            }
+        }
+
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => break,
+            _ = sleep(Duration::from_secs(5)) => {}
+        }
     }
 
-    // ONVIF integration (single poller, map by camera_id -> stream_id)
-    let bus = EventBus::new(128);
-    let (motion_state, _rx) = MotionStateBus::new();
-
-    let cam_map = camera_to_stream.clone();
-    let uplink_motion = uplink.clone();
-    let motion_merge_secs = runtime_i64("MOTION_MERGE_SECS")
-        .or_else(|| runtime_i64("CLIP_POST_SECS"))
-        .unwrap_or(0)
-        .max(0);
-    let motion_merge_window = chrono::Duration::seconds(motion_merge_secs);
-    let bus_sub = bus.clone();
-    tokio::spawn(async move {
-        let mut rx = bus_sub.subscribe().await;
-        let mut latch = MotionEventIdLatch::new_with_grace(motion_merge_window);
-        while let Some(ev) = rx.recv().await {
-            let Event::Motion(motion_event) = ev;
-            let motion_event = latch.normalize(motion_event);
-            let stream_id = forward_motion_event(&uplink_motion, &cam_map, &motion_event);
-            info!(stream_id, motion_event = %motion_event, "Forwarding motion event");
-        }
-    });
-
-    tokio::spawn(async move {
-        if let Err(e) = run_onvif_motion_poller(bus, motion_state).await {
-            warn!(error = %e, "ONVIF motion poller ended");
-        }
-    });
-
-    tokio::signal::ctrl_c().await?;
-    cancel.cancel();
+    if let Some(runtime) = runtime.take() {
+        runtime.stop().await;
+    }
     Ok(())
 }
 
@@ -674,16 +766,27 @@ mod tests {
     use sentinel_rtp_cam::forward_agent::resolve_stream_id;
     use serde_json::json;
     use std::fs;
+    use std::sync::{Mutex, MutexGuard, OnceLock};
     use std::time::{SystemTime, UNIX_EPOCH};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::{TcpListener, TcpStream};
 
-    struct EnvGuard;
+    struct EnvGuard {
+        _lock: MutexGuard<'static, ()>,
+    }
+
+    fn runtime_test_lock() -> &'static Mutex<()> {
+        static RUNTIME_TEST_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        RUNTIME_TEST_LOCK.get_or_init(|| Mutex::new(()))
+    }
 
     impl EnvGuard {
         fn new() -> Self {
+            let _lock = runtime_test_lock()
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner());
             AgentConfig::clear_runtime_overrides();
-            Self
+            Self { _lock }
         }
     }
 
@@ -771,6 +874,87 @@ mod tests {
         );
         assert_eq!(targets[0].config_version, Some(json!(11)));
         assert_eq!(targets[1].config_version, Some(json!(12)));
+    }
+
+    #[test]
+    fn desired_runtime_from_config_drops_removed_camera_slots() {
+        let _guard = EnvGuard::new();
+        let initial = json!({
+            "server": {
+                "bearer_token": "agent-token"
+            },
+            "forward_agent": {
+                "server_addr": "127.0.0.1:7443"
+            },
+            "cameras": [
+                {
+                    "id": "ABLAK",
+                    "rtsp": {
+                        "url": "rtsp://192.168.1.187:554/stream2",
+                        "stream_id": 1
+                    },
+                    "transport": "udp"
+                },
+                {
+                    "id": "cam-2",
+                    "rtsp": {
+                        "url": "rtsp://192.168.1.189:554/stream2",
+                        "stream_id": 2
+                    },
+                    "transport": "tcp"
+                }
+            ]
+        });
+        AgentConfig::apply_json_env_overrides(&initial);
+        let runtime = desired_runtime_from_config(&initial)
+            .expect("build desired runtime")
+            .expect("runtime should be ready");
+        assert_eq!(runtime.cams.len(), 2);
+        assert_eq!(runtime.cams[1].camera_id, "cam-2");
+
+        let updated = json!({
+            "server": {
+                "bearer_token": "agent-token"
+            },
+            "forward_agent": {
+                "server_addr": "127.0.0.1:7443"
+            },
+            "cameras": [
+                {
+                    "id": "ABLAK",
+                    "rtsp": {
+                        "url": "rtsp://192.168.1.187:554/stream2",
+                        "stream_id": 1
+                    },
+                    "transport": "udp"
+                }
+            ]
+        });
+        AgentConfig::apply_json_env_overrides(&updated);
+        let runtime = desired_runtime_from_config(&updated)
+            .expect("build updated desired runtime")
+            .expect("runtime should stay ready");
+        assert_eq!(runtime.cams.len(), 1);
+        assert_eq!(runtime.cams[0].camera_id, "ABLAK");
+    }
+
+    #[test]
+    fn desired_runtime_from_config_enters_standby_when_cameras_removed() {
+        let _guard = EnvGuard::new();
+        let config = json!({
+            "server": {
+                "bearer_token": "agent-token"
+            },
+            "forward_agent": {
+                "server_addr": "127.0.0.1:7443"
+            },
+            "cameras": []
+        });
+        AgentConfig::apply_json_env_overrides(&config);
+
+        assert!(desired_runtime_from_config(&config)
+            .expect("evaluate desired runtime")
+            .is_none());
     }
 
     async fn read_request(stream: &mut TcpStream) -> String {

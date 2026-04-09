@@ -15,6 +15,7 @@ use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 use tokio::time::{interval, sleep};
 use tokio_rustls::TlsConnector;
+use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 use url::Url;
 
@@ -26,6 +27,7 @@ pub struct Uplink {
     media_tx: mpsc::Sender<Msg>,
     motion_tx: mpsc::UnboundedSender<Msg>,
     stats: Arc<UplinkStats>,
+    shutdown: CancellationToken,
 }
 
 #[derive(Debug, Serialize)]
@@ -114,16 +116,25 @@ impl Uplink {
         let (media_tx, mut media_rx) = mpsc::channel::<Msg>(4096);
         let (motion_tx, mut motion_rx) = mpsc::unbounded_channel::<Msg>();
         let stats = Arc::new(UplinkStats::default());
+        let shutdown = CancellationToken::new();
 
         let stats_task = stats.clone();
+        let shutdown_task = shutdown.clone();
         tokio::spawn(async move {
             let mut backoff = Duration::from_secs(1);
             loop {
+                if shutdown_task.is_cancelled() {
+                    info!("Uplink shutdown requested");
+                    break;
+                }
                 let (connector, server_name) = match build_tls_connector(&server_addr) {
                     Ok(conn) => conn,
                     Err(e) => {
                         error!(error = %e, server = %server_addr, "Uplink TLS config failed");
-                        sleep(backoff).await;
+                        tokio::select! {
+                            _ = shutdown_task.cancelled() => break,
+                            _ = sleep(backoff) => {}
+                        }
                         backoff = (backoff * 2).min(Duration::from_secs(30));
                         continue;
                     }
@@ -135,7 +146,9 @@ impl Uplink {
                             Ok(tls) => tls,
                             Err(e) => {
                                 error!(error = %e, server = %server_addr, "Uplink TLS handshake failed");
-                                sleep(backoff).await;
+                                if !sleep_or_shutdown(&shutdown_task, backoff).await {
+                                    break;
+                                }
                                 backoff = (backoff * 2).min(Duration::from_secs(30));
                                 continue;
                             }
@@ -172,7 +185,9 @@ impl Uplink {
                             Ok(p) => p,
                             Err(e) => {
                                 error!(error = %e, "Failed to serialize HELLO");
-                                sleep(backoff).await;
+                                if !sleep_or_shutdown(&shutdown_task, backoff).await {
+                                    break;
+                                }
                                 continue;
                             }
                         };
@@ -181,7 +196,9 @@ impl Uplink {
                             write_record(&mut write_half, RECORD_HELLO, 0, &payload).await
                         {
                             error!(error = %e, "Failed to send HELLO");
-                            sleep(backoff).await;
+                            if !sleep_or_shutdown(&shutdown_task, backoff).await {
+                                break;
+                            }
                             continue;
                         }
                         info!(stream_count = stream_map.len(), "Uplink HELLO sent");
@@ -201,7 +218,9 @@ impl Uplink {
                                     Ok(ok) => ok,
                                     Err(e) => {
                                         error!(error = %e, "Failed to parse HELLO_OK");
-                                        sleep(backoff).await;
+                                        if !sleep_or_shutdown(&shutdown_task, backoff).await {
+                                            break;
+                                        }
                                         continue;
                                     }
                                 }
@@ -214,7 +233,9 @@ impl Uplink {
                                 } else {
                                     error!("HELLO rejected");
                                 }
-                                sleep(backoff).await;
+                                if !sleep_or_shutdown(&shutdown_task, backoff).await {
+                                    break;
+                                }
                                 continue;
                             }
                             Ok(Ok(rec)) => {
@@ -222,17 +243,23 @@ impl Uplink {
                                     record_type = rec.record_type,
                                     "Unexpected record after HELLO"
                                 );
-                                sleep(backoff).await;
+                                if !sleep_or_shutdown(&shutdown_task, backoff).await {
+                                    break;
+                                }
                                 continue;
                             }
                             Ok(Err(e)) => {
                                 error!(error = %e, "Failed to read HELLO_OK");
-                                sleep(backoff).await;
+                                if !sleep_or_shutdown(&shutdown_task, backoff).await {
+                                    break;
+                                }
                                 continue;
                             }
                             Err(_) => {
                                 error!("Timed out waiting for HELLO_OK");
-                                sleep(backoff).await;
+                                if !sleep_or_shutdown(&shutdown_task, backoff).await {
+                                    break;
+                                }
                                 continue;
                             }
                         };
@@ -264,6 +291,10 @@ impl Uplink {
                         loop {
                             tokio::select! {
                                 biased;
+                                _ = shutdown_task.cancelled() => {
+                                    info!("Uplink shutdown requested");
+                                    break;
+                                }
                                 rec = rec_rx.recv() => {
                                     match rec {
                                         Some(Ok(rec)) => {
@@ -369,13 +400,19 @@ impl Uplink {
                             }
                         }
                         read_task.abort();
+                        if shutdown_task.is_cancelled() {
+                            break;
+                        }
                     }
                     Err(e) => {
                         error!(error = %e, server = %server_addr, "Uplink connect failed");
                     }
                 }
 
-                sleep(backoff).await;
+                tokio::select! {
+                    _ = shutdown_task.cancelled() => break,
+                    _ = sleep(backoff) => {}
+                }
                 backoff = (backoff * 2).min(Duration::from_secs(30));
             }
         });
@@ -384,7 +421,12 @@ impl Uplink {
             media_tx,
             motion_tx,
             stats,
+            shutdown,
         }
+    }
+
+    pub fn shutdown(&self) {
+        self.shutdown.cancel();
     }
 
     pub fn send_rtp(&self, stream_id: u32, rtp_bytes: Vec<u8>) {
@@ -453,6 +495,13 @@ impl Uplink {
                 "Uplink motion channel closed; dropping MOTION"
             );
         }
+    }
+}
+
+async fn sleep_or_shutdown(shutdown: &CancellationToken, duration: Duration) -> bool {
+    tokio::select! {
+        _ = shutdown.cancelled() => false,
+        _ = sleep(duration) => true,
     }
 }
 
