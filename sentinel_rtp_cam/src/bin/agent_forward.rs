@@ -129,6 +129,18 @@ where
     tokio::spawn(future)
 }
 
+fn rtsp_status_error(cam: &CamConfig, method: &str, status: u16) -> anyhow::Error {
+    if status == 401 {
+        warn!(
+            camera_id = %cam.camera_id,
+            stream_id = cam.stream_id,
+            method,
+            "RTSP authentication failed; check RTSP username/password"
+        );
+    }
+    anyhow!("{method} failed: {status}")
+}
+
 fn start_runtime(desired: &DesiredRuntime) -> Result<AgentRuntime> {
     let applied_config_version: Arc<RwLock<Option<Value>>> =
         Arc::new(RwLock::new(config_version_value(&desired.config_value)));
@@ -567,7 +579,7 @@ async fn run_camera(cam: CamConfig, uplink: Uplink, cancel: CancellationToken) -
         .request("OPTIONS", &cam.rtsp_url, &common_headers, None)
         .await?;
     if r.status != 200 {
-        bail!("OPTIONS failed: {}", r.status);
+        return Err(rtsp_status_error(&cam, "OPTIONS", r.status));
     }
     info!(stream_id = cam.stream_id, "RTSP OPTIONS ok");
     let mut describe_headers = vec![("Accept", "application/sdp")];
@@ -578,7 +590,7 @@ async fn run_camera(cam: CamConfig, uplink: Uplink, cancel: CancellationToken) -
         .request("DESCRIBE", &cam.rtsp_url, &describe_headers, None)
         .await?;
     if r.status != 200 {
-        bail!("DESCRIBE failed: {}", r.status);
+        return Err(rtsp_status_error(&cam, "DESCRIBE", r.status));
     }
     info!(stream_id = cam.stream_id, "RTSP DESCRIBE ok");
     let sdp = String::from_utf8_lossy(&r.body);
@@ -605,7 +617,7 @@ async fn run_camera(cam: CamConfig, uplink: Uplink, cancel: CancellationToken) -
         }
         let r = c.request("SETUP", &setup_url, &setup_headers, None).await?;
         if r.status != 200 {
-            bail!("SETUP failed: {}", r.status);
+            return Err(rtsp_status_error(&cam, "SETUP", r.status));
         }
         c.set_session_from(&r);
         info!(stream_id = cam.stream_id, "RTSP SETUP ok (UDP)");
@@ -618,7 +630,7 @@ async fn run_camera(cam: CamConfig, uplink: Uplink, cancel: CancellationToken) -
             .request("PLAY", &cam.rtsp_url, &play_headers, None)
             .await?;
         if r.status != 200 {
-            bail!("PLAY failed: {}", r.status);
+            return Err(rtsp_status_error(&cam, "PLAY", r.status));
         }
         info!(stream_id = cam.stream_id, "RTSP PLAY ok");
 
@@ -697,7 +709,7 @@ async fn run_camera(cam: CamConfig, uplink: Uplink, cancel: CancellationToken) -
         }
         let r = c.request("SETUP", &setup_url, &setup_headers, None).await?;
         if r.status != 200 {
-            bail!("SETUP failed: {}", r.status);
+            return Err(rtsp_status_error(&cam, "SETUP", r.status));
         }
         c.set_session_from(&r);
         info!(stream_id = cam.stream_id, "RTSP SETUP ok (TCP interleaved)");
@@ -710,7 +722,7 @@ async fn run_camera(cam: CamConfig, uplink: Uplink, cancel: CancellationToken) -
             .request("PLAY", &cam.rtsp_url, &play_headers, None)
             .await?;
         if r.status != 200 {
-            bail!("PLAY failed: {}", r.status);
+            return Err(rtsp_status_error(&cam, "PLAY", r.status));
         }
         info!(stream_id = cam.stream_id, "RTSP PLAY ok");
 
@@ -874,6 +886,27 @@ mod tests {
         );
         assert_eq!(targets[0].config_version, Some(json!(11)));
         assert_eq!(targets[1].config_version, Some(json!(12)));
+    }
+
+    #[test]
+    fn rtsp_status_error_mentions_auth_for_401() {
+        let cam = CamConfig {
+            name: "cam1".to_string(),
+            rtsp_url: "rtsp://192.168.1.187:554/stream2".to_string(),
+            rtsp_user: Some("user".to_string()),
+            rtsp_pass: Some("bad-pass".to_string()),
+            stream_id: 1,
+            transport: "udp".to_string(),
+            rtp_port: 5004,
+            rtcp_port: 5005,
+            camera_id: "ABLAK".to_string(),
+            agent_id: "ABLAK".to_string(),
+            agent_token: "agent-token".to_string(),
+        };
+
+        let err = rtsp_status_error(&cam, "DESCRIBE", 401);
+
+        assert_eq!(err.to_string(), "DESCRIBE failed: 401");
     }
 
     #[test]
