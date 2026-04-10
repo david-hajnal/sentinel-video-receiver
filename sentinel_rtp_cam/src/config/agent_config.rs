@@ -254,7 +254,6 @@ impl AgentConfig {
                 let pass = cam.get("pass");
                 let rtsp = cam.get("rtsp").unwrap_or(&Value::Null);
                 let onvif = cam.get("onvif").unwrap_or(&Value::Null);
-                let motion = cam.get("motion").unwrap_or(&Value::Null);
                 let features = cam.get("features").unwrap_or(&Value::Null);
 
                 let cam_id = cam.get("camera_id").or_else(|| cam.get("id"));
@@ -338,10 +337,10 @@ impl AgentConfig {
                     &format!("{prefix}ONVIF_CONNREFUSED_BACKOFF_MS"),
                     onvif.get("connrefused_backoff_ms"),
                 );
-                set_map_if_value(
+                set_map_if_bool(
                     &mut map,
                     &format!("{prefix}MOTION_ENABLED"),
-                    motion.get("enabled"),
+                    motion_enabled_value(cam),
                 );
                 set_map_if_value(
                     &mut map,
@@ -360,14 +359,13 @@ impl AgentConfig {
                 let pass = first.get("pass");
                 let rtsp = first.get("rtsp").unwrap_or(&Value::Null);
                 let onvif = first.get("onvif").unwrap_or(&Value::Null);
-                let motion = first.get("motion").unwrap_or(&Value::Null);
                 let features = first.get("features").unwrap_or(&Value::Null);
 
                 let cam_id = first.get("camera_id").or_else(|| first.get("id"));
                 let cam_agent_id = first.get("agent_id").or(cam_id);
                 set_map_if_unset(&mut map, "CAMERA_ID", cam_id);
                 set_map_if_unset(&mut map, "AGENT_ID", cam_agent_id);
-                set_map_if_unset(&mut map, "MOTION_ENABLED", motion.get("enabled"));
+                set_map_if_unset_bool(&mut map, "MOTION_ENABLED", motion_enabled_value(first));
                 set_map_if_unset(
                     &mut map,
                     "LOCAL_CLIP_ENABLED",
@@ -700,20 +698,14 @@ fn merge_camera_id(value: &Value, default: &str) -> String {
 }
 
 fn merge_motion_enabled(value: &Value, default: bool) -> bool {
-    if let Some(motion) = value.get("motion") {
-        if let Some(enabled) = motion.get("enabled").and_then(|v| v.as_bool()) {
-            return enabled;
-        }
+    if let Some(enabled) = motion_enabled_value(value) {
+        return enabled;
     }
 
     let cameras = value.get("cameras").and_then(|v| v.as_array());
     if let Some(cameras) = cameras {
         if let Some(first) = cameras.first() {
-            if let Some(enabled) = first
-                .get("motion")
-                .and_then(|m| m.get("enabled"))
-                .and_then(|v| v.as_bool())
-            {
+            if let Some(enabled) = motion_enabled_value(first) {
                 return enabled;
             }
         }
@@ -838,6 +830,7 @@ fn strip_top_level_legacy_camera_fields(value: &mut Value) {
         "stream_id",
         "transport",
         "motion",
+        "motion_enabled",
         "features",
         "local_clip_enabled",
         "rtsp_receiver_enabled",
@@ -915,9 +908,31 @@ fn value_to_string(value: &Value) -> Option<String> {
     }
 }
 
+fn bool_to_runtime_string(value: bool) -> String {
+    if value {
+        "1".to_string()
+    } else {
+        "0".to_string()
+    }
+}
+
+fn motion_enabled_value(value: &Value) -> Option<bool> {
+    value
+        .get("motion")
+        .and_then(|motion| motion.get("enabled"))
+        .and_then(Value::as_bool)
+        .or_else(|| value.get("motion_enabled").and_then(Value::as_bool))
+}
+
 fn set_map_if_value(map: &mut HashMap<String, String>, key: &str, value: Option<&Value>) {
     if let Some(value) = value.and_then(value_to_string) {
         map.insert(key.to_string(), value);
+    }
+}
+
+fn set_map_if_bool(map: &mut HashMap<String, String>, key: &str, value: Option<bool>) {
+    if let Some(value) = value {
+        map.insert(key.to_string(), bool_to_runtime_string(value));
     }
 }
 
@@ -941,6 +956,13 @@ fn set_map_if_unset(map: &mut HashMap<String, String>, key: &str, value: Option<
         return;
     }
     set_map_if_value(map, key, value);
+}
+
+fn set_map_if_unset_bool(map: &mut HashMap<String, String>, key: &str, value: Option<bool>) {
+    if map.contains_key(key) {
+        return;
+    }
+    set_map_if_bool(map, key, value);
 }
 
 impl AgentConfig {
@@ -1148,6 +1170,48 @@ mod tests {
         assert_eq!(
             AgentConfig::runtime_var("CAM2_RTSP_URL").as_deref(),
             Some("rtsp://192.168.1.189:554/stream2")
+        );
+    }
+
+    #[test]
+    fn apply_json_env_overrides_maps_legacy_motion_enabled_fields() {
+        let _guard = EnvGuard::new();
+
+        let cfg = json!({
+            "motion_enabled": false,
+            "cameras": [
+                {
+                    "id": "ABLAK",
+                    "motion_enabled": false,
+                    "rtsp": {
+                        "url": "rtsp://192.168.1.187:554/stream2",
+                        "stream_id": 1
+                    }
+                },
+                {
+                    "id": "Room",
+                    "motion_enabled": true,
+                    "rtsp": {
+                        "url": "rtsp://192.168.1.189:554/stream2",
+                        "stream_id": 2
+                    }
+                }
+            ]
+        });
+
+        AgentConfig::apply_json_env_overrides(&cfg);
+
+        assert_eq!(
+            AgentConfig::runtime_var("MOTION_ENABLED").as_deref(),
+            Some("0")
+        );
+        assert_eq!(
+            AgentConfig::runtime_var("CAM1_MOTION_ENABLED").as_deref(),
+            Some("0")
+        );
+        assert_eq!(
+            AgentConfig::runtime_var("CAM2_MOTION_ENABLED").as_deref(),
+            Some("1")
         );
     }
 

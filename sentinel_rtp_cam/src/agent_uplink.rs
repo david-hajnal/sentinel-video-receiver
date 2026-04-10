@@ -970,7 +970,9 @@ mod tests {
         };
 
         tokio::spawn(async move {
-            write_record(&mut a, RECORD_GAP, 0, &msg.payload).await.unwrap();
+            write_record(&mut a, RECORD_GAP, 0, &msg.payload)
+                .await
+                .unwrap();
         });
 
         let record = read_record(&mut b).await.unwrap();

@@ -973,6 +973,39 @@ mod tests {
     }
 
     #[test]
+    fn onvif_loader_skips_camera_slots_with_legacy_motion_enabled_disabled() {
+        let _guard = EnvGuard::new();
+
+        let cfg = json!({
+            "cameras": [
+                {
+                    "id": "ABLAK",
+                    "user": "alice",
+                    "pass": "secret",
+                    "motion_enabled": true,
+                    "onvif": {
+                        "url": "http://10.20.30.40:3030/onvif/service"
+                    }
+                },
+                {
+                    "id": "Room",
+                    "user": "bob",
+                    "pass": "secret2",
+                    "motion_enabled": false,
+                    "onvif": {
+                        "url": "http://10.20.30.41:2020/onvif/service"
+                    }
+                }
+            ]
+        });
+        AgentConfig::apply_json_env_overrides(&cfg);
+
+        let cameras = load_onvif_cameras_from_env().expect("load onvif cameras from env");
+        assert_eq!(cameras.len(), 1);
+        assert_eq!(cameras[0].camera_id, "ABLAK");
+    }
+
+    #[test]
     fn onvif_loader_respects_global_motion_disabled_for_single_camera() {
         let _guard = EnvGuard::new();
 
