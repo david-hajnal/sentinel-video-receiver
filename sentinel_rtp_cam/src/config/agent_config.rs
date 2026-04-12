@@ -226,6 +226,21 @@ impl AgentConfig {
             ingest.get("clip_stale_part_secs"),
         );
         set_map_if_unset(&mut map, "CLIP_MAX_SECS", ingest.get("clip_max_secs"));
+        set_map_if_value(
+            &mut map,
+            "LIVE_PIPELINE_VERSION",
+            ingest.get("live_pipeline_version"),
+        );
+        set_map_if_value(
+            &mut map,
+            "LIVE_HLS_SEGMENT_SECS",
+            ingest.get("live_hls_segment_secs"),
+        );
+        set_map_if_value(
+            &mut map,
+            "LIVE_HLS_WINDOW_SECS",
+            ingest.get("live_hls_window_secs"),
+        );
 
         let forward = value.get("forward_agent").unwrap_or(&Value::Null);
         set_map_if_value(&mut map, "AGENT_MODE", forward.get("mode"));
@@ -1088,7 +1103,10 @@ mod tests {
                 "clip_post_secs": 120,
                 "clip_pre_secs": 2,
                 "clip_ring_secs": 15,
-                "clip_stale_part_secs": 3600
+                "clip_stale_part_secs": 3600,
+                "live_pipeline_version": "v2",
+                "live_hls_segment_secs": 2,
+                "live_hls_window_secs": 12
             }
         });
 
@@ -1117,6 +1135,18 @@ mod tests {
         assert_eq!(
             AgentConfig::runtime_var("CLIP_STALE_PART_SECS").as_deref(),
             Some("3600")
+        );
+        assert_eq!(
+            AgentConfig::runtime_var("LIVE_PIPELINE_VERSION").as_deref(),
+            Some("v2")
+        );
+        assert_eq!(
+            AgentConfig::runtime_var("LIVE_HLS_SEGMENT_SECS").as_deref(),
+            Some("2")
+        );
+        assert_eq!(
+            AgentConfig::runtime_var("LIVE_HLS_WINDOW_SECS").as_deref(),
+            Some("12")
         );
     }
 

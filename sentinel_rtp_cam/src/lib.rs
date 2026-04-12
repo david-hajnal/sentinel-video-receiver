@@ -63,6 +63,7 @@ pub mod event;
 
 // Server integration
 pub mod server;
+pub mod live;
 
 // Utilities
 pub mod utils;

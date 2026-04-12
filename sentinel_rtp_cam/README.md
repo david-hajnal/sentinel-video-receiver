@@ -48,6 +48,28 @@ cargo run --bin dummy_server
 cargo run --bin onvif_motion_pull
 ```
 
+## Local admin-server integration
+
+For local end-to-end testing against the sibling `sentinel-admin-server` repo:
+
+1. Start `admin-server` and `ingest` there with Docker Compose.
+2. Create an agent and camera in the local admin server.
+3. Write `/etc/sentinel_rtp_cam/server.json` and `/etc/sentinel_rtp_cam/camera.json`.
+4. Install the ingest CA at `/etc/sentinel_rtp_cam/ca.crt`.
+5. Run `cargo run --bin sentinel-agent`.
+
+Important local details:
+
+- `sentinel-agent` reads only `/etc/sentinel_rtp_cam/server.json` and
+  `/etc/sentinel_rtp_cam/camera.json`.
+- `server.json.example` and `camera.json.example` are templates only.
+- `server_ingest` in this repo is not the same local ingest process used by the
+  `sentinel-admin-server` live playback stack.
+- Use the one-time agent token from `POST /api/management/agents`, not a per-camera device token.
+- Use the canonical admin-server `camera_id` in `camera.json`.
+
+See the top-level `README.md` for a full local JSON example.
+
 ## License
 
 See LICENSE.

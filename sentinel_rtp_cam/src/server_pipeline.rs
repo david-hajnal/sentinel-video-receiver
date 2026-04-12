@@ -35,6 +35,8 @@ pub struct StreamConfig {
     pub post_secs: u64,
     pub stale_part_secs: u64,
     pub max_clip_secs: Option<u64>,
+    pub stale_secs: u64,
+    pub stats_log_secs: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -62,6 +64,51 @@ struct ClipSidecar {
     duration_secs: i64,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum StreamHealthState {
+    Idle,
+    Receiving,
+    Stale,
+}
+
+#[derive(Debug, Serialize)]
+struct StreamHealthSnapshot {
+    stream_id: u32,
+    state: StreamHealthState,
+    updated_at: String,
+    stale_after_secs: u64,
+    ring_secs: u64,
+    clip_active: bool,
+    clip_pending: bool,
+    total_rtp_packets: u64,
+    total_access_units: u64,
+    total_gaps: u64,
+    total_motion_events: u64,
+    total_parse_errors: u64,
+    last_rtp_at: Option<String>,
+    last_access_unit_at: Option<String>,
+    last_gap_at: Option<String>,
+    last_motion_at: Option<String>,
+    last_error_at: Option<String>,
+}
+
+#[derive(Debug, Default)]
+struct StreamRuntimeStats {
+    total_rtp_packets: u64,
+    total_access_units: u64,
+    total_gaps: u64,
+    total_motion_events: u64,
+    total_parse_errors: u64,
+    last_rtp_at: Option<DateTime<Utc>>,
+    last_access_unit_at: Option<DateTime<Utc>>,
+    last_gap_at: Option<DateTime<Utc>>,
+    last_motion_at: Option<DateTime<Utc>>,
+    last_error_at: Option<DateTime<Utc>>,
+    last_stats_log_at: Option<Instant>,
+    last_health_write_at: Option<Instant>,
+}
+
 pub async fn run_stream(cfg: StreamConfig, mut rx: mpsc::Receiver<StreamMsg>) -> Result<()> {
     tokio::fs::create_dir_all(&cfg.clip_dir).await?;
     cleanup_stale_parts(&cfg.clip_dir, cfg.stale_part_secs).await?;
@@ -79,6 +126,7 @@ pub async fn run_stream(cfg: StreamConfig, mut rx: mpsc::Receiver<StreamMsg>) ->
     let mut clip_pending = false;
     let mut pending_rule = String::new();
     let mut pending_ring_snapshot: Option<VecDeque<AccessUnit>> = None;
+    let mut stats = StreamRuntimeStats::default();
 
     let mut tick = tokio::time::interval(Duration::from_millis(200));
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -91,16 +139,22 @@ pub async fn run_stream(cfg: StreamConfig, mut rx: mpsc::Receiver<StreamMsg>) ->
                         finalize_clip(cfg.stream_id, clip.take()).await?;
                     }
                 }
+                maybe_log_stream_stats(&cfg, &mut stats, clip.is_some(), clip_pending);
+                maybe_write_stream_health(&cfg, &mut stats, clip.is_some(), clip_pending).await?;
             }
             Some(msg) = rx.recv() => {
                 match msg {
                     StreamMsg::Gap { .. } => {
+                        stats.total_gaps = stats.total_gaps.saturating_add(1);
+                        stats.last_gap_at = Some(Utc::now());
                         dep.reset();
                         synced = false;
                         expected_seq = None;
                         current_au.clear();
                     }
                     StreamMsg::Motion { rule, active, ts: _ } => {
+                        stats.total_motion_events = stats.total_motion_events.saturating_add(1);
+                        stats.last_motion_at = Some(Utc::now());
                         if active {
                             if clip.is_none() {
                                 clip_pending = true;
@@ -110,9 +164,12 @@ pub async fn run_stream(cfg: StreamConfig, mut rx: mpsc::Receiver<StreamMsg>) ->
                         }
                     }
                     StreamMsg::Rtp(bytes) => {
+                        stats.total_rtp_packets = stats.total_rtp_packets.saturating_add(1);
+                        stats.last_rtp_at = Some(Utc::now());
                         let pkt = match RtpPacket::parse(&bytes) {
                             Ok(p) => p,
                             Err(_) => {
+                                mark_stream_error(&mut stats);
                                 dep.reset();
                                 synced = false;
                                 expected_seq = None;
@@ -135,6 +192,7 @@ pub async fn run_stream(cfg: StreamConfig, mut rx: mpsc::Receiver<StreamMsg>) ->
                         let nals = match dep.push_rtp_payload(pkt.payload) {
                             Ok(v) => v,
                             Err(_) => {
+                                mark_stream_error(&mut stats);
                                 dep.reset();
                                 synced = false;
                                 expected_seq = None;
@@ -169,6 +227,8 @@ pub async fn run_stream(cfg: StreamConfig, mut rx: mpsc::Receiver<StreamMsg>) ->
                             }
 
                             ring.push_back(au);
+                            stats.total_access_units = stats.total_access_units.saturating_add(1);
+                            stats.last_access_unit_at = Some(Utc::now());
                             prune_ring(&mut ring, cfg.ring_secs);
 
                             if clip_pending && clip.is_none() {
@@ -194,6 +254,7 @@ pub async fn run_stream(cfg: StreamConfig, mut rx: mpsc::Receiver<StreamMsg>) ->
         }
     }
 
+    write_stream_health(&cfg, &stats, clip.is_some(), clip_pending).await?;
     Ok(())
 }
 
@@ -241,6 +302,120 @@ fn should_finalize_clip(now: Instant, stop_at: Instant, hard_stop_at: Option<Ins
     let stop_due = now >= stop_at;
     let hard_due = hard_stop_at.map(|t| now >= t).unwrap_or(false);
     stop_due || hard_due
+}
+
+fn mark_stream_error(stats: &mut StreamRuntimeStats) {
+    stats.total_parse_errors = stats.total_parse_errors.saturating_add(1);
+    stats.last_error_at = Some(Utc::now());
+}
+
+fn derive_stream_health_state(
+    last_rtp_at: Option<DateTime<Utc>>,
+    stale_secs: u64,
+    now: DateTime<Utc>,
+) -> StreamHealthState {
+    let Some(last_rtp_at) = last_rtp_at else {
+        return StreamHealthState::Idle;
+    };
+    let elapsed_secs = now
+        .signed_duration_since(last_rtp_at)
+        .num_seconds()
+        .max(0) as u64;
+    if elapsed_secs <= stale_secs.max(1) {
+        StreamHealthState::Receiving
+    } else {
+        StreamHealthState::Stale
+    }
+}
+
+fn maybe_log_stream_stats(
+    cfg: &StreamConfig,
+    stats: &mut StreamRuntimeStats,
+    clip_active: bool,
+    clip_pending: bool,
+) {
+    let now = Instant::now();
+    let interval = Duration::from_secs(cfg.stats_log_secs.max(5));
+    if stats
+        .last_stats_log_at
+        .is_some_and(|last| now.duration_since(last) < interval)
+    {
+        return;
+    }
+
+    let state = derive_stream_health_state(stats.last_rtp_at, cfg.stale_secs, Utc::now());
+    info!(
+        stream_id = cfg.stream_id,
+        state = ?state,
+        clip_active,
+        clip_pending,
+        total_rtp_packets = stats.total_rtp_packets,
+        total_access_units = stats.total_access_units,
+        total_gaps = stats.total_gaps,
+        total_motion_events = stats.total_motion_events,
+        total_parse_errors = stats.total_parse_errors,
+        "Stream pipeline stats"
+    );
+    stats.last_stats_log_at = Some(now);
+}
+
+async fn maybe_write_stream_health(
+    cfg: &StreamConfig,
+    stats: &mut StreamRuntimeStats,
+    clip_active: bool,
+    clip_pending: bool,
+) -> Result<()> {
+    let now = Instant::now();
+    let interval = Duration::from_secs(1);
+    if stats
+        .last_health_write_at
+        .is_some_and(|last| now.duration_since(last) < interval)
+    {
+        return Ok(());
+    }
+
+    write_stream_health(cfg, stats, clip_active, clip_pending).await?;
+    stats.last_health_write_at = Some(now);
+    Ok(())
+}
+
+async fn write_stream_health(
+    cfg: &StreamConfig,
+    stats: &StreamRuntimeStats,
+    clip_active: bool,
+    clip_pending: bool,
+) -> Result<()> {
+    let now = Utc::now();
+    let snapshot = StreamHealthSnapshot {
+        stream_id: cfg.stream_id,
+        state: derive_stream_health_state(stats.last_rtp_at, cfg.stale_secs, now),
+        updated_at: now.to_rfc3339(),
+        stale_after_secs: cfg.stale_secs,
+        ring_secs: cfg.ring_secs,
+        clip_active,
+        clip_pending,
+        total_rtp_packets: stats.total_rtp_packets,
+        total_access_units: stats.total_access_units,
+        total_gaps: stats.total_gaps,
+        total_motion_events: stats.total_motion_events,
+        total_parse_errors: stats.total_parse_errors,
+        last_rtp_at: stats.last_rtp_at.map(|ts| ts.to_rfc3339()),
+        last_access_unit_at: stats.last_access_unit_at.map(|ts| ts.to_rfc3339()),
+        last_gap_at: stats.last_gap_at.map(|ts| ts.to_rfc3339()),
+        last_motion_at: stats.last_motion_at.map(|ts| ts.to_rfc3339()),
+        last_error_at: stats.last_error_at.map(|ts| ts.to_rfc3339()),
+    };
+
+    let final_path = cfg
+        .clip_dir
+        .join(format!("stream_{}.health.json", cfg.stream_id));
+    let temp_path = cfg
+        .clip_dir
+        .join(format!("stream_{}.health.json.tmp", cfg.stream_id));
+    let bytes = serde_json::to_vec_pretty(&snapshot)?;
+    tokio::fs::write(&temp_path, bytes).await?;
+    tokio::fs::rename(&temp_path, &final_path).await?;
+    Ok(())
 }
 
 async fn try_start_clip(
@@ -369,8 +544,10 @@ async fn cleanup_stale_parts(dir: &PathBuf, stale_part_secs: u64) -> Result<()> 
 #[cfg(test)]
 mod tests {
     use super::{
-        cleanup_stale_parts, should_finalize_clip, try_start_clip, AccessUnit, StreamConfig,
+        cleanup_stale_parts, derive_stream_health_state, should_finalize_clip, try_start_clip,
+        write_stream_health, AccessUnit, StreamConfig, StreamHealthState, StreamRuntimeStats,
     };
+    use chrono::{Duration as ChronoDuration, Utc};
     use std::collections::VecDeque;
     use std::path::PathBuf;
     use std::time::{Duration, Instant};
@@ -390,6 +567,8 @@ mod tests {
             post_secs: 3,
             stale_part_secs: 1,
             max_clip_secs: Some(9),
+            stale_secs: 15,
+            stats_log_secs: 60,
         }
     }
 
@@ -428,6 +607,33 @@ mod tests {
         let stop_at = now + Duration::from_secs(10);
         let hard_stop_at = Some(now + Duration::from_secs(5));
         assert!(!should_finalize_clip(now, stop_at, hard_stop_at));
+    }
+
+    #[test]
+    fn stream_health_is_idle_without_recent_rtp() {
+        let now = Utc::now();
+        assert_eq!(
+            derive_stream_health_state(None, 15, now),
+            StreamHealthState::Idle
+        );
+    }
+
+    #[test]
+    fn stream_health_is_receiving_within_stale_window() {
+        let now = Utc::now();
+        assert_eq!(
+            derive_stream_health_state(Some(now - ChronoDuration::seconds(3)), 15, now),
+            StreamHealthState::Receiving
+        );
+    }
+
+    #[test]
+    fn stream_health_is_stale_after_threshold() {
+        let now = Utc::now();
+        assert_eq!(
+            derive_stream_health_state(Some(now - ChronoDuration::seconds(20)), 15, now),
+            StreamHealthState::Stale
+        );
     }
 
     #[tokio::test]
@@ -505,6 +711,39 @@ mod tests {
         assert!(fs::metadata(&stale_part).await.is_err());
         assert!(fs::metadata(&fresh_part).await.is_ok());
         assert!(fs::metadata(&non_part).await.is_ok());
+
+        fs::remove_dir_all(&clip_dir).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn write_stream_health_publishes_atomic_snapshot() {
+        let clip_dir = test_dir("health");
+        fs::create_dir_all(&clip_dir).await.unwrap();
+        let cfg = stream_config(clip_dir.clone());
+        let stats = StreamRuntimeStats {
+            total_rtp_packets: 11,
+            total_access_units: 4,
+            total_gaps: 1,
+            total_motion_events: 2,
+            total_parse_errors: 0,
+            last_rtp_at: Some(Utc::now()),
+            last_access_unit_at: Some(Utc::now()),
+            last_gap_at: Some(Utc::now()),
+            last_motion_at: Some(Utc::now()),
+            last_error_at: None,
+            last_stats_log_at: None,
+            last_health_write_at: None,
+        };
+
+        write_stream_health(&cfg, &stats, true, false).await.unwrap();
+
+        let health_path = clip_dir.join("stream_7.health.json");
+        let raw = fs::read_to_string(&health_path).await.unwrap();
+        assert!(raw.contains("\"stream_id\": 7"));
+        assert!(raw.contains("\"state\": \"receiving\""));
+        assert!(raw.contains("\"clip_active\": true"));
+        assert!(raw.contains("\"total_rtp_packets\": 11"));
+        assert!(fs::metadata(clip_dir.join("stream_7.health.json.tmp")).await.is_err());
 
         fs::remove_dir_all(&clip_dir).await.unwrap();
     }

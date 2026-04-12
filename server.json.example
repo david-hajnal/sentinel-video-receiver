@@ -1,8 +1,8 @@
 {
   "server": {
-    "enabled": null,
-    "base_url": null,
-    "bearer_token": null,
+    "enabled": true,
+    "base_url": "http://localhost:8000",
+    "bearer_token": 01KNXJ3SZWJYE01YHJMVTPD4J8,
     "retry_interval_secs": null,
     "max_retries": null
   }
