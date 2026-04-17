@@ -1576,9 +1576,11 @@ pub async fn run_agent_heartbeat_poster(
     cameras: Arc<RwLock<Vec<CameraHeartbeatTarget>>>,
     onvif_probe: OnvifProbeManager,
 ) -> Result<()> {
+    let heartbeat_interval_secs = AgentConfig::runtime_u64_nonzero("HEARTBEAT_INTERVAL_SECS", 30);
     info!(
         server_url = %config.base_url,
         agent_id = %agent_id,
+        heartbeat_interval_secs,
         "Starting agent heartbeat poster"
     );
 
@@ -1586,7 +1588,7 @@ pub async fn run_agent_heartbeat_poster(
         .timeout(Duration::from_secs(10))
         .build()?;
 
-    let heartbeat_interval = Duration::from_secs(30);
+    let heartbeat_interval = Duration::from_secs(heartbeat_interval_secs);
     let mut telemetry_sampler = TelemetrySampler::new();
     let mut firmware_job_memory = FirmwareJobMemory::default();
     let mut restart_job_memory = RestartJobMemory::default();

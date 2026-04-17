@@ -29,6 +29,8 @@ use sentinel_rtp_cam::{
 
 const DEFAULT_SERVER_CONFIG_PATH: &str = "/etc/sentinel_rtp_cam/server.json";
 const DEFAULT_CAMERA_CONFIG_PATH: &str = "/etc/sentinel_rtp_cam/camera.json";
+const DEFAULT_HEARTBEAT_INTERVAL_SECS: u64 = 30;
+const DEFAULT_CONFIG_PULL_INTERVAL_SECS: u64 = 30;
 
 fn runtime_var(name: &str) -> Option<String> {
     AgentConfig::runtime_var(name).filter(|v| !v.trim().is_empty())
@@ -36,6 +38,33 @@ fn runtime_var(name: &str) -> Option<String> {
 
 fn runtime_i64(name: &str) -> Option<i64> {
     runtime_var(name).and_then(|v| v.parse::<i64>().ok())
+}
+
+fn heartbeat_interval_secs() -> u64 {
+    AgentConfig::runtime_u64_nonzero("HEARTBEAT_INTERVAL_SECS", DEFAULT_HEARTBEAT_INTERVAL_SECS)
+}
+
+fn config_pull_interval_secs() -> u64 {
+    AgentConfig::runtime_u64_nonzero(
+        "CONFIG_PULL_INTERVAL_SECS",
+        DEFAULT_CONFIG_PULL_INTERVAL_SECS,
+    )
+}
+
+fn apply_runtime_overrides_and_log_intervals(
+    config_value: &Value,
+    last_logged_intervals: &mut Option<(u64, u64)>,
+) {
+    AgentConfig::apply_json_env_overrides(config_value);
+    let intervals = (heartbeat_interval_secs(), config_pull_interval_secs());
+    if *last_logged_intervals != Some(intervals) {
+        info!(
+            heartbeat_interval_secs = intervals.0,
+            config_pull_interval_secs = intervals.1,
+            "Applied runtime interval settings"
+        );
+        *last_logged_intervals = Some(intervals);
+    }
 }
 
 fn config_version_value(value: &Value) -> Option<Value> {
@@ -369,7 +398,8 @@ async fn main() -> Result<()> {
         }
     };
     let config_value = AgentConfig::merge_server_camera_configs(&camera_value, &server_value);
-    AgentConfig::apply_json_env_overrides(&config_value);
+    let mut last_logged_intervals = None;
+    apply_runtime_overrides_and_log_intervals(&config_value, &mut last_logged_intervals);
 
     let log_filter = runtime_var("RUST_LOG").unwrap_or_else(|| "info".to_string());
     tracing_subscriber::fmt()
@@ -427,7 +457,7 @@ async fn main() -> Result<()> {
         };
         let mut config_value =
             AgentConfig::merge_server_camera_configs(&camera_value, &server_value);
-        AgentConfig::apply_json_env_overrides(&config_value);
+        apply_runtime_overrides_and_log_intervals(&config_value, &mut last_logged_intervals);
 
         let mut desired = match desired_runtime_from_config(&config_value) {
             Ok(desired) => desired,
@@ -442,7 +472,7 @@ async fn main() -> Result<()> {
         let server_base_url = runtime_var("SERVER_BASE_URL");
         let server_bearer = runtime_var("SERVER_BEARER_TOKEN");
 
-        if last_pull.elapsed() > Duration::from_secs(30) {
+        if last_pull.elapsed() > Duration::from_secs(config_pull_interval_secs()) {
             if let (Some(base_url), Some(token)) = (&server_base_url, &server_bearer) {
                 let camera_hint =
                     runtime_var("CAMERA_ID").or_else(|| runtime_var("CAM1_CAMERA_ID"));
@@ -465,7 +495,10 @@ async fn main() -> Result<()> {
                                     &camera_value,
                                     &server_value,
                                 );
-                                AgentConfig::apply_json_env_overrides(&config_value);
+                                apply_runtime_overrides_and_log_intervals(
+                                    &config_value,
+                                    &mut last_logged_intervals,
+                                );
                                 desired = match desired_runtime_from_config(&config_value) {
                                     Ok(desired) => desired,
                                     Err(e) => {

@@ -47,7 +47,9 @@
   "forward_agent": {
     "mode": null,
     "server_addr": null,
-    "motion_merge_secs": null
+    "motion_merge_secs": null,
+    "heartbeat_interval_secs": null,
+    "config_pull_interval_secs": null
   },
   "logging": {
     "rust_log": null

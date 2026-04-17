@@ -121,7 +121,9 @@ Then use `server.local:9000` in `camera.json`.
     }
   ],
   "forward_agent": {
-    "server_addr": "server.local:9000"
+    "server_addr": "server.local:9000",
+    "heartbeat_interval_secs": 30,
+    "config_pull_interval_secs": 30
   },
   "logging": {
     "rust_log": "info"
@@ -133,6 +135,8 @@ Notes:
 
 - `server.json` is for admin API / heartbeat / config pull.
 - `camera.json` is where `forward_agent.server_addr` lives for the TLS ingest uplink.
+- `forward_agent.heartbeat_interval_secs` controls heartbeat cadence (default `30`).
+- `forward_agent.config_pull_interval_secs` controls remote config pull cadence (default `30`).
 - The agent reloads these JSON files periodically, so edits are usually picked up without a
   restart.
 

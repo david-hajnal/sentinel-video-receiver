@@ -250,6 +250,16 @@ impl AgentConfig {
             "MOTION_MERGE_SECS",
             forward.get("motion_merge_secs"),
         );
+        set_map_if_value(
+            &mut map,
+            "HEARTBEAT_INTERVAL_SECS",
+            forward.get("heartbeat_interval_secs"),
+        );
+        set_map_if_value(
+            &mut map,
+            "CONFIG_PULL_INTERVAL_SECS",
+            forward.get("config_pull_interval_secs"),
+        );
 
         let logging = value.get("logging").unwrap_or(&Value::Null);
         set_map_if_value(&mut map, "RUST_LOG", logging.get("rust_log"));
@@ -477,6 +487,13 @@ impl AgentConfig {
             .unwrap_or(default)
     }
 
+    pub fn runtime_u64_nonzero(key: &str, default: u64) -> u64 {
+        Self::runtime_var(key)
+            .and_then(|v| v.parse().ok())
+            .filter(|value| *value > 0)
+            .unwrap_or(default)
+    }
+
     pub fn clear_runtime_overrides() {
         if let Ok(mut guard) = overrides_map().write() {
             guard.clear();
@@ -581,7 +598,9 @@ impl AgentConfig {
             "forward_agent": {
                 "mode": null,
                 "server_addr": null,
-                "motion_merge_secs": null
+                "motion_merge_secs": null,
+                "heartbeat_interval_secs": null,
+                "config_pull_interval_secs": null
             },
             "logging": {
                 "rust_log": null
@@ -627,7 +646,9 @@ fn default_empty_json() -> Value {
         "forward_agent": {
             "mode": null,
             "server_addr": null,
-            "motion_merge_secs": null
+            "motion_merge_secs": null,
+            "heartbeat_interval_secs": null,
+            "config_pull_interval_secs": null
         },
         "cameras": [
             {
@@ -1242,6 +1263,80 @@ mod tests {
         assert_eq!(
             AgentConfig::runtime_var("CAM2_MOTION_ENABLED").as_deref(),
             Some("1")
+        );
+    }
+
+    #[test]
+    fn apply_json_env_overrides_maps_forward_agent_intervals() {
+        let _guard = EnvGuard::new();
+
+        let cfg = json!({
+            "forward_agent": {
+                "heartbeat_interval_secs": 10,
+                "config_pull_interval_secs": 15
+            }
+        });
+
+        AgentConfig::apply_json_env_overrides(&cfg);
+
+        assert_eq!(
+            AgentConfig::runtime_var("HEARTBEAT_INTERVAL_SECS").as_deref(),
+            Some("10")
+        );
+        assert_eq!(
+            AgentConfig::runtime_var("CONFIG_PULL_INTERVAL_SECS").as_deref(),
+            Some("15")
+        );
+    }
+
+    #[test]
+    fn runtime_u64_nonzero_falls_back_to_default_for_zero_or_invalid() {
+        let _guard = EnvGuard::new();
+        let default = 30;
+
+        assert_eq!(
+            AgentConfig::runtime_u64_nonzero("HEARTBEAT_INTERVAL_SECS", default),
+            default
+        );
+
+        AgentConfig::runtime_restore(
+            [("HEARTBEAT_INTERVAL_SECS".to_string(), "".to_string())]
+                .into_iter()
+                .collect(),
+        );
+        assert_eq!(
+            AgentConfig::runtime_u64_nonzero("HEARTBEAT_INTERVAL_SECS", default),
+            default
+        );
+
+        AgentConfig::runtime_restore(
+            [("HEARTBEAT_INTERVAL_SECS".to_string(), "0".to_string())]
+                .into_iter()
+                .collect(),
+        );
+        assert_eq!(
+            AgentConfig::runtime_u64_nonzero("HEARTBEAT_INTERVAL_SECS", default),
+            default
+        );
+
+        AgentConfig::runtime_restore(
+            [("HEARTBEAT_INTERVAL_SECS".to_string(), "abc".to_string())]
+                .into_iter()
+                .collect(),
+        );
+        assert_eq!(
+            AgentConfig::runtime_u64_nonzero("HEARTBEAT_INTERVAL_SECS", default),
+            default
+        );
+
+        AgentConfig::runtime_restore(
+            [("HEARTBEAT_INTERVAL_SECS".to_string(), "9".to_string())]
+                .into_iter()
+                .collect(),
+        );
+        assert_eq!(
+            AgentConfig::runtime_u64_nonzero("HEARTBEAT_INTERVAL_SECS", default),
+            9
         );
     }
 
