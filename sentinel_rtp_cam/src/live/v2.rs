@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -21,6 +21,8 @@ const VIDEO_PID: u16 = 0x0100;
 const TS_PACKET_SIZE: usize = 188;
 const H264_STREAM_TYPE: u8 = 0x1B;
 const H264_STREAM_ID: u8 = 0xE0;
+const DEFAULT_V2_SESSION_RETENTION_SECS: u64 = 300;
+const DEFAULT_V2_SESSION_KEEP_COUNT: usize = 3;
 
 #[derive(Clone)]
 pub struct LivePipelineV2Config {
@@ -76,6 +78,7 @@ struct NoPublishEpisode {
 #[derive(Debug, Serialize)]
 struct StreamHealthSnapshot {
     stream_id: u32,
+    current_session_id: String,
     state: StreamHealthState,
     updated_at: String,
     stale_after_secs: u64,
@@ -94,8 +97,26 @@ struct StreamHealthSnapshot {
     last_error_at: Option<String>,
     last_idr_at: Option<String>,
     last_segment_write_at: Option<String>,
+    last_segment_write_ts: Option<String>,
     segment_seq: u64,
     discontinuity_count: u64,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+struct CurrentSessionPointer {
+    session_id: String,
+    started_at: String,
+    generation: u64,
+    writer_state: String,
+    updated_at: String,
+    last_segment_seq: u64,
+}
+
+struct LiveSessionContext {
+    session_id: String,
+    output_root: PathBuf,
+    generation: u64,
+    started_at: DateTime<Utc>,
 }
 
 struct AtomicPublisher {
@@ -128,13 +149,15 @@ impl AtomicPublisher {
     async fn publish(mut self) -> Result<PathBuf> {
         self.writer.flush().await?;
         drop(self.writer);
-        fs::rename(&self.temp_path, &self.final_path).await.with_context(|| {
-            format!(
-                "rename {} -> {}",
-                self.temp_path.display(),
-                self.final_path.display()
-            )
-        })?;
+        fs::rename(&self.temp_path, &self.final_path)
+            .await
+            .with_context(|| {
+                format!(
+                    "rename {} -> {}",
+                    self.temp_path.display(),
+                    self.final_path.display()
+                )
+            })?;
         Ok(self.final_path)
     }
 
@@ -285,6 +308,141 @@ impl PlaylistState {
     }
 }
 
+fn session_id_now() -> String {
+    let ts = Utc::now().format("%Y%m%d%H%M%S%3f");
+    format!(
+        "{ts}-{}",
+        ulid::Ulid::new().to_string().to_ascii_lowercase()
+    )
+}
+
+fn load_session_gc_config() -> (u64, usize) {
+    let retention_secs = std::env::var("LIVE_V2_SESSION_RETENTION_SECS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(DEFAULT_V2_SESSION_RETENTION_SECS)
+        .max(30);
+    let keep_count = std::env::var("LIVE_V2_SESSION_KEEP_COUNT")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(DEFAULT_V2_SESSION_KEEP_COUNT)
+        .max(1);
+    (retention_secs, keep_count)
+}
+
+async fn read_current_generation(camera_root: &Path) -> u64 {
+    let pointer_path = camera_root.join("current.json");
+    let raw = match fs::read(&pointer_path).await {
+        Ok(raw) => raw,
+        Err(_) => return 1,
+    };
+    let pointer = match serde_json::from_slice::<CurrentSessionPointer>(&raw) {
+        Ok(pointer) => pointer,
+        Err(_) => return 1,
+    };
+    pointer.generation.saturating_add(1).max(1)
+}
+
+async fn write_current_session_pointer(
+    camera_root: &Path,
+    context: &LiveSessionContext,
+    writer_state: &str,
+    last_segment_seq: u64,
+) -> Result<()> {
+    let pointer = CurrentSessionPointer {
+        session_id: context.session_id.clone(),
+        started_at: context.started_at.to_rfc3339(),
+        generation: context.generation,
+        writer_state: writer_state.to_string(),
+        updated_at: Utc::now().to_rfc3339(),
+        last_segment_seq,
+    };
+    AtomicPublisher::publish_bytes(
+        &camera_root.join("current.json"),
+        &serde_json::to_vec_pretty(&pointer)?,
+    )
+    .await
+}
+
+async fn initialize_live_session(camera_root: &Path) -> Result<LiveSessionContext> {
+    fs::create_dir_all(camera_root).await?;
+    let generation = read_current_generation(camera_root).await;
+    let session_id = session_id_now();
+    let session_output_root = camera_root.join(&session_id);
+    fs::create_dir_all(&session_output_root).await?;
+
+    let context = LiveSessionContext {
+        session_id: session_id.clone(),
+        output_root: session_output_root,
+        generation,
+        started_at: Utc::now(),
+    };
+    write_current_session_pointer(camera_root, &context, "starting", 0).await?;
+
+    let (retention_secs, keep_count) = load_session_gc_config();
+    let camera_root = camera_root.to_path_buf();
+    tokio::spawn(async move {
+        if let Err(error) =
+            cleanup_old_sessions(camera_root, session_id, retention_secs, keep_count).await
+        {
+            warn!(error = %error, "Failed to cleanup old v2 session directories");
+        }
+    });
+
+    Ok(context)
+}
+
+async fn cleanup_old_sessions(
+    camera_root: PathBuf,
+    current_session_id: String,
+    retention_secs: u64,
+    keep_count: usize,
+) -> Result<()> {
+    let mut read_dir = fs::read_dir(&camera_root).await?;
+    let mut sessions: Vec<(PathBuf, std::time::SystemTime)> = Vec::new();
+    while let Some(entry) = read_dir.next_entry().await? {
+        let path = entry.path();
+        let Ok(metadata) = entry.metadata().await else {
+            continue;
+        };
+        if !metadata.is_dir() {
+            continue;
+        }
+        let Some(name) = path.file_name().and_then(|value| value.to_str()) else {
+            continue;
+        };
+        if name == current_session_id {
+            continue;
+        }
+        let modified = metadata
+            .modified()
+            .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+        sessions.push((path, modified));
+    }
+    sessions.sort_by(|a, b| b.1.cmp(&a.1));
+
+    let now = std::time::SystemTime::now();
+    let keep_old = keep_count.saturating_sub(1);
+    for (idx, (path, modified)) in sessions.into_iter().enumerate() {
+        if idx < keep_old {
+            continue;
+        }
+        let age_secs = now.duration_since(modified).unwrap_or_default().as_secs();
+        if age_secs <= retention_secs {
+            continue;
+        }
+        if let Err(error) = fs::remove_dir_all(&path).await {
+            warn!(
+                session_path = %path.display(),
+                error = %error,
+                "Failed to remove old v2 session directory"
+            );
+        }
+    }
+
+    Ok(())
+}
+
 struct CurrentSegment {
     seq: u64,
     writer: MpegTsSegmentWriter,
@@ -303,8 +461,14 @@ pub async fn run_stream_v2(
     cfg: LivePipelineV2Config,
     mut rx: mpsc::Receiver<StreamMsg>,
 ) -> Result<()> {
-    fs::create_dir_all(&cfg.output_root).await?;
-    cleanup_v2_output(&cfg.output_root).await?;
+    let session = initialize_live_session(&cfg.output_root).await?;
+    info!(
+        stream_id = cfg.stream_id,
+        session_id = %session.session_id,
+        generation = session.generation,
+        output_root = %session.output_root.display(),
+        "Live pipeline v2 session started"
+    );
 
     let mut dep = H264Depacketizer::new();
     let mut sync_gate = H264SyncGate::new(true);
@@ -338,6 +502,7 @@ pub async fn run_stream_v2(
                     &mut stats,
                     latest_segment_seq,
                     discontinuity_count,
+                    &session.session_id,
                 ).await?;
             }
             msg = rx.recv() => {
@@ -349,7 +514,7 @@ pub async fn run_stream_v2(
                         stats.total_gaps = stats.total_gaps.saturating_add(1);
                         stats.last_gap_at = Some(Utc::now());
                         handle_discontinuity(
-                            &cfg,
+                            &session.output_root,
                             &mut playlist,
                             &mut current_segment,
                             &mut pending_discontinuity,
@@ -393,7 +558,7 @@ pub async fn run_stream_v2(
                                     None,
                                 );
                                 handle_discontinuity(
-                                    &cfg,
+                                    &session.output_root,
                                     &mut playlist,
                                     &mut current_segment,
                                     &mut pending_discontinuity,
@@ -415,7 +580,7 @@ pub async fn run_stream_v2(
                                 stats.total_gaps = stats.total_gaps.saturating_add(1);
                                 stats.last_gap_at = Some(Utc::now());
                                 handle_discontinuity(
-                                    &cfg,
+                                    &session.output_root,
                                     &mut playlist,
                                     &mut current_segment,
                                     &mut pending_discontinuity,
@@ -445,7 +610,7 @@ pub async fn run_stream_v2(
                                     derive_rtp_payload_nal_type(pkt.payload),
                                 );
                                 handle_discontinuity(
-                                    &cfg,
+                                    &session.output_root,
                                     &mut playlist,
                                     &mut current_segment,
                                     &mut pending_discontinuity,
@@ -487,7 +652,7 @@ pub async fn run_stream_v2(
                             if should_rotate_segment(current_segment.as_ref(), &au, cfg.segment_secs)
                             {
                                 finalize_segment(
-                                    &cfg,
+                                    &session.output_root,
                                     &mut playlist,
                                     &mut current_segment,
                                     &mut latest_segment_seq,
@@ -501,7 +666,7 @@ pub async fn run_stream_v2(
                                     continue;
                                 }
                                 current_segment = Some(open_segment(
-                                    &cfg,
+                                    &session.output_root,
                                     &mut playlist,
                                     pending_discontinuity,
                                 )
@@ -527,13 +692,28 @@ pub async fn run_stream_v2(
     }
 
     finalize_segment(
-        &cfg,
+        &session.output_root,
         &mut playlist,
         &mut current_segment,
         &mut latest_segment_seq,
     )
     .await?;
-    write_stream_health(&cfg, &stats, latest_segment_seq, discontinuity_count).await?;
+    write_current_session_pointer(&cfg.output_root, &session, "stopped", latest_segment_seq)
+        .await?;
+    write_stream_health(
+        &cfg,
+        &stats,
+        latest_segment_seq,
+        discontinuity_count,
+        &session.session_id,
+    )
+    .await?;
+    info!(
+        stream_id = cfg.stream_id,
+        session_id = %session.session_id,
+        latest_segment_seq,
+        "Live pipeline v2 session stopped"
+    );
     Ok(())
 }
 
@@ -551,11 +731,11 @@ fn build_access_unit(nals: Vec<Vec<u8>>, rtp_timestamp: u32) -> AccessUnit {
 }
 
 async fn open_segment(
-    cfg: &LivePipelineV2Config,
+    session_output_root: &Path,
     playlist: &mut PlaylistState,
     discontinuity: bool,
 ) -> Result<CurrentSegment> {
-    let (seq, path) = playlist.next_segment_path(&cfg.output_root);
+    let (seq, path) = playlist.next_segment_path(session_output_root);
     Ok(CurrentSegment {
         seq,
         writer: MpegTsSegmentWriter::create(path).await?,
@@ -579,7 +759,7 @@ fn should_rotate_segment(
 }
 
 async fn finalize_segment(
-    cfg: &LivePipelineV2Config,
+    session_output_root: &Path,
     playlist: &mut PlaylistState,
     current_segment: &mut Option<CurrentSegment>,
     latest_segment_seq: &mut u64,
@@ -598,14 +778,14 @@ async fn finalize_segment(
     let discontinuity = segment.discontinuity;
     segment.writer.publish().await?;
     playlist
-        .push_segment(&cfg.output_root, seq, duration_secs, discontinuity)
+        .push_segment(session_output_root, seq, duration_secs, discontinuity)
         .await?;
     *latest_segment_seq = seq;
     Ok(())
 }
 
 async fn handle_discontinuity(
-    cfg: &LivePipelineV2Config,
+    session_output_root: &Path,
     playlist: &mut PlaylistState,
     current_segment: &mut Option<CurrentSegment>,
     pending_discontinuity: &mut bool,
@@ -613,7 +793,13 @@ async fn handle_discontinuity(
     latest_segment_seq: &mut u64,
 ) -> Result<()> {
     let saw_published_output = *latest_segment_seq > 0 || current_segment.is_some();
-    finalize_segment(cfg, playlist, current_segment, latest_segment_seq).await?;
+    finalize_segment(
+        session_output_root,
+        playlist,
+        current_segment,
+        latest_segment_seq,
+    )
+    .await?;
     if saw_published_output {
         *pending_discontinuity = true;
         *discontinuity_count = discontinuity_count.saturating_add(1);
@@ -705,10 +891,7 @@ fn derive_stream_health_state(
     let Some(last_rtp_at) = last_rtp_at else {
         return StreamHealthState::Idle;
     };
-    let elapsed_secs = now
-        .signed_duration_since(last_rtp_at)
-        .num_seconds()
-        .max(0) as u64;
+    let elapsed_secs = now.signed_duration_since(last_rtp_at).num_seconds().max(0) as u64;
     if elapsed_secs <= stale_secs.max(1) {
         StreamHealthState::Receiving
     } else {
@@ -752,6 +935,7 @@ async fn maybe_write_stream_health(
     stats: &mut StreamRuntimeStats,
     segment_seq: u64,
     discontinuity_count: u64,
+    current_session_id: &str,
 ) -> Result<()> {
     let now = Instant::now();
     if stats
@@ -760,7 +944,14 @@ async fn maybe_write_stream_health(
     {
         return Ok(());
     }
-    write_stream_health(cfg, stats, segment_seq, discontinuity_count).await?;
+    write_stream_health(
+        cfg,
+        stats,
+        segment_seq,
+        discontinuity_count,
+        current_session_id,
+    )
+    .await?;
     stats.last_health_write_at = Some(now);
     Ok(())
 }
@@ -770,10 +961,12 @@ async fn write_stream_health(
     stats: &StreamRuntimeStats,
     segment_seq: u64,
     discontinuity_count: u64,
+    current_session_id: &str,
 ) -> Result<()> {
     let now = Utc::now();
     let snapshot = StreamHealthSnapshot {
         stream_id: cfg.stream_id,
+        current_session_id: current_session_id.to_string(),
         state: derive_stream_health_state(stats.last_rtp_at, cfg.stale_secs, now),
         updated_at: now.to_rfc3339(),
         stale_after_secs: cfg.stale_secs,
@@ -792,35 +985,17 @@ async fn write_stream_health(
         last_error_at: stats.last_error_at.map(|ts| ts.to_rfc3339()),
         last_idr_at: stats.last_idr_at.map(|ts| ts.to_rfc3339()),
         last_segment_write_at: stats.last_segment_write_at.map(|ts| ts.to_rfc3339()),
+        last_segment_write_ts: stats.last_segment_write_at.map(|ts| ts.to_rfc3339()),
         segment_seq,
         discontinuity_count,
     };
 
     AtomicPublisher::publish_bytes(
-        &cfg.health_dir.join(format!("stream_{}.health.json", cfg.stream_id)),
+        &cfg.health_dir
+            .join(format!("stream_{}.health.json", cfg.stream_id)),
         &serde_json::to_vec_pretty(&snapshot)?,
     )
     .await
-}
-
-async fn cleanup_v2_output(output_root: &Path) -> Result<()> {
-    if fs::metadata(output_root).await.is_err() {
-        return Ok(());
-    }
-
-    let mut read_dir = fs::read_dir(output_root).await?;
-    while let Some(entry) = read_dir.next_entry().await? {
-        let path = entry.path();
-        let name = path.file_name().and_then(|value| value.to_str()).unwrap_or("");
-        if name == "index.m3u8"
-            || name.ends_with(".tmp")
-            || (name.starts_with("seg_") && name.ends_with(".ts"))
-        {
-            let _ = fs::remove_file(&path).await;
-        }
-    }
-
-    Ok(())
 }
 
 fn temp_path_for(final_path: &Path) -> PathBuf {
@@ -938,8 +1113,7 @@ fn packetize_ts(
             }
         }
 
-        packet[write_offset..write_offset + take]
-            .copy_from_slice(&payload[offset..offset + take]);
+        packet[write_offset..write_offset + take].copy_from_slice(&payload[offset..offset + take]);
         packets.extend_from_slice(&packet);
         offset += take;
         first = false;
@@ -970,6 +1144,7 @@ mod tests {
         StreamRuntimeStats,
     };
     use crate::server_pipeline::StreamMsg;
+    use serde_json::Value;
     use std::path::PathBuf;
     use tokio::fs;
     use tokio::sync::mpsc;
@@ -1031,16 +1206,32 @@ mod tests {
         let (tx, rx) = mpsc::channel(64);
 
         let handle = tokio::spawn(run_stream_v2(cfg.clone(), rx));
-        tx.send(StreamMsg::Rtp(rtp_single_nal(1, 90_000, true, &[0x41, 0x01])))
-            .await
-            .unwrap();
+        tx.send(StreamMsg::Rtp(rtp_single_nal(
+            1,
+            90_000,
+            true,
+            &[0x41, 0x01],
+        )))
+        .await
+        .unwrap();
         drop(tx);
 
         handle.await.unwrap().unwrap();
 
-        assert!(fs::metadata(cfg.output_root.join("index.m3u8")).await.is_err());
-        let mut entries = fs::read_dir(&cfg.output_root).await.unwrap();
-        assert!(entries.next_entry().await.unwrap().is_none());
+        let pointer_raw = fs::read_to_string(cfg.output_root.join("current.json"))
+            .await
+            .expect("current pointer");
+        let pointer: Value = serde_json::from_str(&pointer_raw).expect("valid pointer");
+        let session_id = pointer
+            .get("session_id")
+            .and_then(Value::as_str)
+            .expect("session id in pointer");
+        let session_root = cfg.output_root.join(session_id);
+
+        assert!(fs::metadata(session_root.join("index.m3u8")).await.is_err());
+        assert!(fs::metadata(session_root.join("seg_000001.ts"))
+            .await
+            .is_err());
 
         fs::remove_dir_all(&dir).await.unwrap();
     }
@@ -1053,25 +1244,52 @@ mod tests {
         let (tx, rx) = mpsc::channel(64);
 
         let handle = tokio::spawn(run_stream_v2(cfg.clone(), rx));
-        tx.send(StreamMsg::Rtp(rtp_single_nal(1, 90_000, true, &[0x67, 0x64, 0x00])))
-            .await
-            .unwrap();
-        tx.send(StreamMsg::Rtp(rtp_single_nal(2, 93_600, true, &[0x68, 0xEE, 0x3C])))
-            .await
-            .unwrap();
-        tx.send(StreamMsg::Rtp(rtp_single_nal(3, 97_200, true, &[0x65, 0x88, 0x99])))
-            .await
-            .unwrap();
+        tx.send(StreamMsg::Rtp(rtp_single_nal(
+            1,
+            90_000,
+            true,
+            &[0x67, 0x64, 0x00],
+        )))
+        .await
+        .unwrap();
+        tx.send(StreamMsg::Rtp(rtp_single_nal(
+            2,
+            93_600,
+            true,
+            &[0x68, 0xEE, 0x3C],
+        )))
+        .await
+        .unwrap();
+        tx.send(StreamMsg::Rtp(rtp_single_nal(
+            3,
+            97_200,
+            true,
+            &[0x65, 0x88, 0x99],
+        )))
+        .await
+        .unwrap();
         drop(tx);
 
         handle.await.unwrap().unwrap();
 
-        let playlist = fs::read_to_string(cfg.output_root.join("index.m3u8"))
+        let pointer_raw = fs::read_to_string(cfg.output_root.join("current.json"))
+            .await
+            .expect("current pointer");
+        let pointer: Value = serde_json::from_str(&pointer_raw).expect("valid pointer");
+        let session_id = pointer
+            .get("session_id")
+            .and_then(Value::as_str)
+            .expect("session id in pointer");
+        let session_root = cfg.output_root.join(session_id);
+
+        let playlist = fs::read_to_string(session_root.join("index.m3u8"))
             .await
             .unwrap();
         assert!(playlist.contains("#EXTM3U"));
         assert!(playlist.contains("seg_000001.ts"));
-        assert!(fs::metadata(cfg.output_root.join("seg_000001.ts")).await.is_ok());
+        assert!(fs::metadata(session_root.join("seg_000001.ts"))
+            .await
+            .is_ok());
 
         fs::remove_dir_all(&dir).await.unwrap();
     }
@@ -1099,7 +1317,65 @@ mod tests {
             .await
             .unwrap();
         assert!(health.contains("\"total_motion_events\": 1"));
-        assert!(fs::metadata(cfg.output_root.join("index.m3u8")).await.is_err());
+        assert!(fs::metadata(cfg.output_root.join("index.m3u8"))
+            .await
+            .is_err());
+
+        fs::remove_dir_all(&dir).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn v2_startup_does_not_delete_existing_root_playlist_or_segments() {
+        let dir = test_dir("startup_no_cleanup");
+        fs::create_dir_all(&dir).await.unwrap();
+        let cfg = config(&dir);
+        fs::create_dir_all(&cfg.output_root).await.unwrap();
+        fs::write(cfg.output_root.join("index.m3u8"), "#EXTM3U\n")
+            .await
+            .unwrap();
+        fs::write(cfg.output_root.join("seg_000001.ts"), b"old-segment")
+            .await
+            .unwrap();
+
+        let (tx, rx) = mpsc::channel(8);
+        let handle = tokio::spawn(run_stream_v2(cfg.clone(), rx));
+        drop(tx);
+        handle.await.unwrap().unwrap();
+
+        assert!(fs::metadata(cfg.output_root.join("index.m3u8"))
+            .await
+            .is_ok());
+        assert!(fs::metadata(cfg.output_root.join("seg_000001.ts"))
+            .await
+            .is_ok());
+
+        fs::remove_dir_all(&dir).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn v2_writes_current_session_pointer_on_startup() {
+        let dir = test_dir("current_session_pointer");
+        fs::create_dir_all(&dir).await.unwrap();
+        let cfg = config(&dir);
+        let (tx, rx) = mpsc::channel(8);
+
+        let handle = tokio::spawn(run_stream_v2(cfg.clone(), rx));
+        drop(tx);
+        handle.await.unwrap().unwrap();
+
+        let pointer_raw = fs::read_to_string(cfg.output_root.join("current.json"))
+            .await
+            .expect("current session pointer");
+        let pointer: Value = serde_json::from_str(&pointer_raw).expect("valid pointer json");
+        assert!(pointer
+            .get("session_id")
+            .and_then(Value::as_str)
+            .is_some_and(|value| !value.is_empty()));
+        let writer_state = pointer
+            .get("writer_state")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        assert!(writer_state == "starting" || writer_state == "stopped");
 
         fs::remove_dir_all(&dir).await.unwrap();
     }
