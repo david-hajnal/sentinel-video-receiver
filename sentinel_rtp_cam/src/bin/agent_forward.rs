@@ -7,9 +7,9 @@ use std::time::{Duration, Instant};
 use tokio::net::UdpSocket;
 use tokio::sync::RwLock;
 use tokio::task::JoinHandle;
-use tokio::time::sleep;
+use tokio::time::{sleep, timeout};
 use tokio_util::sync::CancellationToken;
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 
 use sentinel_rtp_cam::agent_uplink::Uplink;
 use sentinel_rtp_cam::core::rtp::RtpPacket;
@@ -168,6 +168,23 @@ fn rtsp_status_error(cam: &CamConfig, method: &str, status: u16) -> anyhow::Erro
         );
     }
     anyhow!("{method} failed: {status}")
+}
+
+fn parse_interleaved_channels(transport: &str) -> Option<(u8, u8)> {
+    for part in transport.split(';') {
+        let token = part.trim();
+        if let Some(value) = token.strip_prefix("interleaved=") {
+            let (rtp, rtcp) = value.split_once('-')?;
+            return Some((rtp.parse::<u8>().ok()?, rtcp.parse::<u8>().ok()?));
+        }
+    }
+    None
+}
+
+fn format_rtsp_target(rtsp_url: &str) -> String {
+    parse_rtsp_url(rtsp_url)
+        .map(|(host, _port, path)| format!("{host}{path}"))
+        .unwrap_or_else(|_| rtsp_url.to_string())
 }
 
 fn start_runtime(desired: &DesiredRuntime) -> Result<AgentRuntime> {
@@ -628,6 +645,34 @@ async fn run_camera(cam: CamConfig, uplink: Uplink, cancel: CancellationToken) -
     info!(stream_id = cam.stream_id, "RTSP DESCRIBE ok");
     let sdp = String::from_utf8_lossy(&r.body);
     let track = parse_sdp_video_track(&sdp)?;
+    let has_sprop_parameter_sets = track.sprop_sps.is_some() && track.sprop_pps.is_some();
+    info!(
+        camera_id = %cam.camera_id,
+        stream_id = cam.stream_id,
+        payload_type = track.payload_type,
+        codec = track.codec_name.as_deref().unwrap_or("unknown"),
+        control_url = %track.control,
+        has_sprop_parameter_sets,
+        "Parsed SDP video track"
+    );
+    if let Some(codec) = track.codec_name.as_deref() {
+        if !codec.eq_ignore_ascii_case("H264") {
+            error!(
+                camera_id = %cam.camera_id,
+                stream_id = cam.stream_id,
+                advertised_codec = %codec,
+                "Live startup failed: live path is H.264-only"
+            );
+            bail!("Unsupported codec advertised in SDP: {codec}");
+        }
+    } else {
+        warn!(
+            camera_id = %cam.camera_id,
+            stream_id = cam.stream_id,
+            payload_type = track.payload_type,
+            "SDP missing rtpmap codec for selected payload type; assuming H264"
+        );
+    }
 
     let setup_url = if track.control.starts_with("rtsp://") {
         track.control.clone()
@@ -640,11 +685,11 @@ async fn run_camera(cam: CamConfig, uplink: Uplink, cancel: CancellationToken) -
     };
 
     if cam.transport == "udp" {
-        let transport = format!(
+        let requested_transport = format!(
             "RTP/AVP;unicast;client_port={}-{};mode=play",
             cam.rtp_port, cam.rtcp_port
         );
-        let mut setup_headers = vec![("Transport", transport.as_str())];
+        let mut setup_headers = vec![("Transport", requested_transport.as_str())];
         if let Some(ref a) = authz {
             setup_headers.push(("Authorization", a.as_str()));
         }
@@ -652,6 +697,18 @@ async fn run_camera(cam: CamConfig, uplink: Uplink, cancel: CancellationToken) -
         if r.status != 200 {
             return Err(rtsp_status_error(&cam, "SETUP", r.status));
         }
+        let negotiated_transport = r
+            .headers
+            .iter()
+            .find_map(|(k, v)| k.eq_ignore_ascii_case("Transport").then_some(v.as_str()))
+            .unwrap_or("");
+        info!(
+            stream_id = cam.stream_id,
+            camera_id = %cam.camera_id,
+            requested_transport = %requested_transport,
+            negotiated_transport = %negotiated_transport,
+            "RTSP transport negotiated (UDP)"
+        );
         c.set_session_from(&r);
         info!(stream_id = cam.stream_id, "RTSP SETUP ok (UDP)");
 
@@ -686,8 +743,30 @@ async fn run_camera(cam: CamConfig, uplink: Uplink, cancel: CancellationToken) -
         loop {
             tokio::select! {
                 _ = cancel.cancelled() => break,
-                r = sock.recv_from(&mut buf) => {
-                    let (n, _) = r?;
+                r = async {
+                    if first_logged {
+                        sock.recv_from(&mut buf).await.map(Some)
+                    } else {
+                        match timeout(Duration::from_secs(10), sock.recv_from(&mut buf)).await {
+                            Ok(result) => result.map(Some),
+                            Err(_) => {
+                                error!(
+                                    camera_id = %cam.camera_id,
+                                    stream_id = cam.stream_id,
+                                    transport = %cam.transport,
+                                    rtsp_target = %format_rtsp_target(&cam.rtsp_url),
+                                    requested_transport = %requested_transport,
+                                    negotiated_transport = %negotiated_transport,
+                                    "Live startup failed: no RTP received within 10s after PLAY"
+                                );
+                                Ok(None)
+                            }
+                        }
+                    }
+                } => {
+                    let Some((n, _)) = r? else {
+                        bail!("No RTP received within startup watchdog window");
+                    };
                     total_pkts += 1;
                     total_bytes += n as u64;
                     let pkt = match RtpPacket::parse(&buf[..n]) {
@@ -735,8 +814,8 @@ async fn run_camera(cam: CamConfig, uplink: Uplink, cancel: CancellationToken) -
             }
         }
     } else {
-        let transport = "RTP/AVP/TCP;unicast;interleaved=0-1;mode=play";
-        let mut setup_headers = vec![("Transport", transport)];
+        let requested_transport = "RTP/AVP/TCP;unicast;interleaved=0-1;mode=play";
+        let mut setup_headers = vec![("Transport", requested_transport)];
         if let Some(ref a) = authz {
             setup_headers.push(("Authorization", a.as_str()));
         }
@@ -744,6 +823,22 @@ async fn run_camera(cam: CamConfig, uplink: Uplink, cancel: CancellationToken) -
         if r.status != 200 {
             return Err(rtsp_status_error(&cam, "SETUP", r.status));
         }
+        let negotiated_transport = r
+            .headers
+            .iter()
+            .find_map(|(k, v)| k.eq_ignore_ascii_case("Transport").then_some(v.as_str()))
+            .ok_or_else(|| anyhow!("SETUP response missing Transport header"))?;
+        let (rtp_channel, rtcp_channel) = parse_interleaved_channels(negotiated_transport)
+            .ok_or_else(|| anyhow!("SETUP response missing/invalid interleaved channels"))?;
+        info!(
+            stream_id = cam.stream_id,
+            camera_id = %cam.camera_id,
+            requested_transport = %requested_transport,
+            negotiated_transport = %negotiated_transport,
+            rtp_channel,
+            rtcp_channel,
+            "RTSP transport negotiated (TCP interleaved)"
+        );
         c.set_session_from(&r);
         info!(stream_id = cam.stream_id, "RTSP SETUP ok (TCP interleaved)");
 
@@ -769,8 +864,34 @@ async fn run_camera(cam: CamConfig, uplink: Uplink, cancel: CancellationToken) -
         loop {
             tokio::select! {
                 _ = cancel.cancelled() => break,
-                frame = read_interleaved_frame(&mut c, 0, 1) => {
-                    match frame? {
+                frame = async {
+                    if first_logged {
+                        read_interleaved_frame(&mut c, rtp_channel, rtcp_channel).await.map(Some)
+                    } else {
+                        match timeout(
+                            Duration::from_secs(10),
+                            read_interleaved_frame(&mut c, rtp_channel, rtcp_channel),
+                        ).await {
+                            Ok(result) => result.map(Some),
+                            Err(_) => {
+                                error!(
+                                    camera_id = %cam.camera_id,
+                                    stream_id = cam.stream_id,
+                                    transport = %cam.transport,
+                                    rtsp_target = %format_rtsp_target(&cam.rtsp_url),
+                                    requested_transport = %requested_transport,
+                                    negotiated_transport = %negotiated_transport,
+                                    "Live startup failed: no RTP received within 10s after PLAY"
+                                );
+                                Ok(None)
+                            }
+                        }
+                    }
+                } => {
+                    let Some(frame) = frame? else {
+                        bail!("No RTP received within startup watchdog window");
+                    };
+                    match frame {
                         InterleavedFrame::Rtp(bytes) => {
                             total_pkts += 1;
                             total_bytes += bytes.len() as u64;
@@ -940,6 +1061,24 @@ mod tests {
         let err = rtsp_status_error(&cam, "DESCRIBE", 401);
 
         assert_eq!(err.to_string(), "DESCRIBE failed: 401");
+    }
+
+    #[test]
+    fn parse_interleaved_channels_reads_negotiated_pair() {
+        let transport = "RTP/AVP/TCP;unicast;interleaved=2-3;mode=play";
+        assert_eq!(parse_interleaved_channels(transport), Some((2, 3)));
+    }
+
+    #[test]
+    fn parse_interleaved_channels_rejects_invalid_values() {
+        assert_eq!(
+            parse_interleaved_channels("RTP/AVP/TCP;unicast;interleaved=abc-def"),
+            None
+        );
+        assert_eq!(
+            parse_interleaved_channels("RTP/AVP/TCP;unicast;mode=play"),
+            None
+        );
     }
 
     #[test]

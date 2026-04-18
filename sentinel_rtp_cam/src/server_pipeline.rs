@@ -117,8 +117,16 @@ struct StreamRuntimeStats {
     last_gap_at: Option<DateTime<Utc>>,
     last_motion_at: Option<DateTime<Utc>>,
     last_error_at: Option<DateTime<Utc>>,
+    last_idr_at: Option<DateTime<Utc>>,
     last_stats_log_at: Option<Instant>,
     last_health_write_at: Option<Instant>,
+}
+
+#[derive(Debug, Default)]
+struct NoDecodeEpisode {
+    first_rtp_at: Option<Instant>,
+    access_units_at_start: u64,
+    logged: bool,
 }
 
 pub async fn run_stream(cfg: StreamConfig, mut rx: mpsc::Receiver<StreamMsg>) -> Result<()> {
@@ -139,6 +147,7 @@ pub async fn run_stream(cfg: StreamConfig, mut rx: mpsc::Receiver<StreamMsg>) ->
     let mut pending_rule = String::new();
     let mut pending_ring_snapshot: Option<VecDeque<AccessUnit>> = None;
     let mut stats = StreamRuntimeStats::default();
+    let mut no_decode_episode = NoDecodeEpisode::default();
 
     let mut tick = tokio::time::interval(Duration::from_millis(200));
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -156,6 +165,7 @@ pub async fn run_stream(cfg: StreamConfig, mut rx: mpsc::Receiver<StreamMsg>) ->
                         finalize_clip(cfg.stream_id, clip.take()).await?;
                     }
                 }
+                maybe_log_no_decode_watchdog(cfg.stream_id, &stats, &mut no_decode_episode);
                 maybe_log_stream_stats(&cfg, &mut stats, clip.is_some(), clip_pending);
                 maybe_write_stream_health(&cfg, &mut stats, clip.is_some(), clip_pending).await?;
             }
@@ -183,10 +193,23 @@ pub async fn run_stream(cfg: StreamConfig, mut rx: mpsc::Receiver<StreamMsg>) ->
                     StreamMsg::Rtp(bytes) => {
                         stats.total_rtp_packets = stats.total_rtp_packets.saturating_add(1);
                         stats.last_rtp_at = Some(Utc::now());
+                        if no_decode_episode.first_rtp_at.is_none() {
+                            no_decode_episode.first_rtp_at = Some(Instant::now());
+                            no_decode_episode.access_units_at_start = stats.total_access_units;
+                            no_decode_episode.logged = false;
+                        }
                         let pkt = match RtpPacket::parse(&bytes) {
                             Ok(p) => p,
-                            Err(_) => {
+                            Err(error) => {
                                 mark_stream_error(&mut stats);
+                                maybe_log_rate_limited_parse_warn(
+                                    cfg.stream_id,
+                                    stats.total_parse_errors,
+                                    &error.to_string(),
+                                    bytes.len(),
+                                    bytes.first().copied(),
+                                    None,
+                                );
                                 dep.reset();
                                 synced = false;
                                 expected_seq = None;
@@ -208,8 +231,16 @@ pub async fn run_stream(cfg: StreamConfig, mut rx: mpsc::Receiver<StreamMsg>) ->
 
                         let nals = match dep.push_rtp_payload(pkt.payload) {
                             Ok(v) => v,
-                            Err(_) => {
+                            Err(error) => {
                                 mark_stream_error(&mut stats);
+                                maybe_log_rate_limited_parse_warn(
+                                    cfg.stream_id,
+                                    stats.total_parse_errors,
+                                    &error.to_string(),
+                                    pkt.payload.len(),
+                                    pkt.payload.first().copied(),
+                                    derive_rtp_payload_nal_type(pkt.payload),
+                                );
                                 dep.reset();
                                 synced = false;
                                 expected_seq = None;
@@ -246,6 +277,10 @@ pub async fn run_stream(cfg: StreamConfig, mut rx: mpsc::Receiver<StreamMsg>) ->
                             ring.push_back(au);
                             stats.total_access_units = stats.total_access_units.saturating_add(1);
                             stats.last_access_unit_at = Some(Utc::now());
+                            if ring.back().is_some_and(|unit| unit.has_idr) {
+                                stats.last_idr_at = Some(Utc::now());
+                            }
+                            no_decode_episode = NoDecodeEpisode::default();
                             prune_ring(&mut ring, cfg.ring_secs);
 
                             if clip_pending && clip.is_none() {
@@ -515,6 +550,76 @@ fn mark_stream_error(stats: &mut StreamRuntimeStats) {
     stats.last_error_at = Some(Utc::now());
 }
 
+fn derive_rtp_payload_nal_type(payload: &[u8]) -> Option<u8> {
+    let first = *payload.first()?;
+    let nal_type = first & 0x1F;
+    match nal_type {
+        1..=23 => Some(nal_type),
+        28 => payload.get(1).map(|v| v & 0x1F),
+        _ => None,
+    }
+}
+
+fn should_log_rate_limited(count: u64) -> bool {
+    count <= 3 || count % 100 == 0
+}
+
+fn maybe_log_rate_limited_parse_warn(
+    stream_id: u32,
+    parse_error_count: u64,
+    error_text: &str,
+    payload_size: usize,
+    first_payload_byte: Option<u8>,
+    derived_nal_type: Option<u8>,
+) {
+    if !should_log_rate_limited(parse_error_count) {
+        return;
+    }
+    warn!(
+        stream_id,
+        parse_error_count,
+        error = %error_text,
+        payload_size,
+        first_payload_byte = first_payload_byte.map(|v| format!("0x{v:02X}")),
+        derived_nal_type,
+        "RTP/H264 parse failure"
+    );
+}
+
+fn maybe_log_no_decode_watchdog(
+    stream_id: u32,
+    stats: &StreamRuntimeStats,
+    episode: &mut NoDecodeEpisode,
+) {
+    if episode.first_rtp_at.is_none() {
+        return;
+    }
+    if stats.total_access_units > episode.access_units_at_start {
+        *episode = NoDecodeEpisode::default();
+        return;
+    }
+    if episode.logged {
+        return;
+    }
+    let elapsed = episode
+        .first_rtp_at
+        .map(|started| started.elapsed())
+        .unwrap_or(Duration::ZERO);
+    if elapsed < Duration::from_secs(30) {
+        return;
+    }
+    error!(
+        stream_id,
+        total_rtp_packets = stats.total_rtp_packets,
+        total_access_units = stats.total_access_units,
+        total_parse_errors = stats.total_parse_errors,
+        last_idr_at = stats.last_idr_at.map(|ts| ts.to_rfc3339()),
+        segment_seq = 0_u64,
+        "Startup watchdog: receiving media but not decoding a publishable H.264 stream"
+    );
+    episode.logged = true;
+}
+
 fn derive_stream_health_state(
     last_rtp_at: Option<DateTime<Utc>>,
     stale_secs: u64,
@@ -752,7 +857,7 @@ mod tests {
     use super::{
         cleanup_stale_parts, derive_stream_health_state, should_finalize_clip, try_start_clip,
         write_stream_health, write_with_retry_and_cleanup, AccessUnit, ClipWriteSettings,
-        StreamConfig, StreamHealthState, StreamRuntimeStats,
+        NoDecodeEpisode, StreamConfig, StreamHealthState, StreamRuntimeStats,
     };
     use anyhow::anyhow;
     use chrono::{Duration as ChronoDuration, Utc};
@@ -845,6 +950,43 @@ mod tests {
             derive_stream_health_state(Some(now - ChronoDuration::seconds(20)), 15, now),
             StreamHealthState::Stale
         );
+    }
+
+    #[test]
+    fn derive_rtp_payload_nal_type_handles_single_nal_and_fu_a() {
+        assert_eq!(super::derive_rtp_payload_nal_type(&[0x65, 0x01]), Some(5));
+        assert_eq!(super::derive_rtp_payload_nal_type(&[0x7C, 0x85]), Some(5));
+        assert_eq!(super::derive_rtp_payload_nal_type(&[0x78]), None);
+    }
+
+    #[test]
+    fn should_log_rate_limited_matches_first_three_then_every_hundredth() {
+        assert!(super::should_log_rate_limited(1));
+        assert!(super::should_log_rate_limited(2));
+        assert!(super::should_log_rate_limited(3));
+        assert!(!super::should_log_rate_limited(4));
+        assert!(super::should_log_rate_limited(100));
+        assert!(!super::should_log_rate_limited(101));
+    }
+
+    #[test]
+    fn no_decode_watchdog_latches_and_resets_after_recovery() {
+        let mut stats = StreamRuntimeStats::default();
+        stats.total_rtp_packets = 42;
+        stats.total_parse_errors = 7;
+        let mut episode = NoDecodeEpisode {
+            first_rtp_at: Some(Instant::now() - Duration::from_secs(31)),
+            access_units_at_start: 0,
+            logged: false,
+        };
+
+        super::maybe_log_no_decode_watchdog(7, &stats, &mut episode);
+        assert!(episode.logged);
+
+        stats.total_access_units = 1;
+        super::maybe_log_no_decode_watchdog(7, &stats, &mut episode);
+        assert!(episode.first_rtp_at.is_none());
+        assert!(!episode.logged);
     }
 
     #[tokio::test]
@@ -942,6 +1084,7 @@ mod tests {
             last_gap_at: Some(Utc::now()),
             last_motion_at: Some(Utc::now()),
             last_error_at: None,
+            last_idr_at: None,
             last_stats_log_at: None,
             last_health_write_at: None,
         };

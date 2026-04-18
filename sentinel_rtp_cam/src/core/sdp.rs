@@ -5,6 +5,7 @@ use base64::Engine;
 pub struct SdpVideoTrack {
     pub payload_type: u8,
     pub clock_rate: u32,
+    pub codec_name: Option<String>,
     pub control: String,
     pub sprop_sps: Option<Vec<u8>>, // raw SPS (no Annex-B start code)
     pub sprop_pps: Option<Vec<u8>>, // raw PPS (no Annex-B start code)
@@ -14,6 +15,7 @@ pub fn parse_sdp_video_track(sdp: &str) -> Result<SdpVideoTrack> {
     let mut in_video = false;
     let mut pt: Option<u8> = None;
     let mut clock: Option<u32> = None;
+    let mut codec_name: Option<String> = None;
     let mut control: Option<String> = None;
     let mut sprop_sps: Option<Vec<u8>> = None;
     let mut sprop_pps: Option<Vec<u8>> = None;
@@ -38,9 +40,8 @@ pub fn parse_sdp_video_track(sdp: &str) -> Result<SdpVideoTrack> {
             if line.starts_with(&format!("a=rtpmap:{p}")) {
                 if let Some((_, rhs)) = line.split_once(' ') {
                     if let Some((codec, rate)) = rhs.split_once('/') {
-                        if codec.eq_ignore_ascii_case("H264") {
-                            clock = Some(rate.parse()?);
-                        }
+                        codec_name = Some(codec.trim().to_string());
+                        clock = Some(rate.parse()?);
                     }
                 }
             }
@@ -73,6 +74,7 @@ pub fn parse_sdp_video_track(sdp: &str) -> Result<SdpVideoTrack> {
     Ok(SdpVideoTrack {
         payload_type: pt.ok_or_else(|| anyhow::anyhow!("No video PT found"))?,
         clock_rate: clock.unwrap_or(90000),
+        codec_name,
         control: control.ok_or_else(|| anyhow::anyhow!("No control found"))?,
         sprop_sps,
         sprop_pps,
@@ -103,7 +105,37 @@ mod tests {
         );
 
         let track = parse_sdp_video_track(&sdp).unwrap();
+        assert_eq!(track.codec_name.as_deref(), Some("H264"));
         assert_eq!(track.sprop_sps.unwrap(), sps);
         assert_eq!(track.sprop_pps.unwrap(), pps);
+    }
+
+    #[test]
+    fn parses_non_h264_codec_name() {
+        let sdp = "v=0\r\n\
+             o=- 0 0 IN IP4 127.0.0.1\r\n\
+             s=No Name\r\n\
+             t=0 0\r\n\
+             m=video 0 RTP/AVP 96\r\n\
+             a=rtpmap:96 H265/90000\r\n\
+             a=control:trackID=0\r\n";
+
+        let track = parse_sdp_video_track(sdp).unwrap();
+        assert_eq!(track.codec_name.as_deref(), Some("H265"));
+        assert_eq!(track.clock_rate, 90000);
+    }
+
+    #[test]
+    fn missing_rtpmap_keeps_codec_unknown_with_default_clock() {
+        let sdp = "v=0\r\n\
+             o=- 0 0 IN IP4 127.0.0.1\r\n\
+             s=No Name\r\n\
+             t=0 0\r\n\
+             m=video 0 RTP/AVP 96\r\n\
+             a=control:trackID=0\r\n";
+
+        let track = parse_sdp_video_track(sdp).unwrap();
+        assert_eq!(track.codec_name, None);
+        assert_eq!(track.clock_rate, 90000);
     }
 }

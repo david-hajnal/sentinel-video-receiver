@@ -177,6 +177,22 @@ async fn main() -> Result<()> {
         live_hls_window_secs,
         "Server ingest listening"
     );
+    match live_pipeline_version {
+        LivePipelineVersion::V1 => {
+            info!(
+                "LIVE_PIPELINE_VERSION=v1: clip/ingest-only path; does not publish HLS live artifacts"
+            );
+            info!(
+                "Viewer-facing live output requires LIVE_PIPELINE_VERSION=v2; both v1 and v2 require ingest to receive H.264 RTP"
+            );
+        }
+        LivePipelineVersion::V2 => {
+            info!("LIVE_PIPELINE_VERSION=v2: live HLS pipeline enabled");
+            info!(
+                "Viewer-facing live output requires LIVE_PIPELINE_VERSION=v2; both v1 and v2 require ingest to receive H.264 RTP"
+            );
+        }
+    }
 
     let streams: Arc<Mutex<HashMap<u32, mpsc::Sender<StreamMsg>>>> =
         Arc::new(Mutex::new(HashMap::new()));

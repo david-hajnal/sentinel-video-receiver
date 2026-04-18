@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 use tokio::fs::{self, File};
 use tokio::io::{AsyncWriteExt, BufWriter};
 use tokio::sync::mpsc;
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 
 use crate::core::h264_depacketize::H264Depacketizer;
 use crate::core::h264_sync::H264SyncGate;
@@ -64,6 +64,13 @@ struct StreamRuntimeStats {
     last_segment_write_at: Option<DateTime<Utc>>,
     last_stats_log_at: Option<Instant>,
     last_health_write_at: Option<Instant>,
+}
+
+#[derive(Debug, Default)]
+struct NoPublishEpisode {
+    first_rtp_at: Option<Instant>,
+    segment_seq_at_start: u64,
+    logged: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -311,6 +318,7 @@ pub async fn run_stream_v2(
     let mut pending_discontinuity = false;
     let mut discontinuity_count = 0u64;
     let mut latest_segment_seq = 0u64;
+    let mut no_publish_episode = NoPublishEpisode::default();
 
     let mut tick = tokio::time::interval(Duration::from_millis(200));
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -318,6 +326,12 @@ pub async fn run_stream_v2(
     loop {
         tokio::select! {
             _ = tick.tick() => {
+                maybe_log_no_publish_watchdog(
+                    cfg.stream_id,
+                    &stats,
+                    latest_segment_seq,
+                    &mut no_publish_episode,
+                );
                 maybe_log_stream_stats(&cfg, &mut stats, latest_segment_seq, discontinuity_count);
                 maybe_write_stream_health(
                     &cfg,
@@ -360,11 +374,24 @@ pub async fn run_stream_v2(
                     StreamMsg::Rtp(bytes) => {
                         stats.total_rtp_packets = stats.total_rtp_packets.saturating_add(1);
                         stats.last_rtp_at = Some(Utc::now());
+                        if no_publish_episode.first_rtp_at.is_none() {
+                            no_publish_episode.first_rtp_at = Some(Instant::now());
+                            no_publish_episode.segment_seq_at_start = latest_segment_seq;
+                            no_publish_episode.logged = false;
+                        }
 
                         let pkt = match RtpPacket::parse(&bytes) {
                             Ok(pkt) => pkt,
-                            Err(_) => {
+                            Err(error) => {
                                 mark_stream_error(&mut stats);
+                                maybe_log_rate_limited_parse_warn(
+                                    cfg.stream_id,
+                                    stats.total_parse_errors,
+                                    &error.to_string(),
+                                    bytes.len(),
+                                    bytes.first().copied(),
+                                    None,
+                                );
                                 handle_discontinuity(
                                     &cfg,
                                     &mut playlist,
@@ -407,8 +434,16 @@ pub async fn run_stream_v2(
 
                         let nals = match dep.push_rtp_payload(pkt.payload) {
                             Ok(nals) => nals,
-                            Err(_) => {
+                            Err(error) => {
                                 mark_stream_error(&mut stats);
+                                maybe_log_rate_limited_parse_warn(
+                                    cfg.stream_id,
+                                    stats.total_parse_errors,
+                                    &error.to_string(),
+                                    pkt.payload.len(),
+                                    pkt.payload.first().copied(),
+                                    derive_rtp_payload_nal_type(pkt.payload),
+                                );
                                 handle_discontinuity(
                                     &cfg,
                                     &mut playlist,
@@ -458,6 +493,7 @@ pub async fn run_stream_v2(
                                     &mut latest_segment_seq,
                                 )
                                 .await?;
+                                no_publish_episode = NoPublishEpisode::default();
                             }
 
                             if current_segment.is_none() {
@@ -588,6 +624,77 @@ async fn handle_discontinuity(
 fn mark_stream_error(stats: &mut StreamRuntimeStats) {
     stats.total_parse_errors = stats.total_parse_errors.saturating_add(1);
     stats.last_error_at = Some(Utc::now());
+}
+
+fn derive_rtp_payload_nal_type(payload: &[u8]) -> Option<u8> {
+    let first = *payload.first()?;
+    let nal_type = first & 0x1F;
+    match nal_type {
+        1..=23 => Some(nal_type),
+        28 => payload.get(1).map(|v| v & 0x1F),
+        _ => None,
+    }
+}
+
+fn should_log_rate_limited(count: u64) -> bool {
+    count <= 3 || count % 100 == 0
+}
+
+fn maybe_log_rate_limited_parse_warn(
+    stream_id: u32,
+    parse_error_count: u64,
+    error_text: &str,
+    payload_size: usize,
+    first_payload_byte: Option<u8>,
+    derived_nal_type: Option<u8>,
+) {
+    if !should_log_rate_limited(parse_error_count) {
+        return;
+    }
+    warn!(
+        stream_id,
+        parse_error_count,
+        error = %error_text,
+        payload_size,
+        first_payload_byte = first_payload_byte.map(|v| format!("0x{v:02X}")),
+        derived_nal_type,
+        "RTP/H264 parse failure"
+    );
+}
+
+fn maybe_log_no_publish_watchdog(
+    stream_id: u32,
+    stats: &StreamRuntimeStats,
+    segment_seq: u64,
+    episode: &mut NoPublishEpisode,
+) {
+    if episode.first_rtp_at.is_none() {
+        return;
+    }
+    if segment_seq > episode.segment_seq_at_start {
+        *episode = NoPublishEpisode::default();
+        return;
+    }
+    if episode.logged {
+        return;
+    }
+    let elapsed = episode
+        .first_rtp_at
+        .map(|started| started.elapsed())
+        .unwrap_or(Duration::ZERO);
+    if elapsed < Duration::from_secs(30) {
+        return;
+    }
+    error!(
+        stream_id,
+        total_rtp_packets = stats.total_rtp_packets,
+        total_access_units = stats.total_access_units,
+        total_parse_errors = stats.total_parse_errors,
+        last_idr_at = stats.last_idr_at.map(|ts| ts.to_rfc3339()),
+        segment_seq,
+        "Startup watchdog: RTP is arriving but no HLS segment has been published"
+    );
+    episode.logged = true;
 }
 
 fn derive_stream_health_state(
@@ -858,7 +965,10 @@ fn mpeg_crc32(bytes: &[u8]) -> u32 {
 
 #[cfg(test)]
 mod tests {
-    use super::{run_stream_v2, temp_path_for, AtomicPublisher, LivePipelineV2Config};
+    use super::{
+        run_stream_v2, temp_path_for, AtomicPublisher, LivePipelineV2Config, NoPublishEpisode,
+        StreamRuntimeStats,
+    };
     use crate::server_pipeline::StreamMsg;
     use std::path::PathBuf;
     use tokio::fs;
@@ -992,5 +1102,36 @@ mod tests {
         assert!(fs::metadata(cfg.output_root.join("index.m3u8")).await.is_err());
 
         fs::remove_dir_all(&dir).await.unwrap();
+    }
+
+    #[test]
+    fn parse_error_rate_limit_helper_matches_expected_pattern() {
+        assert!(super::should_log_rate_limited(1));
+        assert!(super::should_log_rate_limited(2));
+        assert!(super::should_log_rate_limited(3));
+        assert!(!super::should_log_rate_limited(4));
+        assert!(super::should_log_rate_limited(100));
+    }
+
+    #[test]
+    fn no_publish_watchdog_latches_and_resets_after_segment_publish() {
+        let mut episode = NoPublishEpisode {
+            first_rtp_at: Some(std::time::Instant::now() - std::time::Duration::from_secs(31)),
+            segment_seq_at_start: 0,
+            logged: false,
+        };
+        let stats = StreamRuntimeStats {
+            total_rtp_packets: 10,
+            total_access_units: 0,
+            total_parse_errors: 3,
+            ..StreamRuntimeStats::default()
+        };
+
+        super::maybe_log_no_publish_watchdog(9, &stats, 0, &mut episode);
+        assert!(episode.logged);
+
+        super::maybe_log_no_publish_watchdog(9, &stats, 1, &mut episode);
+        assert!(episode.first_rtp_at.is_none());
+        assert!(!episode.logged);
     }
 }
