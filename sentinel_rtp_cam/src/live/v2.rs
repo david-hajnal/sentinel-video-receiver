@@ -1140,12 +1140,19 @@ fn mpeg_crc32(bytes: &[u8]) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::{
-        run_stream_v2, temp_path_for, AtomicPublisher, LivePipelineV2Config, NoPublishEpisode,
-        StreamRuntimeStats,
+        build_access_unit, build_pat_packet, build_pmt_packet, cleanup_old_sessions,
+        derive_rtp_payload_nal_type, derive_stream_health_state, encode_pts, finalize_segment,
+        handle_discontinuity, initialize_live_session, mpeg_crc32, open_segment, packetize_ts,
+        read_current_generation, run_stream_v2, should_rotate_segment, temp_path_for,
+        write_current_session_pointer, AtomicPublisher, LivePipelineV2Config, NoPublishEpisode,
+        PlaylistState, StreamHealthState, StreamRuntimeStats,
     };
     use crate::server_pipeline::StreamMsg;
+    use chrono::{Duration as ChronoDuration, Utc};
+    use filetime::{set_file_mtime, FileTime};
     use serde_json::Value;
     use std::path::PathBuf;
+    use std::time::{Duration, Instant, SystemTime};
     use tokio::fs;
     use tokio::sync::mpsc;
     use ulid::Ulid;
@@ -1175,6 +1182,549 @@ mod tests {
         packet.extend_from_slice(&1u32.to_be_bytes());
         packet.extend_from_slice(nal);
         packet
+    }
+
+    async fn send_sync_idr(tx: &mpsc::Sender<StreamMsg>, seq_start: u16, ts_start: u32) {
+        tx.send(StreamMsg::Rtp(rtp_single_nal(
+            seq_start,
+            ts_start,
+            true,
+            &[0x67, 0x64, 0x00, 0x1F],
+        )))
+        .await
+        .unwrap();
+        tx.send(StreamMsg::Rtp(rtp_single_nal(
+            seq_start.wrapping_add(1),
+            ts_start.wrapping_add(3_600),
+            true,
+            &[0x68, 0xEE, 0x3C, 0x80],
+        )))
+        .await
+        .unwrap();
+        tx.send(StreamMsg::Rtp(rtp_single_nal(
+            seq_start.wrapping_add(2),
+            ts_start.wrapping_add(7_200),
+            true,
+            &[0x65, 0x88, 0x99, 0xAA],
+        )))
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn playlist_state_calculates_max_segments_and_minimum_floor() {
+        let tiny = PlaylistState::new(1, 1);
+        assert_eq!(tiny.target_duration_secs, 1);
+        assert_eq!(tiny.max_segments, 3);
+
+        let wider = PlaylistState::new(2, 9);
+        assert_eq!(wider.target_duration_secs, 2);
+        assert_eq!(wider.max_segments, 6);
+    }
+
+    #[tokio::test]
+    async fn playlist_publish_includes_required_tags_and_discontinuity_marker() {
+        let dir = test_dir("playlist_publish");
+        fs::create_dir_all(&dir).await.unwrap();
+        let mut playlist = PlaylistState::new(2, 4);
+        fs::write(dir.join("seg_000001.ts"), b"segment-1")
+            .await
+            .unwrap();
+        fs::write(dir.join("seg_000002.ts"), b"segment-2")
+            .await
+            .unwrap();
+        playlist.push_segment(&dir, 1, 1.2, false).await.unwrap();
+        playlist.push_segment(&dir, 2, 1.8, true).await.unwrap();
+
+        let manifest = fs::read_to_string(dir.join("index.m3u8")).await.unwrap();
+        assert!(manifest.contains("#EXTM3U"));
+        assert!(manifest.contains("#EXT-X-VERSION:3"));
+        assert!(manifest.contains("#EXT-X-INDEPENDENT-SEGMENTS"));
+        assert!(manifest.contains("#EXT-X-TARGETDURATION:2"));
+        assert!(manifest.contains("#EXT-X-MEDIA-SEQUENCE:1"));
+        assert!(manifest.contains("#EXT-X-DISCONTINUITY\n#EXTINF:1.800,\nseg_000002.ts"));
+
+        fs::remove_dir_all(&dir).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn playlist_push_segment_evicts_oldest_files_and_updates_media_sequence() {
+        let dir = test_dir("playlist_eviction");
+        fs::create_dir_all(&dir).await.unwrap();
+        let mut playlist = PlaylistState::new(1, 1);
+        assert_eq!(playlist.max_segments, 3);
+
+        for seq in 1..=5 {
+            fs::write(
+                dir.join(format!("seg_{seq:06}.ts")),
+                format!("segment-{seq}"),
+            )
+            .await
+            .unwrap();
+            playlist.push_segment(&dir, seq, 1.0, false).await.unwrap();
+        }
+
+        let manifest = fs::read_to_string(dir.join("index.m3u8")).await.unwrap();
+        assert!(manifest.contains("#EXT-X-MEDIA-SEQUENCE:3"));
+        assert!(!manifest.contains("seg_000001.ts"));
+        assert!(!manifest.contains("seg_000002.ts"));
+        assert!(manifest.contains("seg_000003.ts"));
+        assert!(manifest.contains("seg_000004.ts"));
+        assert!(manifest.contains("seg_000005.ts"));
+
+        assert!(fs::metadata(dir.join("seg_000001.ts")).await.is_err());
+        assert!(fs::metadata(dir.join("seg_000002.ts")).await.is_err());
+        assert!(fs::metadata(dir.join("seg_000003.ts")).await.is_ok());
+        assert!(fs::metadata(dir.join("seg_000004.ts")).await.is_ok());
+        assert!(fs::metadata(dir.join("seg_000005.ts")).await.is_ok());
+
+        fs::remove_dir_all(&dir).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn should_rotate_segment_requires_data_elapsed_target_and_next_idr() {
+        let dir = test_dir("segment_rotate");
+        fs::create_dir_all(&dir).await.unwrap();
+        let mut playlist = PlaylistState::new(1, 4);
+        let mut segment = open_segment(&dir, &mut playlist, false).await.unwrap();
+        let idr_au = build_access_unit(vec![vec![0x00, 0x00, 0x00, 0x01, 0x65, 0x88]], 90_000);
+        let p_au = build_access_unit(vec![vec![0x00, 0x00, 0x00, 0x01, 0x41, 0x99]], 93_000);
+
+        assert!(!should_rotate_segment(Some(&segment), &idr_au, 1));
+        segment.access_units_written = 1;
+        segment.started_at = Instant::now() - Duration::from_millis(200);
+        assert!(!should_rotate_segment(Some(&segment), &idr_au, 1));
+        segment.started_at = Instant::now() - Duration::from_secs(2);
+        assert!(!should_rotate_segment(Some(&segment), &p_au, 1));
+        assert!(should_rotate_segment(Some(&segment), &idr_au, 1));
+        assert!(!should_rotate_segment(None, &idr_au, 1));
+
+        fs::remove_dir_all(&dir).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn handle_discontinuity_without_published_output_keeps_pending_false() {
+        let dir = test_dir("disco_no_output");
+        fs::create_dir_all(&dir).await.unwrap();
+        let mut playlist = PlaylistState::new(1, 2);
+        let mut current_segment = None;
+        let mut pending_discontinuity = false;
+        let mut discontinuity_count = 0u64;
+        let mut latest_segment_seq = 0u64;
+
+        handle_discontinuity(
+            &dir,
+            &mut playlist,
+            &mut current_segment,
+            &mut pending_discontinuity,
+            &mut discontinuity_count,
+            &mut latest_segment_seq,
+        )
+        .await
+        .unwrap();
+
+        assert!(!pending_discontinuity);
+        assert_eq!(discontinuity_count, 0);
+        assert_eq!(latest_segment_seq, 0);
+
+        fs::remove_dir_all(&dir).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn handle_discontinuity_after_published_output_sets_pending_and_increments_count() {
+        let dir = test_dir("disco_has_output");
+        fs::create_dir_all(&dir).await.unwrap();
+        let mut playlist = PlaylistState::new(1, 2);
+        let mut current_segment = None;
+        let mut pending_discontinuity = false;
+        let mut discontinuity_count = 0u64;
+        let mut latest_segment_seq = 3u64;
+
+        handle_discontinuity(
+            &dir,
+            &mut playlist,
+            &mut current_segment,
+            &mut pending_discontinuity,
+            &mut discontinuity_count,
+            &mut latest_segment_seq,
+        )
+        .await
+        .unwrap();
+
+        assert!(pending_discontinuity);
+        assert_eq!(discontinuity_count, 1);
+        assert_eq!(latest_segment_seq, 3);
+
+        fs::remove_dir_all(&dir).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn finalize_segment_discards_empty_segments_without_writing_playlist_or_ts() {
+        let dir = test_dir("finalize_empty");
+        fs::create_dir_all(&dir).await.unwrap();
+        let mut playlist = PlaylistState::new(1, 2);
+        let mut current_segment = Some(open_segment(&dir, &mut playlist, false).await.unwrap());
+        let mut latest_segment_seq = 0u64;
+
+        finalize_segment(
+            &dir,
+            &mut playlist,
+            &mut current_segment,
+            &mut latest_segment_seq,
+        )
+        .await
+        .unwrap();
+
+        assert!(current_segment.is_none());
+        assert_eq!(latest_segment_seq, 0);
+        assert!(fs::metadata(dir.join("index.m3u8")).await.is_err());
+        assert!(fs::metadata(dir.join("seg_000001.ts")).await.is_err());
+        assert!(fs::metadata(dir.join("seg_000001.ts.tmp")).await.is_err());
+
+        fs::remove_dir_all(&dir).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn finalize_segment_publishes_non_empty_segment_and_updates_playlist_state() {
+        let dir = test_dir("finalize_non_empty");
+        fs::create_dir_all(&dir).await.unwrap();
+        let mut playlist = PlaylistState::new(1, 2);
+        let mut current_segment = Some(open_segment(&dir, &mut playlist, false).await.unwrap());
+        let mut latest_segment_seq = 0u64;
+        let au = build_access_unit(vec![vec![0x00, 0x00, 0x00, 0x01, 0x65, 0x44]], 90_000);
+
+        {
+            let segment = current_segment.as_mut().expect("segment");
+            segment.writer.write_access_unit(&au).await.unwrap();
+            segment.access_units_written = 1;
+            segment.started_at = Instant::now() - Duration::from_secs(2);
+        }
+
+        finalize_segment(
+            &dir,
+            &mut playlist,
+            &mut current_segment,
+            &mut latest_segment_seq,
+        )
+        .await
+        .unwrap();
+
+        assert!(current_segment.is_none());
+        assert_eq!(latest_segment_seq, 1);
+        assert!(fs::metadata(dir.join("seg_000001.ts")).await.is_ok());
+        let seg_size = fs::metadata(dir.join("seg_000001.ts")).await.unwrap().len();
+        assert!(seg_size > 0);
+        let manifest = fs::read_to_string(dir.join("index.m3u8")).await.unwrap();
+        assert!(manifest.contains("seg_000001.ts"));
+        assert!(manifest.contains("#EXT-X-MEDIA-SEQUENCE:1"));
+
+        fs::remove_dir_all(&dir).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn initialize_live_session_creates_session_directory_and_starting_pointer() {
+        let dir = test_dir("init_session");
+        fs::create_dir_all(&dir).await.unwrap();
+
+        let session = initialize_live_session(&dir).await.unwrap();
+        assert!(fs::metadata(&session.output_root).await.is_ok());
+
+        let pointer_raw = fs::read_to_string(dir.join("current.json")).await.unwrap();
+        let pointer: Value = serde_json::from_str(&pointer_raw).unwrap();
+        assert_eq!(
+            pointer.get("session_id").and_then(Value::as_str),
+            Some(session.session_id.as_str())
+        );
+        assert_eq!(
+            pointer.get("writer_state").and_then(Value::as_str),
+            Some("starting")
+        );
+        assert_eq!(
+            pointer.get("generation").and_then(Value::as_u64),
+            Some(session.generation)
+        );
+
+        fs::remove_dir_all(&dir).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn write_current_session_pointer_updates_state_and_last_segment_seq() {
+        let dir = test_dir("pointer_update");
+        fs::create_dir_all(&dir).await.unwrap();
+        let session = initialize_live_session(&dir).await.unwrap();
+
+        write_current_session_pointer(&dir, &session, "stopped", 42)
+            .await
+            .unwrap();
+        let pointer_raw = fs::read_to_string(dir.join("current.json")).await.unwrap();
+        let pointer: Value = serde_json::from_str(&pointer_raw).unwrap();
+        assert_eq!(
+            pointer.get("writer_state").and_then(Value::as_str),
+            Some("stopped")
+        );
+        assert_eq!(
+            pointer.get("last_segment_seq").and_then(Value::as_u64),
+            Some(42)
+        );
+
+        fs::remove_dir_all(&dir).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn read_current_generation_handles_missing_malformed_and_valid_pointer() {
+        let dir = test_dir("read_generation");
+        fs::create_dir_all(&dir).await.unwrap();
+
+        assert_eq!(read_current_generation(&dir).await, 1);
+
+        fs::write(dir.join("current.json"), "{not-json")
+            .await
+            .unwrap();
+        assert_eq!(read_current_generation(&dir).await, 1);
+
+        let valid_pointer = serde_json::json!({
+            "session_id": "sess_a",
+            "started_at": "2026-04-18T12:00:00Z",
+            "generation": 8,
+            "writer_state": "starting",
+            "updated_at": "2026-04-18T12:00:00Z",
+            "last_segment_seq": 0
+        });
+        fs::write(
+            dir.join("current.json"),
+            serde_json::to_vec_pretty(&valid_pointer).unwrap(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(read_current_generation(&dir).await, 9);
+
+        fs::remove_dir_all(&dir).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn cleanup_old_sessions_keeps_current_and_newest_old_sessions_then_removes_expired_older()
+    {
+        let dir = test_dir("session_gc");
+        fs::create_dir_all(&dir).await.unwrap();
+        let current = dir.join("sess_current");
+        let keep_newest = dir.join("sess_keep_newest");
+        let keep_second = dir.join("sess_keep_second");
+        let remove_old = dir.join("sess_remove_old");
+        let remove_older = dir.join("sess_remove_older");
+        for session_dir in [
+            &current,
+            &keep_newest,
+            &keep_second,
+            &remove_old,
+            &remove_older,
+        ] {
+            fs::create_dir_all(session_dir).await.unwrap();
+        }
+
+        let now = SystemTime::now();
+        set_file_mtime(
+            &keep_newest,
+            FileTime::from_system_time(now - Duration::from_secs(400)),
+        )
+        .unwrap();
+        set_file_mtime(
+            &keep_second,
+            FileTime::from_system_time(now - Duration::from_secs(500)),
+        )
+        .unwrap();
+        set_file_mtime(
+            &remove_old,
+            FileTime::from_system_time(now - Duration::from_secs(600)),
+        )
+        .unwrap();
+        set_file_mtime(
+            &remove_older,
+            FileTime::from_system_time(now - Duration::from_secs(700)),
+        )
+        .unwrap();
+
+        cleanup_old_sessions(dir.clone(), "sess_current".to_string(), 300, 3)
+            .await
+            .unwrap();
+
+        assert!(fs::metadata(&current).await.is_ok());
+        assert!(fs::metadata(&keep_newest).await.is_ok());
+        assert!(fs::metadata(&keep_second).await.is_ok());
+        assert!(fs::metadata(&remove_old).await.is_err());
+        assert!(fs::metadata(&remove_older).await.is_err());
+
+        fs::remove_dir_all(&dir).await.unwrap();
+    }
+
+    #[test]
+    fn temp_path_for_appends_tmp_suffix_to_filename() {
+        let path = PathBuf::from("/tmp/index.m3u8");
+        let temp = temp_path_for(&path);
+        assert_eq!(temp, PathBuf::from("/tmp/index.m3u8.tmp"));
+    }
+
+    #[test]
+    fn encode_pts_sets_expected_marker_bits() {
+        let encoded = encode_pts(0x1ABCDE);
+        assert_eq!(encoded.len(), 5);
+        assert_eq!(encoded[0] & 0xF0, 0x20);
+        assert_eq!(encoded[0] & 0x01, 1);
+        assert_eq!(encoded[2] & 0x01, 1);
+        assert_eq!(encoded[4] & 0x01, 1);
+    }
+
+    #[test]
+    fn packetize_ts_uses_adaptation_padding_and_wraps_continuity_counter() {
+        let payload = vec![0xAB; 50];
+        let mut cc = 15u8;
+        let packets = packetize_ts(0x0100, &payload, &mut cc, true);
+        assert_eq!(packets.len() % 188, 0);
+        assert_eq!(packets.len(), 188);
+        assert_eq!(packets[0], 0x47);
+        assert_eq!(packets[3] & 0x0F, 15);
+        assert_eq!((packets[3] >> 4) & 0x03, 0b11);
+        assert_eq!(cc, 0);
+
+        let adaptation_len = packets[4] as usize;
+        assert!(adaptation_len > 0);
+        assert_eq!(packets[5], 0x00);
+        assert!(packets[6..(5 + adaptation_len)]
+            .iter()
+            .all(|byte| *byte == 0xFF));
+        let payload_offset = 5 + adaptation_len;
+        assert_eq!(
+            &packets[payload_offset..payload_offset + payload.len()],
+            payload.as_slice()
+        );
+
+        let mut cc_multi = 14u8;
+        let multi_packets = packetize_ts(0x0100, &[0xCD; 400], &mut cc_multi, false);
+        assert_eq!(multi_packets.len(), 188 * 3);
+        assert_eq!(multi_packets[3] & 0x0F, 14);
+        assert_eq!(multi_packets[188 + 3] & 0x0F, 15);
+        assert_eq!(multi_packets[(188 * 2) + 3] & 0x0F, 0);
+        assert_eq!(cc_multi, 1);
+    }
+
+    #[test]
+    fn build_pat_and_pmt_packets_use_expected_sync_and_pid_values() {
+        let mut cc_pat = 0u8;
+        let pat = build_pat_packet(&mut cc_pat);
+        assert_eq!(pat.len() % 188, 0);
+        assert_eq!(pat[0], 0x47);
+        let pat_pid = (((pat[1] & 0x1F) as u16) << 8) | pat[2] as u16;
+        assert_eq!(pat_pid, super::PAT_PID);
+        assert_eq!(cc_pat, 1);
+
+        let mut cc_pmt = 3u8;
+        let pmt = build_pmt_packet(&mut cc_pmt);
+        assert_eq!(pmt.len() % 188, 0);
+        assert_eq!(pmt[0], 0x47);
+        let pmt_pid = (((pmt[1] & 0x1F) as u16) << 8) | pmt[2] as u16;
+        assert_eq!(pmt_pid, super::PMT_PID);
+        assert_eq!(cc_pmt, 4);
+    }
+
+    #[test]
+    fn mpeg_crc32_is_stable_for_same_bytes_and_changes_with_input() {
+        let bytes = [0x00, 0xB0, 0x0D, 0x00, 0x01, 0xC1];
+        let crc_a = mpeg_crc32(&bytes);
+        let crc_b = mpeg_crc32(&bytes);
+        let mut changed = bytes;
+        changed[1] ^= 0x01;
+        let crc_changed = mpeg_crc32(&changed);
+
+        assert_eq!(crc_a, crc_b);
+        assert_ne!(crc_a, crc_changed);
+    }
+
+    #[tokio::test]
+    async fn run_stream_v2_gap_driven_segments_include_discontinuity_and_evict_old_segments() {
+        let dir = test_dir("gap_discontinuity_eviction");
+        fs::create_dir_all(&dir).await.unwrap();
+        let mut cfg = config(&dir);
+        cfg.segment_secs = 1;
+        cfg.window_secs = 1;
+        let (tx, rx) = mpsc::channel(256);
+
+        let handle = tokio::spawn(run_stream_v2(cfg.clone(), rx));
+        let mut seq = 1u16;
+        let mut ts = 90_000u32;
+        for idx in 0..5 {
+            send_sync_idr(&tx, seq, ts).await;
+            seq = seq.wrapping_add(3);
+            ts = ts.wrapping_add(9_000);
+            if idx < 4 {
+                tx.send(StreamMsg::Gap {
+                    last: seq.wrapping_sub(1),
+                    new: seq.wrapping_add(10),
+                })
+                .await
+                .unwrap();
+            }
+        }
+        drop(tx);
+        handle.await.unwrap().unwrap();
+
+        let pointer_raw = fs::read_to_string(cfg.output_root.join("current.json"))
+            .await
+            .expect("current session pointer");
+        let pointer: Value = serde_json::from_str(&pointer_raw).expect("valid pointer");
+        let session_id = pointer
+            .get("session_id")
+            .and_then(Value::as_str)
+            .expect("session id");
+        let session_root = cfg.output_root.join(session_id);
+        let manifest = fs::read_to_string(session_root.join("index.m3u8"))
+            .await
+            .unwrap();
+
+        assert!(manifest.contains("#EXT-X-DISCONTINUITY"));
+        assert!(manifest.contains("#EXT-X-MEDIA-SEQUENCE:3"));
+        assert!(!manifest.contains("seg_000001.ts"));
+        assert!(!manifest.contains("seg_000002.ts"));
+        assert!(manifest.contains("seg_000003.ts"));
+        assert!(manifest.contains("seg_000004.ts"));
+        assert!(manifest.contains("seg_000005.ts"));
+        assert!(fs::metadata(session_root.join("seg_000001.ts"))
+            .await
+            .is_err());
+        assert!(fs::metadata(session_root.join("seg_000002.ts"))
+            .await
+            .is_err());
+        for seq in 3..=5 {
+            let path = session_root.join(format!("seg_{seq:06}.ts"));
+            let size = fs::metadata(path).await.unwrap().len();
+            assert!(size > 0);
+        }
+
+        fs::remove_dir_all(&dir).await.unwrap();
+    }
+
+    #[test]
+    fn derive_stream_health_state_reports_idle_receiving_and_stale() {
+        let now = Utc::now();
+        assert_eq!(
+            derive_stream_health_state(None, 10, now),
+            StreamHealthState::Idle
+        );
+        assert_eq!(
+            derive_stream_health_state(Some(now - ChronoDuration::seconds(5)), 10, now),
+            StreamHealthState::Receiving
+        );
+        assert_eq!(
+            derive_stream_health_state(Some(now - ChronoDuration::seconds(11)), 10, now),
+            StreamHealthState::Stale
+        );
+    }
+
+    #[test]
+    fn derive_rtp_payload_nal_type_supports_single_nal_fu_a_and_invalid_inputs() {
+        assert_eq!(derive_rtp_payload_nal_type(&[0x65, 0xAA]), Some(5));
+        assert_eq!(derive_rtp_payload_nal_type(&[0x7C, 0x85, 0xAA]), Some(5));
+        assert_eq!(derive_rtp_payload_nal_type(&[0x7C]), None);
+        assert_eq!(derive_rtp_payload_nal_type(&[0x00]), None);
+        assert_eq!(derive_rtp_payload_nal_type(&[]), None);
     }
 
     #[tokio::test]
