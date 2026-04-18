@@ -4,6 +4,7 @@ use std::fmt;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use tokio::sync::{mpsc, watch};
+use tracing::warn;
 
 #[derive(Debug, Clone)]
 pub enum Event {
@@ -63,7 +64,9 @@ impl EventBus {
         };
 
         for tx in subscribers {
-            let _ = tx.send(ev.clone()).await;
+            if let Err(error) = tx.send(ev.clone()).await {
+                warn!(error = %error, "EventBus publish failed; subscriber closed");
+            }
         }
 
         self.inner.lock().await.retain(|tx| !tx.is_closed());
@@ -203,6 +206,30 @@ mod tests {
             .expect("second event should exist");
         let Event::Motion(second_motion) = second_recv;
         assert!(!second_motion.active);
+    }
+
+    #[tokio::test]
+    async fn publish_prunes_closed_subscribers_and_keeps_live_delivery() {
+        let bus = EventBus::new(8);
+        let dropped_rx = bus.subscribe().await;
+        drop(dropped_rx);
+        let mut live_rx = bus.subscribe().await;
+
+        bus.publish(Event::Motion(MotionEvent {
+            rule: "rule-1".to_string(),
+            active: true,
+            ts: Utc::now(),
+            camera_id: "cam-1".to_string(),
+            event_id: "evt-1".to_string(),
+        }))
+        .await;
+
+        let recv = timeout(Duration::from_secs(1), live_rx.recv())
+            .await
+            .expect("live recv should complete")
+            .expect("live subscriber should receive event");
+        let Event::Motion(motion) = recv;
+        assert!(motion.active);
     }
 
     #[test]

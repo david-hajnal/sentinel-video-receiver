@@ -37,6 +37,9 @@ pub fn load_uplink_ingest_config_from_env() -> Option<HelloIngestConfig> {
         clip_ring_secs: env_u64("CLIP_RING_SECS"),
         clip_stale_part_secs: env_u64("CLIP_STALE_PART_SECS"),
         clip_max_secs: env_u64("CLIP_MAX_SECS"),
+        clip_write_timeout_ms: env_u64("CLIP_WRITE_TIMEOUT_MS"),
+        clip_write_retry_count: env_u64("CLIP_WRITE_RETRY_COUNT"),
+        clip_write_retry_backoff_ms: env_u64("CLIP_WRITE_RETRY_BACKOFF_MS"),
     };
     if ingest.is_empty() {
         None

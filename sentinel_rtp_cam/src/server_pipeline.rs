@@ -2,10 +2,12 @@ use anyhow::Result;
 use chrono::{DateTime, Utc};
 use serde::Serialize;
 use std::collections::VecDeque;
+#[cfg(test)]
+use std::future::Future;
 use std::path::PathBuf;
 use std::time::{Duration, Instant, SystemTime};
 use tokio::sync::mpsc;
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::core::clip_writer::ClipWriter;
 use crate::core::h264_depacketize::H264Depacketizer;
@@ -35,6 +37,9 @@ pub struct StreamConfig {
     pub post_secs: u64,
     pub stale_part_secs: u64,
     pub max_clip_secs: Option<u64>,
+    pub clip_write_timeout_ms: u64,
+    pub clip_write_retry_count: u64,
+    pub clip_write_retry_backoff_ms: u64,
     pub stale_secs: u64,
     pub stats_log_secs: u64,
 }
@@ -52,6 +57,13 @@ struct ClipState {
     rule: String,
     stop_at: Instant,
     hard_stop_at: Option<Instant>,
+}
+
+#[derive(Clone, Copy)]
+struct ClipWriteSettings {
+    timeout: Duration,
+    retry_count: u64,
+    retry_backoff: Duration,
 }
 
 #[derive(Serialize)]
@@ -130,6 +142,11 @@ pub async fn run_stream(cfg: StreamConfig, mut rx: mpsc::Receiver<StreamMsg>) ->
 
     let mut tick = tokio::time::interval(Duration::from_millis(200));
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let clip_write = ClipWriteSettings {
+        timeout: Duration::from_millis(cfg.clip_write_timeout_ms.max(1)),
+        retry_count: cfg.clip_write_retry_count,
+        retry_backoff: Duration::from_millis(cfg.clip_write_retry_backoff_ms),
+    };
 
     loop {
         tokio::select! {
@@ -242,7 +259,17 @@ pub async fn run_stream(cfg: StreamConfig, mut rx: mpsc::Receiver<StreamMsg>) ->
                             if let Some(cs) = &mut clip {
                                 if let Some(au) = ring.back() {
                                     for nal in &au.nals {
-                                        let _ = cs.writer.write_nal(nal).await;
+                                        if !write_active_clip_nal_with_retry(
+                                            cfg.stream_id,
+                                            cs,
+                                            nal,
+                                            clip_write,
+                                        )
+                                        .await
+                                        {
+                                            clip = None;
+                                            break;
+                                        }
                                     }
                                 }
                             }
@@ -256,6 +283,185 @@ pub async fn run_stream(cfg: StreamConfig, mut rx: mpsc::Receiver<StreamMsg>) ->
 
     write_stream_health(&cfg, &stats, clip.is_some(), clip_pending).await?;
     Ok(())
+}
+
+async fn write_active_clip_nal_with_retry(
+    stream_id: u32,
+    clip: &mut ClipState,
+    nal: &[u8],
+    settings: ClipWriteSettings,
+) -> bool {
+    let part_path = clip.writer.part_path().clone();
+    let attempts = settings.retry_count.saturating_add(1);
+    for attempt in 1..=attempts {
+        let result = tokio::time::timeout(settings.timeout, clip.writer.write_nal(nal)).await;
+        match result {
+            Ok(Ok(())) => return true,
+            Ok(Err(error)) if attempt < attempts => {
+                warn!(
+                    stream_id,
+                    rule = %clip.rule,
+                    part_file = ?part_path,
+                    attempt,
+                    max_attempts = attempts,
+                    timeout_ms = settings.timeout.as_millis(),
+                    retry_backoff_ms = settings.retry_backoff.as_millis(),
+                    error = %error,
+                    "Clip write failed, retrying"
+                );
+                if settings.retry_backoff > Duration::ZERO {
+                    tokio::time::sleep(settings.retry_backoff).await;
+                }
+                continue;
+            }
+            Ok(Err(error)) => {
+                error!(
+                    stream_id,
+                    rule = %clip.rule,
+                    part_file = ?part_path,
+                    attempt,
+                    max_attempts = attempts,
+                    timeout_ms = settings.timeout.as_millis(),
+                    retry_backoff_ms = settings.retry_backoff.as_millis(),
+                    error = %error,
+                    "Clip write failed, dropping active clip"
+                );
+            }
+            Err(_) if attempt < attempts => {
+                warn!(
+                    stream_id,
+                    rule = %clip.rule,
+                    part_file = ?part_path,
+                    attempt,
+                    max_attempts = attempts,
+                    timeout_ms = settings.timeout.as_millis(),
+                    retry_backoff_ms = settings.retry_backoff.as_millis(),
+                    "Clip write timed out, retrying"
+                );
+                if settings.retry_backoff > Duration::ZERO {
+                    tokio::time::sleep(settings.retry_backoff).await;
+                }
+                continue;
+            }
+            Err(_) => {
+                error!(
+                    stream_id,
+                    rule = %clip.rule,
+                    part_file = ?part_path,
+                    attempt,
+                    max_attempts = attempts,
+                    timeout_ms = settings.timeout.as_millis(),
+                    retry_backoff_ms = settings.retry_backoff.as_millis(),
+                    "Clip write timed out, dropping active clip"
+                );
+            }
+        }
+
+        if let Err(clean_error) = tokio::fs::remove_file(&part_path).await {
+            warn!(
+                stream_id,
+                rule = %clip.rule,
+                part_file = ?part_path,
+                error = %clean_error,
+                "Failed to delete .part file after clip write failure"
+            );
+        }
+        return false;
+    }
+
+    false
+}
+
+#[cfg(test)]
+async fn write_with_retry_and_cleanup<F, Fut>(
+    stream_id: u32,
+    rule: &str,
+    part_path: &PathBuf,
+    settings: ClipWriteSettings,
+    mut op: F,
+) -> bool
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = Result<()>>,
+{
+    let attempts = settings.retry_count.saturating_add(1);
+    for attempt in 1..=attempts {
+        let result = tokio::time::timeout(settings.timeout, op()).await;
+        match result {
+            Ok(Ok(())) => return true,
+            Ok(Err(error)) if attempt < attempts => {
+                warn!(
+                    stream_id,
+                    rule,
+                    part_file = ?part_path,
+                    attempt,
+                    max_attempts = attempts,
+                    timeout_ms = settings.timeout.as_millis(),
+                    retry_backoff_ms = settings.retry_backoff.as_millis(),
+                    error = %error,
+                    "Clip write failed, retrying"
+                );
+                if settings.retry_backoff > Duration::ZERO {
+                    tokio::time::sleep(settings.retry_backoff).await;
+                }
+                continue;
+            }
+            Ok(Err(error)) => {
+                error!(
+                    stream_id,
+                    rule,
+                    part_file = ?part_path,
+                    attempt,
+                    max_attempts = attempts,
+                    timeout_ms = settings.timeout.as_millis(),
+                    retry_backoff_ms = settings.retry_backoff.as_millis(),
+                    error = %error,
+                    "Clip write failed, dropping active clip"
+                );
+            }
+            Err(_) if attempt < attempts => {
+                warn!(
+                    stream_id,
+                    rule,
+                    part_file = ?part_path,
+                    attempt,
+                    max_attempts = attempts,
+                    timeout_ms = settings.timeout.as_millis(),
+                    retry_backoff_ms = settings.retry_backoff.as_millis(),
+                    "Clip write timed out, retrying"
+                );
+                if settings.retry_backoff > Duration::ZERO {
+                    tokio::time::sleep(settings.retry_backoff).await;
+                }
+                continue;
+            }
+            Err(_) => {
+                error!(
+                    stream_id,
+                    rule,
+                    part_file = ?part_path,
+                    attempt,
+                    max_attempts = attempts,
+                    timeout_ms = settings.timeout.as_millis(),
+                    retry_backoff_ms = settings.retry_backoff.as_millis(),
+                    "Clip write timed out, dropping active clip"
+                );
+            }
+        }
+
+        if let Err(clean_error) = tokio::fs::remove_file(part_path).await {
+            warn!(
+                stream_id,
+                rule,
+                part_file = ?part_path,
+                error = %clean_error,
+                "Failed to delete .part file after clip write failure"
+            );
+        }
+        return false;
+    }
+
+    false
 }
 
 fn build_access_unit(
@@ -545,8 +751,10 @@ async fn cleanup_stale_parts(dir: &PathBuf, stale_part_secs: u64) -> Result<()> 
 mod tests {
     use super::{
         cleanup_stale_parts, derive_stream_health_state, should_finalize_clip, try_start_clip,
-        write_stream_health, AccessUnit, StreamConfig, StreamHealthState, StreamRuntimeStats,
+        write_stream_health, write_with_retry_and_cleanup, AccessUnit, ClipWriteSettings,
+        StreamConfig, StreamHealthState, StreamRuntimeStats,
     };
+    use anyhow::anyhow;
     use chrono::{Duration as ChronoDuration, Utc};
     use std::collections::VecDeque;
     use std::path::PathBuf;
@@ -567,6 +775,9 @@ mod tests {
             post_secs: 3,
             stale_part_secs: 1,
             max_clip_secs: Some(9),
+            clip_write_timeout_ms: 5_000,
+            clip_write_retry_count: 2,
+            clip_write_retry_backoff_ms: 250,
             stale_secs: 15,
             stats_log_secs: 60,
         }
@@ -745,6 +956,90 @@ mod tests {
         assert!(raw.contains("\"total_rtp_packets\": 11"));
         assert!(fs::metadata(clip_dir.join("stream_7.health.json.tmp")).await.is_err());
 
+        fs::remove_dir_all(&clip_dir).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn clip_write_retry_succeeds_without_retry() {
+        let clip_dir = test_dir("write_retry_success");
+        fs::create_dir_all(&clip_dir).await.unwrap();
+        let part = clip_dir.join("active.h264.part");
+        fs::write(&part, b"seed").await.unwrap();
+        let mut attempts = 0u64;
+        let settings = ClipWriteSettings {
+            timeout: Duration::from_millis(50),
+            retry_count: 2,
+            retry_backoff: Duration::from_millis(1),
+        };
+
+        let ok = write_with_retry_and_cleanup(7, "rule-a", &part, settings, || {
+            attempts += 1;
+            std::future::ready(Ok(()))
+        })
+        .await;
+
+        assert!(ok);
+        assert_eq!(attempts, 1);
+        assert!(fs::metadata(&part).await.is_ok());
+        fs::remove_dir_all(&clip_dir).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn clip_write_retry_recovers_after_timeout_then_error() {
+        let clip_dir = test_dir("write_retry_recover");
+        fs::create_dir_all(&clip_dir).await.unwrap();
+        let part = clip_dir.join("active.h264.part");
+        fs::write(&part, b"seed").await.unwrap();
+        let mut attempts = 0u64;
+        let settings = ClipWriteSettings {
+            timeout: Duration::from_millis(5),
+            retry_count: 3,
+            retry_backoff: Duration::from_millis(1),
+        };
+
+        let ok = write_with_retry_and_cleanup(7, "rule-a", &part, settings, || {
+            attempts += 1;
+            async move {
+                match attempts {
+                    1 => {
+                        tokio::time::sleep(Duration::from_millis(20)).await;
+                        Ok(())
+                    }
+                    2 => Err(anyhow!("transient io error")),
+                    _ => Ok(()),
+                }
+            }
+        })
+        .await;
+
+        assert!(ok);
+        assert_eq!(attempts, 3);
+        assert!(fs::metadata(&part).await.is_ok());
+        fs::remove_dir_all(&clip_dir).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn clip_write_retry_exhaustion_removes_part_file() {
+        let clip_dir = test_dir("write_retry_exhaust");
+        fs::create_dir_all(&clip_dir).await.unwrap();
+        let part = clip_dir.join("active.h264.part");
+        fs::write(&part, b"seed").await.unwrap();
+        let mut attempts = 0u64;
+        let settings = ClipWriteSettings {
+            timeout: Duration::from_millis(5),
+            retry_count: 2,
+            retry_backoff: Duration::from_millis(1),
+        };
+
+        let ok = write_with_retry_and_cleanup(7, "rule-a", &part, settings, || {
+            attempts += 1;
+            std::future::ready(Err(anyhow!("persistent io error")))
+        })
+        .await;
+
+        assert!(!ok);
+        assert_eq!(attempts, 3);
+        assert!(fs::metadata(&part).await.is_err());
         fs::remove_dir_all(&clip_dir).await.unwrap();
     }
 }

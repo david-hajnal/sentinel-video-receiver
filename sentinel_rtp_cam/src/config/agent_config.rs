@@ -226,6 +226,21 @@ impl AgentConfig {
             ingest.get("clip_stale_part_secs"),
         );
         set_map_if_unset(&mut map, "CLIP_MAX_SECS", ingest.get("clip_max_secs"));
+        set_map_if_unset(
+            &mut map,
+            "CLIP_WRITE_TIMEOUT_MS",
+            ingest.get("clip_write_timeout_ms"),
+        );
+        set_map_if_unset(
+            &mut map,
+            "CLIP_WRITE_RETRY_COUNT",
+            ingest.get("clip_write_retry_count"),
+        );
+        set_map_if_unset(
+            &mut map,
+            "CLIP_WRITE_RETRY_BACKOFF_MS",
+            ingest.get("clip_write_retry_backoff_ms"),
+        );
         set_map_if_value(
             &mut map,
             "LIVE_PIPELINE_VERSION",
@@ -593,7 +608,10 @@ impl AgentConfig {
                 "clip_post_secs": null,
                 "clip_ring_secs": null,
                 "clip_stale_part_secs": null,
-                "clip_max_secs": null
+                "clip_max_secs": null,
+                "clip_write_timeout_ms": null,
+                "clip_write_retry_count": null,
+                "clip_write_retry_backoff_ms": null
             },
             "forward_agent": {
                 "mode": null,
@@ -641,7 +659,10 @@ fn default_empty_json() -> Value {
             "clip_post_secs": null,
             "clip_ring_secs": null,
             "clip_stale_part_secs": null,
-            "clip_max_secs": null
+            "clip_max_secs": null,
+            "clip_write_timeout_ms": null,
+            "clip_write_retry_count": null,
+            "clip_write_retry_backoff_ms": null
         },
         "forward_agent": {
             "mode": null,
@@ -1125,6 +1146,9 @@ mod tests {
                 "clip_pre_secs": 2,
                 "clip_ring_secs": 15,
                 "clip_stale_part_secs": 3600,
+                "clip_write_timeout_ms": 5000,
+                "clip_write_retry_count": 2,
+                "clip_write_retry_backoff_ms": 250,
                 "live_pipeline_version": "v2",
                 "live_hls_segment_secs": 2,
                 "live_hls_window_secs": 12
@@ -1156,6 +1180,18 @@ mod tests {
         assert_eq!(
             AgentConfig::runtime_var("CLIP_STALE_PART_SECS").as_deref(),
             Some("3600")
+        );
+        assert_eq!(
+            AgentConfig::runtime_var("CLIP_WRITE_TIMEOUT_MS").as_deref(),
+            Some("5000")
+        );
+        assert_eq!(
+            AgentConfig::runtime_var("CLIP_WRITE_RETRY_COUNT").as_deref(),
+            Some("2")
+        );
+        assert_eq!(
+            AgentConfig::runtime_var("CLIP_WRITE_RETRY_BACKOFF_MS").as_deref(),
+            Some("250")
         );
         assert_eq!(
             AgentConfig::runtime_var("LIVE_PIPELINE_VERSION").as_deref(),

@@ -20,12 +20,12 @@ use tracing::{debug, error, info, warn};
 use url::Url;
 
 use crate::config::AgentConfig;
-use crate::proto::{Msg, GAP, MOTION, RTP};
+use crate::proto::{Msg, GAP, RTP};
 
 #[derive(Clone)]
 pub struct Uplink {
     media_tx: mpsc::Sender<Msg>,
-    motion_tx: mpsc::UnboundedSender<Msg>,
+    motion_tx: mpsc::UnboundedSender<MotionEnvelope>,
     stats: Arc<UplinkStats>,
     shutdown: CancellationToken,
 }
@@ -52,6 +52,12 @@ pub struct HelloIngestConfig {
     pub clip_stale_part_secs: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub clip_max_secs: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub clip_write_timeout_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub clip_write_retry_count: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub clip_write_retry_backoff_ms: Option<u64>,
 }
 
 impl HelloIngestConfig {
@@ -61,6 +67,9 @@ impl HelloIngestConfig {
             && self.clip_ring_secs.is_none()
             && self.clip_stale_part_secs.is_none()
             && self.clip_max_secs.is_none()
+            && self.clip_write_timeout_ms.is_none()
+            && self.clip_write_retry_count.is_none()
+            && self.clip_write_retry_backoff_ms.is_none()
     }
 }
 
@@ -73,15 +82,13 @@ struct HelloStream {
     ingest: Option<HelloIngestConfig>,
 }
 #[derive(Debug, Deserialize)]
-struct LegacyMotionPayload {
-    #[allow(dead_code)]
-    rule: Option<String>,
-    active: Option<bool>,
-    ts: Option<String>,
-    #[allow(dead_code)]
-    camera_id: Option<String>,
-    #[allow(dead_code)]
-    event_id: Option<String>,
+struct MotionEnvelope {
+    stream_id: u32,
+    rule: String,
+    active: bool,
+    ts: String,
+    camera_id: String,
+    event_id: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -114,7 +121,7 @@ impl Uplink {
         stream_ingest: Option<HelloIngestConfig>,
     ) -> Self {
         let (media_tx, mut media_rx) = mpsc::channel::<Msg>(4096);
-        let (motion_tx, mut motion_rx) = mpsc::unbounded_channel::<Msg>();
+        let (motion_tx, mut motion_rx) = mpsc::unbounded_channel::<MotionEnvelope>();
         let stats = Arc::new(UplinkStats::default());
         let shutdown = CancellationToken::new();
 
@@ -332,7 +339,13 @@ impl Uplink {
                                     let payload = match serde_json::to_vec(&event) {
                                         Ok(p) => p,
                                         Err(e) => {
-                                            error!(error = %e, "Failed to serialize MOTION");
+                                            error!(
+                                                error = %e,
+                                                stream_id = msg.stream_id,
+                                                camera_id = %msg.camera_id,
+                                                event_id = %msg.event_id,
+                                                "Failed to serialize MOTION envelope"
+                                            );
                                             continue;
                                         }
                                     };
@@ -477,17 +490,13 @@ impl Uplink {
         camera_id: String,
         event_id: String,
     ) {
-        let payload = serde_json::json!({
-            "rule": rule,
-            "active": active,
-            "ts": ts,
-            "camera_id": camera_id,
-            "event_id": event_id,
-        });
-        let msg = Msg {
-            msg_type: MOTION,
+        let msg = MotionEnvelope {
             stream_id,
-            payload: serde_json::to_vec(&payload).unwrap_or_default(),
+            rule,
+            active,
+            ts,
+            camera_id,
+            event_id,
         };
         if let Err(e) = self.motion_tx.send(msg) {
             warn!(
@@ -610,6 +619,7 @@ fn encode_gap_tls(stream_id: u32, last_seq: u16, new_seq: u16) -> Vec<u8> {
     buf.to_vec()
 }
 
+#[cfg(test)]
 fn decode_rtp_tls(buf: &[u8]) -> Result<(u32, Vec<u8>)> {
     if buf.len() < 4 {
         return Err(anyhow!("rtp tls payload too short: {}", buf.len()));
@@ -645,11 +655,10 @@ mod tests {
     use super::{
         build_event_payload, build_streams_info, decode_rtp_tls, encode_gap_tls, encode_rtp_tls,
         load_tls_config, read_record, resolve_server_name, write_record, HelloIngestConfig,
-        HelloPayload, RECORD_EVENT, RECORD_GAP, RECORD_RTP,
+        HelloPayload, MotionEnvelope, RECORD_EVENT, RECORD_GAP, RECORD_RTP,
     };
     use crate::config::AgentConfig;
     use crate::proto::{Msg, GAP, RTP};
-    use serde_json::json;
     use std::collections::HashMap;
     use std::sync::MutexGuard;
     use tokio::io::duplex;
@@ -695,6 +704,9 @@ mod tests {
             clip_ring_secs: Some(5),
             clip_stale_part_secs: Some(3600),
             clip_max_secs: Some(30),
+            clip_write_timeout_ms: Some(5000),
+            clip_write_retry_count: Some(2),
+            clip_write_retry_backoff_ms: Some(250),
         };
 
         let streams = build_streams_info(&stream_map, &stream_camera_map, Some(&ingest));
@@ -771,6 +783,9 @@ mod tests {
             clip_ring_secs: None,
             clip_stale_part_secs: None,
             clip_max_secs: None,
+            clip_write_timeout_ms: None,
+            clip_write_retry_count: None,
+            clip_write_retry_backoff_ms: None,
         };
         assert!(empty.is_empty());
 
@@ -780,23 +795,22 @@ mod tests {
             clip_ring_secs: None,
             clip_stale_part_secs: None,
             clip_max_secs: None,
+            clip_write_timeout_ms: None,
+            clip_write_retry_count: None,
+            clip_write_retry_backoff_ms: None,
         };
         assert!(!non_empty.is_empty());
     }
 
     #[test]
     fn build_event_payload_preserves_legacy_motion_fields() {
-        let payload = json!({
-            "rule": "zone-a",
-            "active": true,
-            "ts": "2026-04-06T08:15:30Z",
-            "camera_id": "cam-7",
-            "event_id": "evt-123",
-        });
-        let msg = Msg {
-            msg_type: RECORD_EVENT as u16,
+        let msg = MotionEnvelope {
             stream_id: 7,
-            payload: serde_json::to_vec(&payload).expect("serialize payload"),
+            rule: "zone-a".to_string(),
+            active: true,
+            ts: "2026-04-06T08:15:30Z".to_string(),
+            camera_id: "cam-7".to_string(),
+            event_id: "evt-123".to_string(),
         };
 
         let event = build_event_payload(&msg);
@@ -812,10 +826,13 @@ mod tests {
 
     #[test]
     fn build_event_payload_generates_fallback_values_for_invalid_payload() {
-        let msg = Msg {
-            msg_type: RECORD_EVENT as u16,
+        let msg = MotionEnvelope {
             stream_id: 42,
-            payload: b"{not-json".to_vec(),
+            rule: "motion".to_string(),
+            active: false,
+            ts: "not-a-timestamp".to_string(),
+            camera_id: "".to_string(),
+            event_id: "".to_string(),
         };
 
         let event = build_event_payload(&msg);
@@ -823,7 +840,7 @@ mod tests {
         assert_eq!(event.stream_id, "42");
         assert_eq!(event.state, "stop");
         assert_eq!(event.rule.as_deref(), Some("motion"));
-        assert!(event.camera_id.is_none());
+        assert_eq!(event.camera_id.as_deref(), Some(""));
         assert!(event.event_ts_unix_ms > 0);
         assert!(event
             .event_id
@@ -1020,17 +1037,9 @@ mod tests {
     }
 }
 
-fn build_event_payload(msg: &Msg) -> EventPayload {
-    let legacy = serde_json::from_slice::<LegacyMotionPayload>(&msg.payload).ok();
-    let active = legacy.as_ref().and_then(|p| p.active).unwrap_or(false);
-    let rule = legacy
-        .as_ref()
-        .and_then(|p| p.rule.clone())
-        .unwrap_or_else(|| "motion".to_string());
-    let camera_id = legacy.as_ref().and_then(|p| p.camera_id.clone());
-    let ts = legacy.as_ref().and_then(|p| p.ts.clone());
-    let event_ts = ts
-        .and_then(|value| chrono::DateTime::parse_from_rfc3339(&value).ok())
+fn build_event_payload(msg: &MotionEnvelope) -> EventPayload {
+    let event_ts = chrono::DateTime::parse_from_rfc3339(&msg.ts)
+        .ok()
         .map(|dt| dt.timestamp_millis())
         .unwrap_or_else(|| {
             SystemTime::now()
@@ -1038,25 +1047,24 @@ fn build_event_payload(msg: &Msg) -> EventPayload {
                 .map(|d| d.as_millis() as i64)
                 .unwrap_or(0)
         });
-    let event_id = legacy
-        .as_ref()
-        .and_then(|p| p.event_id.clone())
-        .or_else(|| {
-            if event_ts > 0 {
-                Some(format!("stream{}-{}", msg.stream_id, event_ts))
-            } else {
-                None
-            }
-        });
+    let event_id = if msg.event_id.is_empty() {
+        if event_ts > 0 {
+            Some(format!("stream{}-{}", msg.stream_id, event_ts))
+        } else {
+            None
+        }
+    } else {
+        Some(msg.event_id.clone())
+    };
     EventPayload {
         stream_id: msg.stream_id.to_string(),
         event_type: "motion".to_string(),
-        state: if active { "start" } else { "stop" }.to_string(),
+        state: if msg.active { "start" } else { "stop" }.to_string(),
         event_ts_unix_ms: event_ts,
         confidence: 0.0,
-        rule: Some(rule),
+        rule: Some(msg.rule.clone()),
         event_id,
-        camera_id,
+        camera_id: Some(msg.camera_id.clone()),
     }
 }
 

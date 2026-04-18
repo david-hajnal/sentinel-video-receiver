@@ -1,5 +1,6 @@
 use anyhow::{anyhow, Result};
 use serde::Deserialize;
+use serde_json::Value;
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -43,6 +44,66 @@ struct HelloPayload {
 struct HelloStream {
     stream_id: u32,
     name: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct MotionPayload {
+    active: bool,
+    rule: Option<String>,
+    ts: Option<String>,
+}
+
+fn payload_preview(payload: &[u8], max_chars: usize) -> String {
+    let preview = String::from_utf8_lossy(payload);
+    preview.chars().take(max_chars).collect()
+}
+
+fn parse_motion_msg(stream_id: u32, payload: &[u8]) -> Option<StreamMsg> {
+    let value: Value = match serde_json::from_slice(payload) {
+        Ok(value) => value,
+        Err(error) => {
+            warn!(
+                stream_id,
+                error = %error,
+                payload_len = payload.len(),
+                payload_preview = %payload_preview(payload, 160),
+                "Dropping malformed MOTION payload: invalid JSON"
+            );
+            return None;
+        }
+    };
+
+    if !value.get("active").is_some_and(|field| field.is_boolean()) {
+        warn!(
+            stream_id,
+            payload_len = payload.len(),
+            payload_preview = %payload_preview(payload, 160),
+            "Dropping malformed MOTION payload: missing or non-boolean active"
+        );
+        return None;
+    }
+
+    let parsed: MotionPayload = match serde_json::from_value(value) {
+        Ok(parsed) => parsed,
+        Err(error) => {
+            warn!(
+                stream_id,
+                error = %error,
+                payload_len = payload.len(),
+                payload_preview = %payload_preview(payload, 160),
+                "Dropping malformed MOTION payload: schema decode failed"
+            );
+            return None;
+        }
+    };
+
+    let rule = parsed.rule.unwrap_or_else(|| "motion".to_string());
+    let ts = parsed.ts.unwrap_or_default();
+    Some(StreamMsg::Motion {
+        rule,
+        active: parsed.active,
+        ts,
+    })
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -103,6 +164,9 @@ async fn main() -> Result<()> {
     let _write_batch_bytes: usize = runtime_var("CLIP_WRITE_BATCH_BYTES")
         .and_then(|v| v.parse().ok())
         .unwrap_or(256 * 1024);
+    let clip_write_timeout_ms: u64 = runtime_u64("CLIP_WRITE_TIMEOUT_MS", 5_000);
+    let clip_write_retry_count: u64 = runtime_u64("CLIP_WRITE_RETRY_COUNT", 2);
+    let clip_write_retry_backoff_ms: u64 = runtime_u64("CLIP_WRITE_RETRY_BACKOFF_MS", 250);
     let max_clip_secs: Option<u64> = runtime_opt_u64("CLIP_MAX_SECS");
 
     let listener = TcpListener::bind(&bind).await?;
@@ -137,6 +201,9 @@ async fn main() -> Result<()> {
                 post_secs,
                 stale_part_secs,
                 max_clip_secs,
+                clip_write_timeout_ms,
+                clip_write_retry_count,
+                clip_write_retry_backoff_ms,
                 stale_secs,
                 stream_stats_log_secs,
                 live_pipeline_version,
@@ -163,6 +230,9 @@ async fn handle_conn(
     post_secs: u64,
     stale_part_secs: u64,
     max_clip_secs: Option<u64>,
+    clip_write_timeout_ms: u64,
+    clip_write_retry_count: u64,
+    clip_write_retry_backoff_ms: u64,
     stale_secs: u64,
     stream_stats_log_secs: u64,
     live_pipeline_version: LivePipelineVersion,
@@ -191,6 +261,9 @@ async fn handle_conn(
             post_secs,
             stale_part_secs,
             max_clip_secs,
+            clip_write_timeout_ms,
+            clip_write_retry_count,
+            clip_write_retry_backoff_ms,
             stale_secs,
             stream_stats_log_secs,
             live_pipeline_version,
@@ -216,6 +289,9 @@ async fn handle_conn(
             post_secs,
             stale_part_secs,
             max_clip_secs,
+            clip_write_timeout_ms,
+            clip_write_retry_count,
+            clip_write_retry_backoff_ms,
             stale_secs,
             stream_stats_log_secs,
             live_pipeline_version,
@@ -237,20 +313,10 @@ async fn handle_conn(
                 }
             }
             MOTION => {
-                let v: serde_json::Value = serde_json::from_slice(&payload).unwrap_or_default();
-                let rule = v
-                    .get("rule")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("motion")
-                    .to_string();
-                let active = v.get("active").and_then(|v| v.as_bool()).unwrap_or(false);
-                let ts = v
-                    .get("ts")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_string();
-                if tx.try_send(StreamMsg::Motion { rule, active, ts }).is_err() {
-                    warn!(stream_id, "Dropped MOTION message because stream queue is full");
+                if let Some(msg) = parse_motion_msg(stream_id, &payload) {
+                    if tx.try_send(msg).is_err() {
+                        warn!(stream_id, "Dropped MOTION message because stream queue is full");
+                    }
                 }
             }
             _ => {}
@@ -269,6 +335,9 @@ fn ensure_stream(
     post_secs: u64,
     stale_part_secs: u64,
     max_clip_secs: Option<u64>,
+    clip_write_timeout_ms: u64,
+    clip_write_retry_count: u64,
+    clip_write_retry_backoff_ms: u64,
     stale_secs: u64,
     stream_stats_log_secs: u64,
     live_pipeline_version: LivePipelineVersion,
@@ -289,6 +358,9 @@ fn ensure_stream(
         post_secs,
         stale_part_secs,
         max_clip_secs,
+        clip_write_timeout_ms,
+        clip_write_retry_count,
+        clip_write_retry_backoff_ms,
         stale_secs,
         stats_log_secs: stream_stats_log_secs,
     };
@@ -319,4 +391,41 @@ fn ensure_stream(
 
     guard.insert(stream_id, tx.clone());
     tx
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_motion_msg;
+    use sentinel_rtp_cam::server_pipeline::StreamMsg;
+
+    #[test]
+    fn parse_motion_msg_rejects_invalid_json() {
+        let parsed = parse_motion_msg(7, b"{invalid");
+        assert!(parsed.is_none());
+    }
+
+    #[test]
+    fn parse_motion_msg_rejects_missing_active() {
+        let parsed = parse_motion_msg(7, br#"{"rule":"zone-a"}"#);
+        assert!(parsed.is_none());
+    }
+
+    #[test]
+    fn parse_motion_msg_rejects_non_boolean_active() {
+        let parsed = parse_motion_msg(7, br#"{"active":"true","rule":"zone-a"}"#);
+        assert!(parsed.is_none());
+    }
+
+    #[test]
+    fn parse_motion_msg_keeps_defaults_for_optional_fields() {
+        let parsed = parse_motion_msg(7, br#"{"active":true}"#).expect("motion message");
+        match parsed {
+            StreamMsg::Motion { rule, active, ts } => {
+                assert_eq!(rule, "motion");
+                assert!(active);
+                assert!(ts.is_empty());
+            }
+            other => panic!("expected motion msg, got {other:?}"),
+        }
+    }
 }

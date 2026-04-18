@@ -9,6 +9,7 @@ This repo currently supports two ingest artifact pipelines selected by
 - Uses the existing `server_pipeline` implementation.
 - Writes motion-triggered `.h264` clips and JSON sidecars into `CLIP_DIR`.
 - Writes the existing `stream_<id>.health.json` health sidecar in `CLIP_DIR`.
+- This is the only ingest pipeline that creates motion-triggered `.h264` clips.
 
 This path is the current default and was left in place unchanged.
 
@@ -16,6 +17,7 @@ This path is the current default and was left in place unchanged.
 
 - Enable with: `LIVE_PIPELINE_VERSION=v2`
 - Uses the new additive live artifact pipeline in `sentinel_rtp_cam/src/live/v2.rs`.
+- v2 is HLS-only and does not create motion-triggered `.h264` clips.
 - Keeps the health sidecar filename and base schema stable:
   - `CLIP_DIR/stream_<id>.health.json`
 - Adds live HLS artifacts under a parallel directory prefix:

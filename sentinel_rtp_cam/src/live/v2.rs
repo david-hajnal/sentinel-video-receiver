@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 use tokio::fs::{self, File};
 use tokio::io::{AsyncWriteExt, BufWriter};
 use tokio::sync::mpsc;
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::core::h264_depacketize::H264Depacketizer;
 use crate::core::h264_sync::H264SyncGate;
@@ -352,6 +352,10 @@ pub async fn run_stream_v2(
                     StreamMsg::Motion { .. } => {
                         stats.total_motion_events = stats.total_motion_events.saturating_add(1);
                         stats.last_motion_at = Some(Utc::now());
+                        warn!(
+                            stream_id = cfg.stream_id,
+                            "Received motion event while LIVE_PIPELINE_VERSION=v2; v2 is HLS-only and does not create .h264 motion clips"
+                        );
                     }
                     StreamMsg::Rtp(bytes) => {
                         stats.total_rtp_packets = stats.total_rtp_packets.saturating_add(1);
@@ -958,6 +962,34 @@ mod tests {
         assert!(playlist.contains("#EXTM3U"));
         assert!(playlist.contains("seg_000001.ts"));
         assert!(fs::metadata(cfg.output_root.join("seg_000001.ts")).await.is_ok());
+
+        fs::remove_dir_all(&dir).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn v2_motion_updates_health_counters_without_creating_h264_clips() {
+        let dir = test_dir("motion_only");
+        fs::create_dir_all(&dir).await.unwrap();
+        let cfg = config(&dir);
+        let (tx, rx) = mpsc::channel(64);
+
+        let handle = tokio::spawn(run_stream_v2(cfg.clone(), rx));
+        tx.send(StreamMsg::Motion {
+            rule: "zone-a".to_string(),
+            active: true,
+            ts: "2026-04-18T12:00:00Z".to_string(),
+        })
+        .await
+        .unwrap();
+        drop(tx);
+
+        handle.await.unwrap().unwrap();
+
+        let health = fs::read_to_string(dir.join("stream_7.health.json"))
+            .await
+            .unwrap();
+        assert!(health.contains("\"total_motion_events\": 1"));
+        assert!(fs::metadata(cfg.output_root.join("index.m3u8")).await.is_err());
 
         fs::remove_dir_all(&dir).await.unwrap();
     }

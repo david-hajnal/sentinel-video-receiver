@@ -39,6 +39,9 @@ The agent’s local `ClipRecorder` is used in non-forward workflows (or local re
 - Can hard-stop with `CLIP_MAX_SECS` and re-arm if motion is still active.
 
 ### 2.2 Ingest clip recording (server)
+This section applies to ingest `LIVE_PIPELINE_VERSION=v1` (`server_pipeline`).
+Ingest `v2` is HLS-only and does not create motion-triggered `.h264` clips.
+
 When the forward agent sends RTP to ingest:
 - The ingest pipeline buffers access units in a ring buffer.
 - A clip is started when motion becomes active and an IDR arrives.
@@ -68,6 +71,7 @@ Forward agent:
 Ingest:
 - `CLIP_DIR`
 - `CLIP_PRE_SECS`, `CLIP_POST_SECS`, `CLIP_RING_SECS`
+- `CLIP_WRITE_TIMEOUT_MS`, `CLIP_WRITE_RETRY_COUNT`, `CLIP_WRITE_RETRY_BACKOFF_MS`
 - `CLIP_STALE_PART_SECS`
 - `CLIP_MAX_SECS` (hard stop)
 
@@ -84,4 +88,3 @@ Key behaviors to test:
 - Correct event_id reset after motion ends.
 - Hard-stop clip splitting with same event_id at ingest.
 - RTP forwarding continuity after RTSP PLAY.
-

@@ -157,7 +157,10 @@ fn load_uplink_ingest_config_from_env_reads_present_values() {
         "ingest": {
             "clip_pre_secs": 3,
             "clip_post_secs": 7,
-            "clip_max_secs": 30
+            "clip_max_secs": 30,
+            "clip_write_timeout_ms": 5000,
+            "clip_write_retry_count": 2,
+            "clip_write_retry_backoff_ms": 250
         }
     }));
 
@@ -167,6 +170,9 @@ fn load_uplink_ingest_config_from_env_reads_present_values() {
     assert_eq!(ingest.clip_ring_secs, None);
     assert_eq!(ingest.clip_stale_part_secs, None);
     assert_eq!(ingest.clip_max_secs, Some(30));
+    assert_eq!(ingest.clip_write_timeout_ms, Some(5000));
+    assert_eq!(ingest.clip_write_retry_count, Some(2));
+    assert_eq!(ingest.clip_write_retry_backoff_ms, Some(250));
 }
 
 #[test]
