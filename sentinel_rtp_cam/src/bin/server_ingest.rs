@@ -1,4 +1,5 @@
 use anyhow::{anyhow, Result};
+use base64::Engine;
 use serde::Deserialize;
 use serde_json::Value;
 use std::collections::HashMap;
@@ -9,10 +10,11 @@ use std::sync::{
     Arc, Mutex,
 };
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::mpsc;
+use tokio::sync::mpsc::{self, error::TrySendError};
 use tracing::{info, warn};
 
-use sentinel_rtp_cam::live::v2::{run_stream_v2, LivePipelineV2Config};
+use sentinel_rtp_cam::core::video::annexb_from_raw_nal;
+use sentinel_rtp_cam::live::v2::{run_stream_v2, H264SyncSeed, LivePipelineV2Config};
 use sentinel_rtp_cam::proto::{decode_gap, read_msg, Msg, GAP, HELLO, MOTION, RTP};
 use sentinel_rtp_cam::server_pipeline::{run_stream, StreamConfig, StreamMsg};
 use sentinel_rtp_cam::AgentConfig;
@@ -44,6 +46,49 @@ struct HelloPayload {
 struct HelloStream {
     stream_id: u32,
     name: String,
+    #[serde(default)]
+    h264_sps_b64: Option<String>,
+    #[serde(default)]
+    h264_pps_b64: Option<String>,
+}
+
+#[derive(Clone)]
+struct IngestH264SyncSeed {
+    sps_annexb: Vec<u8>,
+    pps_annexb: Vec<u8>,
+}
+
+fn decode_h264_sync_seed(stream: &HelloStream) -> Result<Option<IngestH264SyncSeed>> {
+    let decode_opt = |label: &str, value: &str| -> Result<Vec<u8>> {
+        let raw = base64::engine::general_purpose::STANDARD
+            .decode(value.as_bytes())
+            .map_err(|error| anyhow!("invalid {label} base64: {error}"))?;
+        if raw.is_empty() {
+            return Err(anyhow!("{label} is empty"));
+        }
+        Ok(raw)
+    };
+
+    match (
+        stream.h264_sps_b64.as_deref(),
+        stream.h264_pps_b64.as_deref(),
+    ) {
+        (None, None) => Ok(None),
+        (Some(_), None) => Err(anyhow!(
+            "h264_pps_b64 missing while h264_sps_b64 is present"
+        )),
+        (None, Some(_)) => Err(anyhow!(
+            "h264_sps_b64 missing while h264_pps_b64 is present"
+        )),
+        (Some(sps_b64), Some(pps_b64)) => {
+            let sps_raw = decode_opt("h264_sps_b64", sps_b64)?;
+            let pps_raw = decode_opt("h264_pps_b64", pps_b64)?;
+            Ok(Some(IngestH264SyncSeed {
+                sps_annexb: annexb_from_raw_nal(&sps_raw),
+                pps_annexb: annexb_from_raw_nal(&pps_raw),
+            }))
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -124,6 +169,52 @@ fn runtime_live_pipeline_version() -> LivePipelineVersion {
     }
 }
 
+#[derive(Clone)]
+struct StreamHandle {
+    tx: mpsc::Sender<StreamMsg>,
+    generation: u64,
+}
+
+#[cfg(test)]
+use std::future::Future;
+#[cfg(test)]
+use std::pin::Pin;
+#[cfg(test)]
+type PipelineFuture = Pin<Box<dyn Future<Output = Result<()>> + Send + 'static>>;
+
+#[cfg(test)]
+type PipelineHook =
+    Arc<dyn Fn(u32, u64, mpsc::Receiver<StreamMsg>) -> PipelineFuture + Send + Sync + 'static>;
+
+#[cfg(test)]
+static TEST_PIPELINE_HOOK: std::sync::OnceLock<Mutex<Option<PipelineHook>>> =
+    std::sync::OnceLock::new();
+
+async fn run_stream_pipeline(
+    live_pipeline_version: LivePipelineVersion,
+    _stream_id: u32,
+    _generation: u64,
+    cfg: StreamConfig,
+    v2_cfg: LivePipelineV2Config,
+    rx: mpsc::Receiver<StreamMsg>,
+) -> Result<()> {
+    #[cfg(test)]
+    {
+        let hook = TEST_PIPELINE_HOOK
+            .get_or_init(|| Mutex::new(None))
+            .lock()
+            .unwrap()
+            .clone();
+        if let Some(hook) = hook {
+            return hook(_stream_id, _generation, rx).await;
+        }
+    }
+    match live_pipeline_version {
+        LivePipelineVersion::V1 => run_stream(cfg, rx).await,
+        LivePipelineVersion::V2 => run_stream_v2(v2_cfg, rx).await,
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let camera_config_path = std::path::PathBuf::from(DEFAULT_CAMERA_CONFIG_PATH);
@@ -194,8 +285,7 @@ async fn main() -> Result<()> {
         }
     }
 
-    let streams: Arc<Mutex<HashMap<u32, mpsc::Sender<StreamMsg>>>> =
-        Arc::new(Mutex::new(HashMap::new()));
+    let streams: Arc<Mutex<HashMap<u32, StreamHandle>>> = Arc::new(Mutex::new(HashMap::new()));
     let active_streams = Arc::new(AtomicUsize::new(0));
 
     loop {
@@ -238,7 +328,7 @@ async fn handle_conn(
     mut sock: TcpStream,
     addr: SocketAddr,
     token: String,
-    streams: Arc<Mutex<HashMap<u32, mpsc::Sender<StreamMsg>>>>,
+    streams: Arc<Mutex<HashMap<u32, StreamHandle>>>,
     active_streams: Arc<AtomicUsize>,
     clip_dir: PathBuf,
     ring_secs: u64,
@@ -266,6 +356,18 @@ async fn handle_conn(
     info!(agent = %hello.agent_id, addr = %addr, "Agent connected");
 
     for s in &hello.streams {
+        let h264_sync_seed = match decode_h264_sync_seed(s) {
+            Ok(seed) => seed,
+            Err(error) => {
+                warn!(
+                    stream_id = s.stream_id,
+                    stream_name = %s.name,
+                    error = %error,
+                    "Invalid H.264 sync seed metadata in HELLO stream entry; falling back to in-band sync"
+                );
+                None
+            }
+        };
         ensure_stream(
             &streams,
             &active_streams,
@@ -285,6 +387,7 @@ async fn handle_conn(
             live_pipeline_version,
             live_hls_segment_secs,
             live_hls_window_secs,
+            h264_sync_seed.clone(),
         );
     }
 
@@ -313,32 +416,83 @@ async fn handle_conn(
             live_pipeline_version,
             live_hls_segment_secs,
             live_hls_window_secs,
+            None,
         );
 
         match msg_type {
             RTP => {
-                if tx.try_send(StreamMsg::Rtp(payload)).is_err() {
-                    warn!(stream_id, "Dropped RTP packet because stream queue is full");
-                }
+                let msg = StreamMsg::Rtp(payload);
+                send_or_recreate_stream_msg(
+                    &streams,
+                    &active_streams,
+                    &tx,
+                    stream_id,
+                    msg,
+                    clip_dir.clone(),
+                    ring_secs,
+                    pre_secs,
+                    post_secs,
+                    stale_part_secs,
+                    max_clip_secs,
+                    clip_write_timeout_ms,
+                    clip_write_retry_count,
+                    clip_write_retry_backoff_ms,
+                    stale_secs,
+                    stream_stats_log_secs,
+                    live_pipeline_version,
+                    live_hls_segment_secs,
+                    live_hls_window_secs,
+                );
             }
             GAP => {
                 if let Ok((last, new)) = decode_gap(&payload) {
-                    if tx.try_send(StreamMsg::Gap { last, new }).is_err() {
-                        warn!(
-                            stream_id,
-                            "Dropped GAP message because stream queue is full"
-                        );
-                    }
+                    let msg = StreamMsg::Gap { last, new };
+                    send_or_recreate_stream_msg(
+                        &streams,
+                        &active_streams,
+                        &tx,
+                        stream_id,
+                        msg,
+                        clip_dir.clone(),
+                        ring_secs,
+                        pre_secs,
+                        post_secs,
+                        stale_part_secs,
+                        max_clip_secs,
+                        clip_write_timeout_ms,
+                        clip_write_retry_count,
+                        clip_write_retry_backoff_ms,
+                        stale_secs,
+                        stream_stats_log_secs,
+                        live_pipeline_version,
+                        live_hls_segment_secs,
+                        live_hls_window_secs,
+                    );
                 }
             }
             MOTION => {
                 if let Some(msg) = parse_motion_msg(stream_id, &payload) {
-                    if tx.try_send(msg).is_err() {
-                        warn!(
-                            stream_id,
-                            "Dropped MOTION message because stream queue is full"
-                        );
-                    }
+                    send_or_recreate_stream_msg(
+                        &streams,
+                        &active_streams,
+                        &tx,
+                        stream_id,
+                        msg,
+                        clip_dir.clone(),
+                        ring_secs,
+                        pre_secs,
+                        post_secs,
+                        stale_part_secs,
+                        max_clip_secs,
+                        clip_write_timeout_ms,
+                        clip_write_retry_count,
+                        clip_write_retry_backoff_ms,
+                        stale_secs,
+                        stream_stats_log_secs,
+                        live_pipeline_version,
+                        live_hls_segment_secs,
+                        live_hls_window_secs,
+                    );
                 }
             }
             _ => {}
@@ -346,8 +500,95 @@ async fn handle_conn(
     }
 }
 
+fn try_send_stream_msg(
+    tx: &mpsc::Sender<StreamMsg>,
+    stream_id: u32,
+    msg: StreamMsg,
+) -> Result<(), StreamMsg> {
+    match tx.try_send(msg) {
+        Ok(()) => Ok(()),
+        Err(TrySendError::Full(_msg)) => {
+            warn!(
+                stream_id,
+                "Dropped stream message because stream queue is full"
+            );
+            Ok(())
+        }
+        Err(TrySendError::Closed(msg)) => {
+            warn!(stream_id, "Stream channel closed; recreating pipeline");
+            Err(msg)
+        }
+    }
+}
+
+fn evict_stream_if_same_sender(
+    streams: &Arc<Mutex<HashMap<u32, StreamHandle>>>,
+    stream_id: u32,
+    tx: &mpsc::Sender<StreamMsg>,
+) {
+    let mut guard = streams.lock().unwrap();
+    if guard
+        .get(&stream_id)
+        .is_some_and(|handle| handle.tx.same_channel(tx))
+    {
+        guard.remove(&stream_id);
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn send_or_recreate_stream_msg(
+    streams: &Arc<Mutex<HashMap<u32, StreamHandle>>>,
+    active_streams: &Arc<AtomicUsize>,
+    tx: &mpsc::Sender<StreamMsg>,
+    stream_id: u32,
+    msg: StreamMsg,
+    clip_dir: PathBuf,
+    ring_secs: u64,
+    pre_secs: u64,
+    post_secs: u64,
+    stale_part_secs: u64,
+    max_clip_secs: Option<u64>,
+    clip_write_timeout_ms: u64,
+    clip_write_retry_count: u64,
+    clip_write_retry_backoff_ms: u64,
+    stale_secs: u64,
+    stream_stats_log_secs: u64,
+    live_pipeline_version: LivePipelineVersion,
+    live_hls_segment_secs: u64,
+    live_hls_window_secs: u64,
+) {
+    let msg = match try_send_stream_msg(tx, stream_id, msg) {
+        Ok(()) => return,
+        Err(msg) => msg,
+    };
+
+    evict_stream_if_same_sender(streams, stream_id, tx);
+    let fresh_tx = ensure_stream(
+        streams,
+        active_streams,
+        stream_id,
+        format!("stream{}", stream_id),
+        clip_dir,
+        ring_secs,
+        pre_secs,
+        post_secs,
+        stale_part_secs,
+        max_clip_secs,
+        clip_write_timeout_ms,
+        clip_write_retry_count,
+        clip_write_retry_backoff_ms,
+        stale_secs,
+        stream_stats_log_secs,
+        live_pipeline_version,
+        live_hls_segment_secs,
+        live_hls_window_secs,
+        None,
+    );
+    let _ = try_send_stream_msg(&fresh_tx, stream_id, msg);
+}
+
 fn ensure_stream(
-    streams: &Arc<Mutex<HashMap<u32, mpsc::Sender<StreamMsg>>>>,
+    streams: &Arc<Mutex<HashMap<u32, StreamHandle>>>,
     active_streams: &Arc<AtomicUsize>,
     stream_id: u32,
     _stream_name: String,
@@ -365,13 +606,28 @@ fn ensure_stream(
     live_pipeline_version: LivePipelineVersion,
     live_hls_segment_secs: u64,
     live_hls_window_secs: u64,
+    h264_sync_seed: Option<IngestH264SyncSeed>,
 ) -> mpsc::Sender<StreamMsg> {
     let mut guard = streams.lock().unwrap();
-    if let Some(tx) = guard.get(&stream_id) {
-        return tx.clone();
+    if let Some(handle) = guard.get(&stream_id) {
+        if !handle.tx.is_closed() {
+            return handle.tx.clone();
+        }
     }
 
+    let generation = guard
+        .get(&stream_id)
+        .map_or(1, |handle| handle.generation.saturating_add(1));
     let (tx, rx) = mpsc::channel::<StreamMsg>(4096);
+    guard.insert(
+        stream_id,
+        StreamHandle {
+            tx: tx.clone(),
+            generation,
+        },
+    );
+    drop(guard);
+
     let cfg = StreamConfig {
         stream_id,
         clip_dir,
@@ -394,8 +650,13 @@ fn ensure_stream(
         stats_log_secs: stream_stats_log_secs,
         segment_secs: live_hls_segment_secs,
         window_secs: live_hls_window_secs,
+        h264_sync_seed: h264_sync_seed.map(|seed| H264SyncSeed {
+            sps_annexb: seed.sps_annexb,
+            pps_annexb: seed.pps_annexb,
+        }),
     };
     let active_streams = active_streams.clone();
+    let streams_for_cleanup = streams.clone();
 
     tokio::spawn(async move {
         let now_active = active_streams.fetch_add(1, Ordering::SeqCst) + 1;
@@ -404,13 +665,26 @@ fn ensure_stream(
             active_streams = now_active,
             "Stream pipeline started"
         );
-        let result = match live_pipeline_version {
-            LivePipelineVersion::V1 => run_stream(cfg, rx).await,
-            LivePipelineVersion::V2 => run_stream_v2(v2_cfg, rx).await,
-        };
+        let result = run_stream_pipeline(
+            live_pipeline_version,
+            stream_id,
+            generation,
+            cfg,
+            v2_cfg,
+            rx,
+        )
+        .await;
         if let Err(e) = result {
             warn!(error = %e, stream_id = stream_id, "Stream pipeline ended");
         }
+        let mut guard = streams_for_cleanup.lock().unwrap();
+        if guard
+            .get(&stream_id)
+            .is_some_and(|handle| handle.generation == generation)
+        {
+            guard.remove(&stream_id);
+        }
+        drop(guard);
         let remaining = active_streams
             .fetch_sub(1, Ordering::SeqCst)
             .saturating_sub(1);
@@ -421,14 +695,95 @@ fn ensure_stream(
         );
     });
 
-    guard.insert(stream_id, tx.clone());
     tx
 }
 
 #[cfg(test)]
 mod tests {
-    use super::parse_motion_msg;
+    use super::{
+        decode_h264_sync_seed, ensure_stream, parse_motion_msg, send_or_recreate_stream_msg,
+        HelloStream, LivePipelineVersion, StreamHandle, TEST_PIPELINE_HOOK,
+    };
+    use anyhow::{anyhow, Result};
     use sentinel_rtp_cam::server_pipeline::StreamMsg;
+    use std::collections::HashMap;
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc, Mutex, OnceLock,
+    };
+    use std::time::Duration;
+    use tokio::sync::{mpsc, Notify};
+    use tokio::task::yield_now;
+    use tokio::time::timeout;
+
+    static TEST_PIPELINE_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+
+    struct HookReset;
+
+    impl Drop for HookReset {
+        fn drop(&mut self) {
+            clear_test_pipeline_hook();
+        }
+    }
+
+    fn set_test_pipeline_hook(
+        hook: impl Fn(u32, u64, mpsc::Receiver<StreamMsg>) -> super::PipelineFuture
+            + Send
+            + Sync
+            + 'static,
+    ) {
+        let mut guard = TEST_PIPELINE_HOOK
+            .get_or_init(|| Mutex::new(None))
+            .lock()
+            .unwrap();
+        *guard = Some(Arc::new(hook));
+    }
+
+    fn clear_test_pipeline_hook() {
+        let mut guard = TEST_PIPELINE_HOOK
+            .get_or_init(|| Mutex::new(None))
+            .lock()
+            .unwrap();
+        *guard = None;
+    }
+
+    async fn wait_for_launches(launches: &Arc<AtomicUsize>, expected: usize) {
+        timeout(Duration::from_secs(1), async {
+            while launches.load(Ordering::SeqCst) < expected {
+                yield_now().await;
+            }
+        })
+        .await
+        .expect("pipeline launch count should reach expected value");
+    }
+
+    fn default_ensure_stream(
+        streams: &Arc<Mutex<HashMap<u32, StreamHandle>>>,
+        active_streams: &Arc<AtomicUsize>,
+        stream_id: u32,
+    ) -> mpsc::Sender<StreamMsg> {
+        ensure_stream(
+            streams,
+            active_streams,
+            stream_id,
+            format!("stream{stream_id}"),
+            std::env::temp_dir(),
+            3,
+            3,
+            5,
+            24 * 60 * 60,
+            None,
+            5000,
+            2,
+            250,
+            15,
+            60,
+            LivePipelineVersion::V1,
+            2,
+            12,
+            None,
+        )
+    }
 
     #[test]
     fn parse_motion_msg_rejects_invalid_json() {
@@ -459,5 +814,202 @@ mod tests {
             }
             other => panic!("expected motion msg, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn decode_h264_sync_seed_accepts_valid_sps_pps_base64() {
+        let stream = HelloStream {
+            stream_id: 7,
+            name: "stream7".to_string(),
+            h264_sps_b64: Some("Z2QAHw==".to_string()),
+            h264_pps_b64: Some("aO48gA==".to_string()),
+        };
+
+        let seed = decode_h264_sync_seed(&stream)
+            .expect("decode should succeed")
+            .expect("seed should be present");
+        assert_eq!(
+            seed.sps_annexb,
+            vec![0x00, 0x00, 0x00, 0x01, 0x67, 0x64, 0x00, 0x1F]
+        );
+        assert_eq!(
+            seed.pps_annexb,
+            vec![0x00, 0x00, 0x00, 0x01, 0x68, 0xEE, 0x3C, 0x80]
+        );
+    }
+
+    #[test]
+    fn decode_h264_sync_seed_rejects_invalid_base64() {
+        let stream = HelloStream {
+            stream_id: 7,
+            name: "stream7".to_string(),
+            h264_sps_b64: Some("###".to_string()),
+            h264_pps_b64: Some("aO48gA==".to_string()),
+        };
+        assert!(decode_h264_sync_seed(&stream).is_err());
+    }
+
+    #[test]
+    fn decode_h264_sync_seed_rejects_partial_metadata() {
+        let stream = HelloStream {
+            stream_id: 7,
+            name: "stream7".to_string(),
+            h264_sps_b64: Some("Z2QAHw==".to_string()),
+            h264_pps_b64: None,
+        };
+        assert!(decode_h264_sync_seed(&stream).is_err());
+    }
+
+    #[test]
+    fn decode_h264_sync_seed_absent_metadata_is_none() {
+        let stream = HelloStream {
+            stream_id: 7,
+            name: "stream7".to_string(),
+            h264_sps_b64: None,
+            h264_pps_b64: None,
+        };
+        assert!(decode_h264_sync_seed(&stream).unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn ensure_stream_reuses_existing_sender_while_pipeline_is_alive() {
+        let _test_lock = TEST_PIPELINE_LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap();
+        let _hook_reset = HookReset;
+        let streams: Arc<Mutex<HashMap<u32, StreamHandle>>> = Arc::new(Mutex::new(HashMap::new()));
+        let active_streams = Arc::new(AtomicUsize::new(0));
+        let launches = Arc::new(AtomicUsize::new(0));
+        let hold_open = Arc::new(Notify::new());
+
+        {
+            let launches = launches.clone();
+            let hold_open = hold_open.clone();
+            set_test_pipeline_hook(move |_stream_id, _generation, mut rx| {
+                let launches = launches.clone();
+                let hold_open = hold_open.clone();
+                Box::pin(async move {
+                    launches.fetch_add(1, Ordering::SeqCst);
+                    let _ = rx.recv().await;
+                    hold_open.notified().await;
+                    Ok(())
+                })
+            });
+        }
+
+        let tx1 = default_ensure_stream(&streams, &active_streams, 7);
+        let tx2 = default_ensure_stream(&streams, &active_streams, 7);
+        wait_for_launches(&launches, 1).await;
+        assert!(tx1.same_channel(&tx2));
+
+        tx1.send(StreamMsg::Rtp(vec![1, 2, 3])).await.expect("send");
+        hold_open.notify_waiters();
+    }
+
+    #[tokio::test]
+    async fn ensure_stream_recreates_pipeline_after_task_exit() {
+        let _test_lock = TEST_PIPELINE_LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap();
+        let _hook_reset = HookReset;
+        let streams: Arc<Mutex<HashMap<u32, StreamHandle>>> = Arc::new(Mutex::new(HashMap::new()));
+        let active_streams = Arc::new(AtomicUsize::new(0));
+        let launches = Arc::new(AtomicUsize::new(0));
+
+        {
+            let launches = launches.clone();
+            set_test_pipeline_hook(move |_stream_id, _generation, mut rx| {
+                let launches = launches.clone();
+                Box::pin(async move {
+                    launches.fetch_add(1, Ordering::SeqCst);
+                    let _ = rx.recv().await;
+                    Err(anyhow!("intentional pipeline failure"))
+                })
+            });
+        }
+
+        let tx1 = default_ensure_stream(&streams, &active_streams, 7);
+        wait_for_launches(&launches, 1).await;
+        tx1.send(StreamMsg::Rtp(vec![1])).await.expect("send");
+
+        timeout(Duration::from_secs(1), async {
+            while streams.lock().unwrap().contains_key(&7) {
+                yield_now().await;
+            }
+        })
+        .await
+        .expect("first pipeline should exit and clean up stream handle");
+
+        let tx2 = default_ensure_stream(&streams, &active_streams, 7);
+        assert!(!tx1.same_channel(&tx2));
+        wait_for_launches(&launches, 2).await;
+    }
+
+    #[tokio::test]
+    async fn closed_sender_from_handle_conn_triggers_stream_recreation() -> Result<()> {
+        let _test_lock = TEST_PIPELINE_LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap();
+        let _hook_reset = HookReset;
+        let streams: Arc<Mutex<HashMap<u32, StreamHandle>>> = Arc::new(Mutex::new(HashMap::new()));
+        let active_streams = Arc::new(AtomicUsize::new(0));
+        let launches = Arc::new(AtomicUsize::new(0));
+
+        {
+            let launches = launches.clone();
+            set_test_pipeline_hook(move |_stream_id, _generation, mut rx| {
+                let launches = launches.clone();
+                Box::pin(async move {
+                    launches.fetch_add(1, Ordering::SeqCst);
+                    let _ = rx.recv().await;
+                    Ok(())
+                })
+            });
+        }
+
+        let tx = default_ensure_stream(&streams, &active_streams, 9);
+        tx.send(StreamMsg::Rtp(vec![1, 2, 3])).await?;
+
+        timeout(Duration::from_secs(1), async {
+            while streams.lock().unwrap().contains_key(&9) {
+                yield_now().await;
+            }
+        })
+        .await
+        .expect("initial pipeline should stop and remove stream handle");
+
+        send_or_recreate_stream_msg(
+            &streams,
+            &active_streams,
+            &tx,
+            9,
+            StreamMsg::Rtp(vec![4, 5, 6]),
+            std::env::temp_dir(),
+            3,
+            3,
+            5,
+            24 * 60 * 60,
+            None,
+            5000,
+            2,
+            250,
+            15,
+            60,
+            LivePipelineVersion::V1,
+            2,
+            12,
+        );
+
+        timeout(Duration::from_secs(1), async {
+            while launches.load(Ordering::SeqCst) < 2 {
+                yield_now().await;
+            }
+        })
+        .await
+        .expect("stream should be recreated after closed sender");
+        Ok(())
     }
 }

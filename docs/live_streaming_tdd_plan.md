@@ -1,21 +1,28 @@
 # Live Streaming TDD Implementation Plan
 
-This plan breaks the producer-side work from [live_streaming_review.md](./live_streaming_review.md)
-into small implementation documents that can be executed independently.
+This plan broke the producer-side work from [live_streaming_review.md](./live_streaming_review.md)
+into small implementation documents that could be executed independently.
 
-## Assumptions
+## Status
 
-- Scope is limited to this repository.
-- Work should prefer small, verifiable changes over broad refactors.
-- Each item starts with failing tests and ends only after the targeted tests pass.
-- External backend/UI follow-up remains out of scope for these docs.
+Producer-side work in this repository is now implemented for the planned slices:
 
-## Suggested implementation order
+- `playlist_publish_order`: implemented
+- `session_pointer_readiness`: implemented
+- `stream_pipeline_restart`: implemented
+- `sdp_sync_seed`: implemented
 
-1. `playlist_publish_order`: removes the stale-playlist-to-404 race with the smallest code change.
-2. `session_pointer_readiness`: fixes publish ordering so `current.json` only points at playable sessions.
-3. `stream_pipeline_restart`: closes the restart gap after pipeline failure.
-4. `sdp_sync_seed`: improves startup reliability on cameras that send SPS/PPS only in SDP.
+Remaining follow-up, if needed, is server-side verification or implementation in the backend repo.
+Use [Server Changes TDD](./live_streaming_tdd_server_changes.md) for that work.
+
+## Implemented improvements
+
+- Playlist publish now happens before eviction, removing the stale-manifest-to-deleted-segment race.
+- `current.json` is published only after the first playable segment and manifest exist, and it moves
+  through `ready` and `stopped` with the latest published segment sequence.
+- Stream pipelines are recreated after task exit instead of leaving stale senders in the ingest registry.
+- SDP `sprop-parameter-sets` now flow from agent DESCRIBE parsing through uplink metadata into v2 sync
+  seeding on ingest startup.
 
 ## Documents
 
@@ -25,17 +32,7 @@ into small implementation documents that can be executed independently.
 - [SDP Sync Seed TDD](./live_streaming_tdd_sdp_sync_seed.md)
 - [Server Changes TDD](./live_streaming_tdd_server_changes.md)
 
-## Common TDD rules
-
-- Add the narrowest failing test that reproduces the current behavior.
-- Do not change production structure until the failure is demonstrated.
-- Make the minimum code change that turns the test green.
-- Refactor only when the passing tests make the safety boundary clear.
-- Keep new assertions focused on externally observable behavior: files on disk, pointer contents,
-  restart behavior, and ingest metadata flow.
-
 ## Exit criteria
 
-- Every document has at least one red-green-refactor loop with named tests.
-- New tests stay close to the module they verify.
-- Existing live pipeline tests still pass after each slice.
+- Producer-side changes are implemented and covered by targeted tests near the affected modules.
+- Remaining work, if any, is limited to backend lease/signing/serving behavior.

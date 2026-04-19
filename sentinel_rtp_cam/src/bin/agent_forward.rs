@@ -290,6 +290,7 @@ fn start_runtime(desired: &DesiredRuntime) -> Result<AgentRuntime> {
         stream_map,
         stream_to_camera,
         stream_ingest,
+        HashMap::new(),
     );
 
     let cancel = CancellationToken::new();
@@ -645,6 +646,9 @@ async fn run_camera(cam: CamConfig, uplink: Uplink, cancel: CancellationToken) -
     info!(stream_id = cam.stream_id, "RTSP DESCRIBE ok");
     let sdp = String::from_utf8_lossy(&r.body);
     let track = parse_sdp_video_track(&sdp)?;
+    if let (Some(sps), Some(pps)) = (track.sprop_sps.clone(), track.sprop_pps.clone()) {
+        uplink.set_stream_h264_parameter_sets(cam.stream_id, sps, pps);
+    }
     let has_sprop_parameter_sets = track.sprop_sps.is_some() && track.sprop_pps.is_some();
     info!(
         camera_id = %cam.camera_id,

@@ -33,6 +33,13 @@ pub struct LivePipelineV2Config {
     pub stats_log_secs: u64,
     pub segment_secs: u64,
     pub window_secs: u64,
+    pub h264_sync_seed: Option<H264SyncSeed>,
+}
+
+#[derive(Debug, Clone)]
+pub struct H264SyncSeed {
+    pub sps_annexb: Vec<u8>,
+    pub pps_annexb: Vec<u8>,
 }
 
 #[derive(Debug, Clone)]
@@ -404,7 +411,6 @@ async fn initialize_live_session(camera_root: &Path) -> Result<LiveSessionContex
         generation,
         started_at: Utc::now(),
     };
-    write_current_session_pointer(camera_root, &context, "starting", 0).await?;
 
     let (retention_secs, keep_count) = load_session_gc_config();
     let camera_root = camera_root.to_path_buf();
@@ -499,6 +505,9 @@ pub async fn run_stream_v2(
 
     let mut dep = H264Depacketizer::new();
     let mut sync_gate = H264SyncGate::new(true);
+    if let Some(seed) = cfg.h264_sync_seed.as_ref() {
+        sync_gate.set_sprop_param_sets(seed.sps_annexb.clone(), seed.pps_annexb.clone());
+    }
     let mut expected_seq: Option<u16> = None;
     let mut current_au_nals: Vec<Vec<u8>> = Vec::new();
     let mut current_au_rtp_ts: Option<u32> = None;
@@ -678,13 +687,22 @@ pub async fn run_stream_v2(
 
                             if should_rotate_segment(current_segment.as_ref(), &au, cfg.segment_secs)
                             {
-                                finalize_segment(
+                                if finalize_segment(
                                     &session.output_root,
                                     &mut playlist,
                                     &mut current_segment,
                                     &mut latest_segment_seq,
                                 )
-                                .await?;
+                                .await?
+                                {
+                                    write_current_session_pointer(
+                                        &cfg.output_root,
+                                        &session,
+                                        "ready",
+                                        latest_segment_seq,
+                                    )
+                                    .await?;
+                                }
                                 no_publish_episode = NoPublishEpisode::default();
                             }
 
@@ -718,15 +736,21 @@ pub async fn run_stream_v2(
         }
     }
 
-    finalize_segment(
+    if finalize_segment(
         &session.output_root,
         &mut playlist,
         &mut current_segment,
         &mut latest_segment_seq,
     )
-    .await?;
-    write_current_session_pointer(&cfg.output_root, &session, "stopped", latest_segment_seq)
-        .await?;
+    .await?
+    {
+        write_current_session_pointer(&cfg.output_root, &session, "ready", latest_segment_seq)
+            .await?;
+    }
+    if latest_segment_seq > 0 {
+        write_current_session_pointer(&cfg.output_root, &session, "stopped", latest_segment_seq)
+            .await?;
+    }
     write_stream_health(
         &cfg,
         &stats,
@@ -790,14 +814,14 @@ async fn finalize_segment(
     playlist: &mut PlaylistState,
     current_segment: &mut Option<CurrentSegment>,
     latest_segment_seq: &mut u64,
-) -> Result<()> {
+) -> Result<bool> {
     let Some(segment) = current_segment.take() else {
-        return Ok(());
+        return Ok(false);
     };
 
     if segment.access_units_written == 0 {
         segment.writer.discard().await?;
-        return Ok(());
+        return Ok(false);
     }
 
     let duration_secs = segment.elapsed_secs();
@@ -808,7 +832,7 @@ async fn finalize_segment(
         .push_segment(session_output_root, seq, duration_secs, discontinuity)
         .await?;
     *latest_segment_seq = seq;
-    Ok(())
+    Ok(true)
 }
 
 async fn handle_discontinuity(
@@ -820,7 +844,7 @@ async fn handle_discontinuity(
     latest_segment_seq: &mut u64,
 ) -> Result<()> {
     let saw_published_output = *latest_segment_seq > 0 || current_segment.is_some();
-    finalize_segment(
+    let _ = finalize_segment(
         session_output_root,
         playlist,
         current_segment,
@@ -1171,8 +1195,8 @@ mod tests {
         derive_rtp_payload_nal_type, derive_stream_health_state, encode_pts, finalize_segment,
         handle_discontinuity, initialize_live_session, mpeg_crc32, open_segment, packetize_ts,
         read_current_generation, run_stream_v2, should_rotate_segment, temp_path_for,
-        write_current_session_pointer, AtomicPublisher, LivePipelineV2Config, NoPublishEpisode,
-        PlaylistState, StreamHealthState, StreamRuntimeStats,
+        write_current_session_pointer, AtomicPublisher, H264SyncSeed, LivePipelineV2Config,
+        NoPublishEpisode, PlaylistState, StreamHealthState, StreamRuntimeStats,
     };
     use crate::server_pipeline::StreamMsg;
     use chrono::{Duration as ChronoDuration, Utc};
@@ -1197,6 +1221,7 @@ mod tests {
             stats_log_secs: 60,
             segment_secs: 1,
             window_secs: 4,
+            h264_sync_seed: None,
         }
     }
 
@@ -1474,7 +1499,7 @@ mod tests {
         let mut current_segment = Some(open_segment(&dir, &mut playlist, false).await.unwrap());
         let mut latest_segment_seq = 0u64;
 
-        finalize_segment(
+        let published = finalize_segment(
             &dir,
             &mut playlist,
             &mut current_segment,
@@ -1483,6 +1508,7 @@ mod tests {
         .await
         .unwrap();
 
+        assert!(!published);
         assert!(current_segment.is_none());
         assert_eq!(latest_segment_seq, 0);
         assert!(fs::metadata(dir.join("index.m3u8")).await.is_err());
@@ -1508,7 +1534,7 @@ mod tests {
             segment.started_at = Instant::now() - Duration::from_secs(2);
         }
 
-        finalize_segment(
+        let published = finalize_segment(
             &dir,
             &mut playlist,
             &mut current_segment,
@@ -1517,6 +1543,7 @@ mod tests {
         .await
         .unwrap();
 
+        assert!(published);
         assert!(current_segment.is_none());
         assert_eq!(latest_segment_seq, 1);
         assert!(fs::metadata(dir.join("seg_000001.ts")).await.is_ok());
@@ -1530,38 +1557,52 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn initialize_live_session_creates_session_directory_and_starting_pointer() {
+    async fn initialize_live_session_creates_private_session_without_current_pointer() {
         let dir = test_dir("init_session");
         fs::create_dir_all(&dir).await.unwrap();
 
         let session = initialize_live_session(&dir).await.unwrap();
         assert!(fs::metadata(&session.output_root).await.is_ok());
-
-        let pointer_raw = fs::read_to_string(dir.join("current.json")).await.unwrap();
-        let pointer: Value = serde_json::from_str(&pointer_raw).unwrap();
-        assert_eq!(
-            pointer.get("session_id").and_then(Value::as_str),
-            Some(session.session_id.as_str())
-        );
-        assert_eq!(
-            pointer.get("writer_state").and_then(Value::as_str),
-            Some("starting")
-        );
-        assert_eq!(
-            pointer.get("generation").and_then(Value::as_u64),
-            Some(session.generation)
-        );
+        assert!(fs::metadata(dir.join("current.json")).await.is_err());
 
         fs::remove_dir_all(&dir).await.unwrap();
     }
 
     #[tokio::test]
-    async fn write_current_session_pointer_updates_state_and_last_segment_seq() {
+    async fn write_current_session_pointer_updates_last_segment_seq_on_each_publish() {
         let dir = test_dir("pointer_update");
         fs::create_dir_all(&dir).await.unwrap();
         let session = initialize_live_session(&dir).await.unwrap();
 
-        write_current_session_pointer(&dir, &session, "stopped", 42)
+        write_current_session_pointer(&dir, &session, "ready", 1)
+            .await
+            .unwrap();
+        let pointer_raw = fs::read_to_string(dir.join("current.json")).await.unwrap();
+        let pointer: Value = serde_json::from_str(&pointer_raw).unwrap();
+        assert_eq!(
+            pointer.get("writer_state").and_then(Value::as_str),
+            Some("ready")
+        );
+        assert_eq!(
+            pointer.get("last_segment_seq").and_then(Value::as_u64),
+            Some(1)
+        );
+
+        write_current_session_pointer(&dir, &session, "ready", 2)
+            .await
+            .unwrap();
+        let pointer_raw = fs::read_to_string(dir.join("current.json")).await.unwrap();
+        let pointer: Value = serde_json::from_str(&pointer_raw).unwrap();
+        assert_eq!(
+            pointer.get("writer_state").and_then(Value::as_str),
+            Some("ready")
+        );
+        assert_eq!(
+            pointer.get("last_segment_seq").and_then(Value::as_u64),
+            Some(2)
+        );
+
+        write_current_session_pointer(&dir, &session, "stopped", 3)
             .await
             .unwrap();
         let pointer_raw = fs::read_to_string(dir.join("current.json")).await.unwrap();
@@ -1572,7 +1613,7 @@ mod tests {
         );
         assert_eq!(
             pointer.get("last_segment_seq").and_then(Value::as_u64),
-            Some(42)
+            Some(3)
         );
 
         fs::remove_dir_all(&dir).await.unwrap();
@@ -1778,6 +1819,14 @@ mod tests {
             .await
             .expect("current session pointer");
         let pointer: Value = serde_json::from_str(&pointer_raw).expect("valid pointer");
+        assert_eq!(
+            pointer.get("writer_state").and_then(Value::as_str),
+            Some("stopped")
+        );
+        assert_eq!(
+            pointer.get("last_segment_seq").and_then(Value::as_u64),
+            Some(5)
+        );
         let session_id = pointer
             .get("session_id")
             .and_then(Value::as_str)
@@ -1876,18 +1925,7 @@ mod tests {
 
         handle.await.unwrap().unwrap();
 
-        let pointer_raw = fs::read_to_string(cfg.output_root.join("current.json"))
-            .await
-            .expect("current pointer");
-        let pointer: Value = serde_json::from_str(&pointer_raw).expect("valid pointer");
-        let session_id = pointer
-            .get("session_id")
-            .and_then(Value::as_str)
-            .expect("session id in pointer");
-        let session_root = cfg.output_root.join(session_id);
-
-        assert!(fs::metadata(session_root.join("index.m3u8")).await.is_err());
-        assert!(fs::metadata(session_root.join("seg_000001.ts"))
+        assert!(fs::metadata(cfg.output_root.join("current.json"))
             .await
             .is_err());
 
@@ -1895,7 +1933,61 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn v2_publishes_segment_after_sps_pps_and_idr_sync() {
+    async fn run_stream_v2_seeds_sync_gate_from_metadata() {
+        let dir = test_dir("sync_seed_from_metadata");
+        fs::create_dir_all(&dir).await.unwrap();
+        let mut cfg = config(&dir);
+        cfg.h264_sync_seed = Some(H264SyncSeed {
+            sps_annexb: vec![0x00, 0x00, 0x00, 0x01, 0x67, 0x64, 0x00, 0x1F],
+            pps_annexb: vec![0x00, 0x00, 0x00, 0x01, 0x68, 0xEE, 0x3C, 0x80],
+        });
+        let (tx, rx) = mpsc::channel(64);
+
+        let handle = tokio::spawn(run_stream_v2(cfg.clone(), rx));
+        tx.send(StreamMsg::Rtp(rtp_single_nal(
+            1,
+            90_000,
+            true,
+            &[0x65, 0x88, 0x99],
+        )))
+        .await
+        .unwrap();
+        tokio::time::sleep(Duration::from_millis(1100)).await;
+        tx.send(StreamMsg::Rtp(rtp_single_nal(
+            2,
+            93_600,
+            true,
+            &[0x65, 0xAA, 0xBB],
+        )))
+        .await
+        .unwrap();
+        drop(tx);
+
+        handle.await.unwrap().unwrap();
+
+        let pointer_raw = fs::read_to_string(cfg.output_root.join("current.json"))
+            .await
+            .expect("current pointer should be published");
+        let pointer: Value = serde_json::from_str(&pointer_raw).expect("valid pointer");
+        let session_id = pointer
+            .get("session_id")
+            .and_then(Value::as_str)
+            .expect("session id");
+        let session_root = cfg.output_root.join(session_id);
+
+        let playlist = fs::read_to_string(session_root.join("index.m3u8"))
+            .await
+            .unwrap();
+        assert!(playlist.contains("seg_000001.ts"));
+        assert!(fs::metadata(session_root.join("seg_000001.ts"))
+            .await
+            .is_ok());
+
+        fs::remove_dir_all(&dir).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn v2_publishes_current_pointer_after_first_segment_and_marks_ready() {
         let dir = test_dir("sync");
         fs::create_dir_all(&dir).await.unwrap();
         let cfg = config(&dir);
@@ -1926,14 +2018,22 @@ mod tests {
         )))
         .await
         .unwrap();
-        drop(tx);
+        tokio::time::sleep(Duration::from_millis(1100)).await;
+        send_sync_idr(&tx, 4, 100_800).await;
 
-        handle.await.unwrap().unwrap();
-
-        let pointer_raw = fs::read_to_string(cfg.output_root.join("current.json"))
-            .await
-            .expect("current pointer");
-        let pointer: Value = serde_json::from_str(&pointer_raw).expect("valid pointer");
+        let pointer = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if let Ok(pointer_raw) =
+                    fs::read_to_string(cfg.output_root.join("current.json")).await
+                {
+                    let pointer: Value = serde_json::from_str(&pointer_raw).expect("valid pointer");
+                    break pointer;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("current pointer should be published after first finalized segment");
         let session_id = pointer
             .get("session_id")
             .and_then(Value::as_str)
@@ -1948,6 +2048,17 @@ mod tests {
         assert!(fs::metadata(session_root.join("seg_000001.ts"))
             .await
             .is_ok());
+        assert_eq!(
+            pointer.get("writer_state").and_then(Value::as_str),
+            Some("ready")
+        );
+        assert_eq!(
+            pointer.get("last_segment_seq").and_then(Value::as_u64),
+            Some(1)
+        );
+
+        drop(tx);
+        handle.await.unwrap().unwrap();
 
         fs::remove_dir_all(&dir).await.unwrap();
     }
@@ -2011,29 +2122,23 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn v2_writes_current_session_pointer_on_startup() {
+    async fn v2_does_not_publish_current_pointer_before_first_playlist() {
         let dir = test_dir("current_session_pointer");
         fs::create_dir_all(&dir).await.unwrap();
         let cfg = config(&dir);
         let (tx, rx) = mpsc::channel(8);
 
         let handle = tokio::spawn(run_stream_v2(cfg.clone(), rx));
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(fs::metadata(cfg.output_root.join("current.json"))
+            .await
+            .is_err());
+
         drop(tx);
         handle.await.unwrap().unwrap();
-
-        let pointer_raw = fs::read_to_string(cfg.output_root.join("current.json"))
+        assert!(fs::metadata(cfg.output_root.join("current.json"))
             .await
-            .expect("current session pointer");
-        let pointer: Value = serde_json::from_str(&pointer_raw).expect("valid pointer json");
-        assert!(pointer
-            .get("session_id")
-            .and_then(Value::as_str)
-            .is_some_and(|value| !value.is_empty()));
-        let writer_state = pointer
-            .get("writer_state")
-            .and_then(Value::as_str)
-            .unwrap_or("");
-        assert!(writer_state == "starting" || writer_state == "stopped");
+            .is_err());
 
         fs::remove_dir_all(&dir).await.unwrap();
     }

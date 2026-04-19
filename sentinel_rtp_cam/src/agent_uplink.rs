@@ -8,7 +8,7 @@ use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::sync::{
     atomic::{AtomicU64, Ordering},
-    Arc,
+    Arc, RwLock,
 };
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::net::TcpStream;
@@ -28,6 +28,13 @@ pub struct Uplink {
     motion_tx: mpsc::UnboundedSender<MotionEnvelope>,
     stats: Arc<UplinkStats>,
     shutdown: CancellationToken,
+    stream_h264_parameter_sets: Arc<RwLock<HashMap<u32, H264ParameterSets>>>,
+}
+
+#[derive(Debug, Clone)]
+pub struct H264ParameterSets {
+    pub sps: Vec<u8>,
+    pub pps: Vec<u8>,
 }
 
 #[derive(Debug, Serialize)]
@@ -80,6 +87,10 @@ struct HelloStream {
     camera_id: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     ingest: Option<HelloIngestConfig>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    h264_sps_b64: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    h264_pps_b64: Option<String>,
 }
 #[derive(Debug, Deserialize)]
 struct MotionEnvelope {
@@ -119,14 +130,17 @@ impl Uplink {
         stream_map: HashMap<u32, String>,
         stream_camera_map: HashMap<u32, String>,
         stream_ingest: Option<HelloIngestConfig>,
+        stream_h264_parameter_sets: HashMap<u32, H264ParameterSets>,
     ) -> Self {
         let (media_tx, mut media_rx) = mpsc::channel::<Msg>(4096);
         let (motion_tx, mut motion_rx) = mpsc::unbounded_channel::<MotionEnvelope>();
         let stats = Arc::new(UplinkStats::default());
         let shutdown = CancellationToken::new();
+        let stream_h264_parameter_sets = Arc::new(RwLock::new(stream_h264_parameter_sets));
 
         let stats_task = stats.clone();
         let shutdown_task = shutdown.clone();
+        let h264_parameter_sets = stream_h264_parameter_sets.clone();
         tokio::spawn(async move {
             let mut backoff = Duration::from_secs(1);
             loop {
@@ -177,6 +191,9 @@ impl Uplink {
                             &stream_map,
                             &stream_camera_map,
                             stream_ingest.as_ref(),
+                            &h264_parameter_sets
+                                .read()
+                                .unwrap_or_else(|poison| poison.into_inner()),
                         );
                         let streams: Vec<String> =
                             streams_info.iter().map(|s| s.name.clone()).collect();
@@ -436,6 +453,7 @@ impl Uplink {
             motion_tx,
             stats,
             shutdown,
+            stream_h264_parameter_sets,
         }
     }
 
@@ -505,6 +523,14 @@ impl Uplink {
                 "Uplink motion channel closed; dropping MOTION"
             );
         }
+    }
+
+    pub fn set_stream_h264_parameter_sets(&self, stream_id: u32, sps: Vec<u8>, pps: Vec<u8>) {
+        let mut guard = self
+            .stream_h264_parameter_sets
+            .write()
+            .unwrap_or_else(|poison| poison.into_inner());
+        guard.insert(stream_id, H264ParameterSets { sps, pps });
     }
 }
 
@@ -633,17 +659,31 @@ fn build_streams_info(
     stream_map: &HashMap<u32, String>,
     stream_camera_map: &HashMap<u32, String>,
     stream_ingest: Option<&HelloIngestConfig>,
+    stream_h264_parameter_sets: &HashMap<u32, H264ParameterSets>,
 ) -> Vec<HelloStream> {
     let mut streams: Vec<HelloStream> = stream_map
         .iter()
-        .map(|(stream_id, name)| HelloStream {
-            stream_id: *stream_id,
-            name: name.clone(),
-            camera_id: stream_camera_map
+        .map(|(stream_id, name)| {
+            let (h264_sps_b64, h264_pps_b64) = stream_h264_parameter_sets
                 .get(stream_id)
-                .cloned()
-                .unwrap_or_else(|| format!("stream-{stream_id}")),
-            ingest: stream_ingest.cloned(),
+                .map(|sets| {
+                    (
+                        Some(base64::engine::general_purpose::STANDARD.encode(&sets.sps)),
+                        Some(base64::engine::general_purpose::STANDARD.encode(&sets.pps)),
+                    )
+                })
+                .unwrap_or((None, None));
+            HelloStream {
+                stream_id: *stream_id,
+                name: name.clone(),
+                camera_id: stream_camera_map
+                    .get(stream_id)
+                    .cloned()
+                    .unwrap_or_else(|| format!("stream-{stream_id}")),
+                ingest: stream_ingest.cloned(),
+                h264_sps_b64,
+                h264_pps_b64,
+            }
         })
         .collect();
     streams.sort_by_key(|s| s.stream_id);
@@ -654,8 +694,8 @@ fn build_streams_info(
 mod tests {
     use super::{
         build_event_payload, build_streams_info, decode_rtp_tls, encode_gap_tls, encode_rtp_tls,
-        load_tls_config, read_record, resolve_server_name, write_record, HelloIngestConfig,
-        HelloPayload, MotionEnvelope, RECORD_EVENT, RECORD_GAP, RECORD_RTP,
+        load_tls_config, read_record, resolve_server_name, write_record, H264ParameterSets,
+        HelloIngestConfig, HelloPayload, MotionEnvelope, RECORD_EVENT, RECORD_GAP, RECORD_RTP,
     };
     use crate::config::AgentConfig;
     use crate::proto::{Msg, GAP, RTP};
@@ -709,7 +749,12 @@ mod tests {
             clip_write_retry_backoff_ms: Some(250),
         };
 
-        let streams = build_streams_info(&stream_map, &stream_camera_map, Some(&ingest));
+        let streams = build_streams_info(
+            &stream_map,
+            &stream_camera_map,
+            Some(&ingest),
+            &HashMap::new(),
+        );
         assert_eq!(streams.len(), 2);
         assert_eq!(streams[0].stream_id, 1);
         assert_eq!(streams[1].stream_id, 2);
@@ -738,7 +783,8 @@ mod tests {
         stream_camera_map.insert(1, "ABLAK".to_string());
         stream_camera_map.insert(2, "aff8812b-c6be-4e59-aefd-40b59b425d92".to_string());
 
-        let streams_info = build_streams_info(&stream_map, &stream_camera_map, None);
+        let streams_info =
+            build_streams_info(&stream_map, &stream_camera_map, None, &HashMap::new());
         let streams: Vec<String> = streams_info.iter().map(|s| s.name.clone()).collect();
         let hello = HelloPayload {
             agent_id: "01KH1V1AMEP4NDDDJ0SRV067TW".to_string(),
@@ -770,9 +816,52 @@ mod tests {
         let mut stream_camera_map = HashMap::new();
         stream_camera_map.insert(1, "camera-1".to_string());
 
-        let streams = build_streams_info(&stream_map, &stream_camera_map, None);
+        let streams = build_streams_info(&stream_map, &stream_camera_map, None, &HashMap::new());
         assert_eq!(streams.len(), 1);
         assert!(streams[0].ingest.is_none());
+    }
+
+    #[test]
+    fn hello_stream_round_trips_h264_parameter_sets() {
+        let mut stream_map = HashMap::new();
+        stream_map.insert(1, "cam1".to_string());
+        let mut stream_camera_map = HashMap::new();
+        stream_camera_map.insert(1, "camera-1".to_string());
+        let mut stream_h264_parameter_sets = HashMap::new();
+        stream_h264_parameter_sets.insert(
+            1,
+            H264ParameterSets {
+                sps: vec![0x67, 0x64, 0x00, 0x1F],
+                pps: vec![0x68, 0xEE, 0x3C, 0x80],
+            },
+        );
+
+        let streams_info = build_streams_info(
+            &stream_map,
+            &stream_camera_map,
+            None,
+            &stream_h264_parameter_sets,
+        );
+        let streams: Vec<String> = streams_info.iter().map(|s| s.name.clone()).collect();
+        let hello = HelloPayload {
+            agent_id: "agent-a".to_string(),
+            token: "agent-token".to_string(),
+            streams,
+            timestamp_unix: 1_775_463_330,
+            nonce: "nonce".to_string(),
+            streams_info,
+        };
+
+        let payload = serde_json::to_vec(&hello).expect("serialize hello");
+        let value: serde_json::Value = serde_json::from_slice(&payload).expect("parse serialized");
+        assert_eq!(
+            value["streams_info"][0]["h264_sps_b64"].as_str(),
+            Some("Z2QAHw==")
+        );
+        assert_eq!(
+            value["streams_info"][0]["h264_pps_b64"].as_str(),
+            Some("aO48gA==")
+        );
     }
 
     #[test]
