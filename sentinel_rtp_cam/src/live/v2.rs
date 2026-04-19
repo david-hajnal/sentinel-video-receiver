@@ -223,6 +223,7 @@ impl MpegTsSegmentWriter {
     }
 }
 
+#[derive(Clone)]
 struct SegmentEntry {
     seq: u64,
     duration_secs: f64,
@@ -235,6 +236,8 @@ struct PlaylistState {
     max_segments: usize,
     next_segment_seq: u64,
     entries: VecDeque<SegmentEntry>,
+    #[cfg(test)]
+    fail_manifest_publish: bool,
 }
 
 impl PlaylistState {
@@ -248,7 +251,14 @@ impl PlaylistState {
             max_segments: max_segments.max(3),
             next_segment_seq: 1,
             entries: VecDeque::new(),
+            #[cfg(test)]
+            fail_manifest_publish: false,
         }
+    }
+
+    #[cfg(test)]
+    fn set_fail_manifest_publish(&mut self, fail: bool) {
+        self.fail_manifest_publish = fail;
     }
 
     fn next_segment_path(&mut self, output_root: &Path) -> (u64, PathBuf) {
@@ -264,27 +274,44 @@ impl PlaylistState {
         duration_secs: f64,
         discontinuity: bool,
     ) -> Result<()> {
-        self.entries.push_back(SegmentEntry {
+        let mut next_entries = self.entries.clone();
+        next_entries.push_back(SegmentEntry {
             seq,
             duration_secs: duration_secs.max(0.001),
             filename: format!("seg_{seq:06}.ts"),
             discontinuity,
         });
 
-        while self.entries.len() > self.max_segments {
-            if let Some(oldest) = self.entries.pop_front() {
-                let old_path = output_root.join(oldest.filename);
-                if fs::metadata(&old_path).await.is_ok() {
-                    fs::remove_file(&old_path).await?;
-                }
+        let mut evicted = Vec::new();
+        while next_entries.len() > self.max_segments {
+            if let Some(oldest) = next_entries.pop_front() {
+                evicted.push(oldest.filename);
             }
         }
 
-        self.publish(output_root).await
+        self.publish_entries(output_root, &next_entries).await?;
+        self.entries = next_entries;
+        for filename in evicted {
+            let old_path = output_root.join(filename);
+            if fs::metadata(&old_path).await.is_ok() {
+                fs::remove_file(&old_path).await?;
+            }
+        }
+
+        Ok(())
     }
 
-    async fn publish(&self, output_root: &Path) -> Result<()> {
-        let media_sequence = self.entries.front().map(|entry| entry.seq).unwrap_or(0);
+    async fn publish_entries(
+        &self,
+        output_root: &Path,
+        entries: &VecDeque<SegmentEntry>,
+    ) -> Result<()> {
+        #[cfg(test)]
+        if self.fail_manifest_publish {
+            anyhow::bail!("injected manifest publish failure");
+        }
+
+        let media_sequence = entries.front().map(|entry| entry.seq).unwrap_or(0);
         let mut playlist = String::new();
         playlist.push_str("#EXTM3U\n");
         playlist.push_str("#EXT-X-VERSION:3\n");
@@ -295,7 +322,7 @@ impl PlaylistState {
         ));
         playlist.push_str(&format!("#EXT-X-MEDIA-SEQUENCE:{media_sequence}\n"));
 
-        for entry in &self.entries {
+        for entry in entries {
             if entry.discontinuity {
                 playlist.push_str("#EXT-X-DISCONTINUITY\n");
             }
@@ -1277,6 +1304,87 @@ mod tests {
         assert!(fs::metadata(dir.join("seg_000003.ts")).await.is_ok());
         assert!(fs::metadata(dir.join("seg_000004.ts")).await.is_ok());
         assert!(fs::metadata(dir.join("seg_000005.ts")).await.is_ok());
+
+        fs::remove_dir_all(&dir).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn playlist_push_segment_keeps_evicted_file_until_new_manifest_is_published() {
+        let dir = test_dir("playlist_publish_order");
+        fs::create_dir_all(&dir).await.unwrap();
+        let mut playlist = PlaylistState::new(1, 1);
+        assert_eq!(playlist.max_segments, 3);
+
+        for seq in 1..=4 {
+            fs::write(
+                dir.join(format!("seg_{seq:06}.ts")),
+                format!("segment-{seq}"),
+            )
+            .await
+            .unwrap();
+        }
+
+        for seq in 1..=3 {
+            playlist.push_segment(&dir, seq, 1.0, false).await.unwrap();
+        }
+
+        let old_manifest = fs::read_to_string(dir.join("index.m3u8")).await.unwrap();
+        playlist.set_fail_manifest_publish(true);
+        assert!(playlist.push_segment(&dir, 4, 1.0, false).await.is_err());
+
+        let unchanged_manifest = fs::read_to_string(dir.join("index.m3u8")).await.unwrap();
+        assert_eq!(unchanged_manifest, old_manifest);
+        assert!(fs::metadata(dir.join("seg_000001.ts")).await.is_ok());
+
+        playlist.set_fail_manifest_publish(false);
+        playlist.push_segment(&dir, 4, 1.0, false).await.unwrap();
+
+        let new_manifest = fs::read_to_string(dir.join("index.m3u8")).await.unwrap();
+        assert!(new_manifest.contains("#EXT-X-MEDIA-SEQUENCE:2"));
+        assert!(!new_manifest.contains("seg_000001.ts"));
+        assert!(new_manifest.contains("seg_000002.ts"));
+        assert!(new_manifest.contains("seg_000003.ts"));
+        assert!(new_manifest.contains("seg_000004.ts"));
+        assert!(fs::metadata(dir.join("seg_000001.ts")).await.is_err());
+
+        fs::remove_dir_all(&dir).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn playlist_push_segment_retains_old_files_when_manifest_publish_fails() {
+        let dir = test_dir("playlist_publish_fail");
+        fs::create_dir_all(&dir).await.unwrap();
+        let mut playlist = PlaylistState::new(1, 1);
+        assert_eq!(playlist.max_segments, 3);
+
+        for seq in 1..=4 {
+            fs::write(
+                dir.join(format!("seg_{seq:06}.ts")),
+                format!("segment-{seq}"),
+            )
+            .await
+            .unwrap();
+        }
+
+        for seq in 1..=3 {
+            playlist.push_segment(&dir, seq, 1.0, false).await.unwrap();
+        }
+        let old_manifest = fs::read_to_string(dir.join("index.m3u8")).await.unwrap();
+
+        playlist.set_fail_manifest_publish(true);
+        assert!(playlist.push_segment(&dir, 4, 1.0, false).await.is_err());
+
+        let manifest_after_failure = fs::read_to_string(dir.join("index.m3u8")).await.unwrap();
+        assert_eq!(manifest_after_failure, old_manifest);
+        assert!(manifest_after_failure.contains("seg_000001.ts"));
+        assert!(manifest_after_failure.contains("seg_000002.ts"));
+        assert!(manifest_after_failure.contains("seg_000003.ts"));
+        assert!(!manifest_after_failure.contains("seg_000004.ts"));
+
+        assert!(fs::metadata(dir.join("seg_000001.ts")).await.is_ok());
+        assert!(fs::metadata(dir.join("seg_000002.ts")).await.is_ok());
+        assert!(fs::metadata(dir.join("seg_000003.ts")).await.is_ok());
+        assert!(fs::metadata(dir.join("seg_000004.ts")).await.is_ok());
 
         fs::remove_dir_all(&dir).await.unwrap();
     }

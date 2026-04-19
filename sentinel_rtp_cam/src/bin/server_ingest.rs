@@ -324,14 +324,20 @@ async fn handle_conn(
             GAP => {
                 if let Ok((last, new)) = decode_gap(&payload) {
                     if tx.try_send(StreamMsg::Gap { last, new }).is_err() {
-                        warn!(stream_id, "Dropped GAP message because stream queue is full");
+                        warn!(
+                            stream_id,
+                            "Dropped GAP message because stream queue is full"
+                        );
                     }
                 }
             }
             MOTION => {
                 if let Some(msg) = parse_motion_msg(stream_id, &payload) {
                     if tx.try_send(msg).is_err() {
-                        warn!(stream_id, "Dropped MOTION message because stream queue is full");
+                        warn!(
+                            stream_id,
+                            "Dropped MOTION message because stream queue is full"
+                        );
                     }
                 }
             }
@@ -393,7 +399,11 @@ fn ensure_stream(
 
     tokio::spawn(async move {
         let now_active = active_streams.fetch_add(1, Ordering::SeqCst) + 1;
-        info!(stream_id, active_streams = now_active, "Stream pipeline started");
+        info!(
+            stream_id,
+            active_streams = now_active,
+            "Stream pipeline started"
+        );
         let result = match live_pipeline_version {
             LivePipelineVersion::V1 => run_stream(cfg, rx).await,
             LivePipelineVersion::V2 => run_stream_v2(v2_cfg, rx).await,
@@ -401,8 +411,14 @@ fn ensure_stream(
         if let Err(e) = result {
             warn!(error = %e, stream_id = stream_id, "Stream pipeline ended");
         }
-        let remaining = active_streams.fetch_sub(1, Ordering::SeqCst).saturating_sub(1);
-        info!(stream_id, active_streams = remaining, "Stream pipeline stopped");
+        let remaining = active_streams
+            .fetch_sub(1, Ordering::SeqCst)
+            .saturating_sub(1);
+        info!(
+            stream_id,
+            active_streams = remaining,
+            "Stream pipeline stopped"
+        );
     });
 
     guard.insert(stream_id, tx.clone());

@@ -62,8 +62,8 @@ pub mod onvif;
 pub mod event;
 
 // Server integration
-pub mod server;
 pub mod live;
+pub mod server;
 
 // Utilities
 pub mod utils;

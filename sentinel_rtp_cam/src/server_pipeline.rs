@@ -628,10 +628,7 @@ fn derive_stream_health_state(
     let Some(last_rtp_at) = last_rtp_at else {
         return StreamHealthState::Idle;
     };
-    let elapsed_secs = now
-        .signed_duration_since(last_rtp_at)
-        .num_seconds()
-        .max(0) as u64;
+    let elapsed_secs = now.signed_duration_since(last_rtp_at).num_seconds().max(0) as u64;
     if elapsed_secs <= stale_secs.max(1) {
         StreamHealthState::Receiving
     } else {
@@ -1089,7 +1086,9 @@ mod tests {
             last_health_write_at: None,
         };
 
-        write_stream_health(&cfg, &stats, true, false).await.unwrap();
+        write_stream_health(&cfg, &stats, true, false)
+            .await
+            .unwrap();
 
         let health_path = clip_dir.join("stream_7.health.json");
         let raw = fs::read_to_string(&health_path).await.unwrap();
@@ -1097,7 +1096,9 @@ mod tests {
         assert!(raw.contains("\"state\": \"receiving\""));
         assert!(raw.contains("\"clip_active\": true"));
         assert!(raw.contains("\"total_rtp_packets\": 11"));
-        assert!(fs::metadata(clip_dir.join("stream_7.health.json.tmp")).await.is_err());
+        assert!(fs::metadata(clip_dir.join("stream_7.health.json.tmp"))
+            .await
+            .is_err());
 
         fs::remove_dir_all(&clip_dir).await.unwrap();
     }
