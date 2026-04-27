@@ -82,6 +82,13 @@ fn config_camera_id(value: &Value) -> Option<&str> {
         .filter(|value| !value.trim().is_empty())
 }
 
+fn is_auth_failure_status(status: reqwest::StatusCode) -> bool {
+    matches!(
+        status,
+        reqwest::StatusCode::UNAUTHORIZED | reqwest::StatusCode::FORBIDDEN
+    )
+}
+
 fn build_camera_heartbeat_targets(
     cams: &[CamConfig],
     config_value: &Value,
@@ -364,6 +371,12 @@ async fn try_pull_remote_config(
         }
     }
     if !resp.status().is_success() {
+        if is_auth_failure_status(resp.status()) {
+            return Err(anyhow!(
+                "AGENT_AUTH_FAILED: config pull rejected with {}. Update local server.json token and retry.",
+                resp.status()
+            ));
+        }
         warn!(
             status = %resp.status(),
             "Config pull failed; server returned error"
@@ -564,7 +577,14 @@ async fn main() -> Result<()> {
                     }
                     Err(e) => {
                         if last_status.elapsed() > Duration::from_secs(30) {
-                            warn!(error = %e, "Config pull failed");
+                            if e.to_string().contains("AGENT_AUTH_FAILED") {
+                                warn!(
+                                    error = %e,
+                                    "Config pull authentication failed; update local server.json bearer token"
+                                );
+                            } else {
+                                warn!(error = %e, "Config pull failed");
+                            }
                         }
                     }
                 }
@@ -1271,6 +1291,26 @@ mod tests {
         (base_url, handle)
     }
 
+    async fn spawn_auth_rejecting_config_server() -> String {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind auth test server");
+        let base_url = format!("http://{}", listener.local_addr().expect("local addr"));
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("accept request");
+            let _request = read_request(&mut stream).await;
+            let response = http_response(
+                "401 Unauthorized",
+                r#"{"code":"AGENT_TOKEN_INVALID","error":"invalid token"}"#,
+            );
+            stream
+                .write_all(response.as_bytes())
+                .await
+                .expect("write response");
+        });
+        base_url
+    }
+
     #[tokio::test]
     async fn remote_config_pull_tries_agent_config_before_camera_hint() {
         let dir = unique_test_dir("pull-order");
@@ -1388,6 +1428,37 @@ mod tests {
         assert_eq!(targets[1].camera_id, "aff8812b-c6be-4e59-aefd-40b59b425d92");
         assert_eq!(targets[1].config_version, Some(json!(12)));
 
+        fs::remove_dir_all(dir).expect("remove test dir");
+    }
+
+    #[tokio::test]
+    async fn remote_config_pull_returns_auth_failure_for_unauthorized() {
+        let dir = unique_test_dir("pull-auth-failure");
+        fs::create_dir_all(&dir).expect("test dir");
+        let camera_path = dir.join("camera.json");
+        AgentConfig::write_json_file(&camera_path, &json!({ "cameras": [] }))
+            .expect("write camera config");
+        let base_url = spawn_auth_rejecting_config_server().await;
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(5))
+            .build()
+            .expect("http client");
+
+        let error = try_pull_remote_config(
+            &client,
+            &base_url,
+            "stale-token",
+            Some("ABLAK".to_string()),
+            &dir.join("server.json"),
+            &camera_path,
+        )
+        .await
+        .expect_err("pull should fail with explicit auth error");
+
+        assert!(
+            error.to_string().contains("AGENT_AUTH_FAILED"),
+            "unexpected error: {error}"
+        );
         fs::remove_dir_all(dir).expect("remove test dir");
     }
 }

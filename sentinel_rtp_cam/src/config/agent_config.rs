@@ -98,8 +98,12 @@ impl AgentConfig {
         let server = ServerConfig {
             enabled: Self::runtime_bool("SERVER_ENABLED", false),
             base_url: server_base_url,
-            bearer_token: Self::runtime_var("SERVER_BEARER_TOKEN")
-                .unwrap_or_else(|| "devtoken".to_string()),
+            bearer_token: Self::runtime_var("SERVER_BEARER_TOKEN").ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "SERVER_BEARER_TOKEN is required when server integration is enabled",
+                )
+            })?,
             retry_interval_secs: Self::runtime_u64("SERVER_RETRY_INTERVAL_SECS", 2),
             max_retries: Self::runtime_u64("SERVER_MAX_RETRIES", 5) as u32,
         };
@@ -1587,6 +1591,26 @@ mod tests {
         );
         let config = AgentConfig::from_env().expect("from_env should allow override");
         assert_eq!(config.server.base_url, "http://example.com/");
+    }
+
+    #[test]
+    fn from_env_requires_server_bearer_token_when_server_base_url_is_set() {
+        let _guard = EnvGuard::new();
+        AgentConfig::runtime_restore(
+            [(
+                "SERVER_BASE_URL".to_string(),
+                "https://admin.example.com".to_string(),
+            )]
+            .into_iter()
+            .collect(),
+        );
+        let error = AgentConfig::from_env().expect_err("from_env should require bearer token");
+        assert!(
+            error
+                .to_string()
+                .contains("SERVER_BEARER_TOKEN is required"),
+            "unexpected error: {error}"
+        );
     }
 
     #[test]

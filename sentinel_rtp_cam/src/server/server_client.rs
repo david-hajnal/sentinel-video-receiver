@@ -825,6 +825,13 @@ fn build_agent_heartbeat_payload(
     payload
 }
 
+fn is_auth_failure_status(status: reqwest::StatusCode) -> bool {
+    matches!(
+        status,
+        reqwest::StatusCode::UNAUTHORIZED | reqwest::StatusCode::FORBIDDEN
+    )
+}
+
 async fn post_heartbeat(
     client: &reqwest::Client,
     config: &ServerConfig,
@@ -842,6 +849,12 @@ async fn post_heartbeat(
                 .json(payload)
                 .send()
                 .await?;
+            if is_auth_failure_status(response.status()) {
+                return Err(anyhow::anyhow!(
+                    "AGENT_AUTH_FAILED: heartbeat rejected with {}. Update local server.json token and retry.",
+                    response.status()
+                ));
+            }
             if response.status() == reqwest::StatusCode::NOT_FOUND {
                 return Ok(FallbackOutcome::NotFound);
             }
@@ -2513,6 +2526,15 @@ mod tests {
                 "/api/heartbeat".to_string(),
             ]
         );
+    }
+
+    #[test]
+    fn auth_failure_statuses_are_classified_explicitly() {
+        assert!(super::is_auth_failure_status(reqwest::StatusCode::UNAUTHORIZED));
+        assert!(super::is_auth_failure_status(reqwest::StatusCode::FORBIDDEN));
+        assert!(!super::is_auth_failure_status(
+            reqwest::StatusCode::BAD_REQUEST
+        ));
     }
 
     #[test]
