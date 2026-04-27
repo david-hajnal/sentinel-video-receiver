@@ -13,13 +13,34 @@ use tokio::time::timeout;
 use tokio_rustls::TlsConnector;
 use tracing::{debug, info, warn};
 
+const HELP_TEXT: &str = "\
+TLS ingest test agent (local-lab tool)
+
+Usage:
+  ingest_agent --server HOST:PORT --agent-id ID --token TOKEN --ca PATH [options]
+
+Required:
+  --server HOST:PORT   or SERVER_ADDR
+  --agent-id ID        or AGENT_ID
+  --token TOKEN        or AGENT_TOKEN
+  --ca PATH            or AGENT_CA_CERT
+
+Options:
+  --streams LIST       Comma-separated stream ids (default: stream1)
+  --ping SEC           Ping timeout multiplier base (default: 15)
+  --rtp-ms MS          RTP tick interval in milliseconds (default: 100)
+  --event-sec SEC      Motion event interval in seconds (default: 10)
+  --help               Show this help
+
+Certificate verification bypass is intentionally not supported in this binary.";
+
+#[derive(Debug)]
 struct Settings {
     server_addr: String,
     agent_id: String,
     token: String,
     streams: Vec<String>,
     ca_cert: Option<PathBuf>,
-    insecure: bool,
     ping_interval: u64,
     rtp_interval_ms: u64,
     event_interval_sec: u64,
@@ -34,6 +55,11 @@ struct StreamState {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    if std::env::args().any(|arg| arg == "--help" || arg == "-h") {
+        println!("{HELP_TEXT}");
+        return Ok(());
+    }
+
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -46,7 +72,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (host, port) = split_host_port(&settings.server_addr)?;
     let server_name = make_server_name(&host)?;
 
-    let tls_config = build_tls_config(settings.insecure, settings.ca_cert.as_deref())?;
+    let tls_config = build_tls_config(settings.ca_cert.as_deref())?;
     let connector = TlsConnector::from(Arc::new(tls_config));
 
     let tcp = TcpStream::connect(format!("{host}:{port}")).await?;
@@ -62,6 +88,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         streams: settings.streams.clone(),
         timestamp_unix: SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs() as i64,
         nonce: random_nonce(),
+        streams_info: Vec::new(),
     };
     let hello_payload = serde_json::to_vec(&hello)?;
     write_record(
@@ -258,6 +285,9 @@ fn spawn_event_loop(
                     state: if next_state { "start".to_string() } else { "stop".to_string() },
                     event_ts_unix_ms: unix_millis(),
                     confidence: 0.9,
+                    camera_id: None,
+                    rule: None,
+                    event_id: None,
                 };
                 if let Ok(payload) = serde_json::to_vec(&event) {
                     let _ = write_record(
@@ -353,93 +383,45 @@ fn make_server_name(host: &str) -> Result<tokio_rustls::rustls::pki_types::Serve
 }
 
 fn build_tls_config(
-    insecure: bool,
     ca_cert: Option<&std::path::Path>,
 ) -> Result<tokio_rustls::rustls::ClientConfig, Box<dyn std::error::Error>> {
     let mut root_store = tokio_rustls::rustls::RootCertStore::empty();
-    if !insecure {
-        let ca_path = ca_cert.ok_or("--ca is required unless --insecure")?;
-        let mut reader = std::io::BufReader::new(std::fs::File::open(ca_path)?);
-        let certs = rustls_pemfile::certs(&mut reader)
-            .collect::<Result<Vec<_>, _>>()?;
-        root_store.add_parsable_certificates(certs);
-    }
+    let ca_path = ca_cert.ok_or("--ca or AGENT_CA_CERT is required")?;
+    let mut reader = std::io::BufReader::new(std::fs::File::open(ca_path)?);
+    let certs = rustls_pemfile::certs(&mut reader)
+        .collect::<Result<Vec<_>, _>>()?;
+    root_store.add_parsable_certificates(certs);
 
-    let mut config = tokio_rustls::rustls::ClientConfig::builder()
+    let config = tokio_rustls::rustls::ClientConfig::builder()
         .with_root_certificates(root_store)
         .with_no_client_auth();
-
-    if insecure {
-        config
-            .dangerous()
-            .set_certificate_verifier(Arc::new(NoVerifier));
-    }
 
     Ok(config)
 }
 
-#[derive(Debug)]
-struct NoVerifier;
-
-impl tokio_rustls::rustls::client::danger::ServerCertVerifier for NoVerifier {
-    fn verify_server_cert(
-        &self,
-        _end_entity: &tokio_rustls::rustls::pki_types::CertificateDer<'_>,
-        _intermediates: &[tokio_rustls::rustls::pki_types::CertificateDer<'_>],
-        _server_name: &tokio_rustls::rustls::pki_types::ServerName<'_>,
-        _ocsp: &[u8],
-        _now: tokio_rustls::rustls::pki_types::UnixTime,
-    ) -> Result<tokio_rustls::rustls::client::danger::ServerCertVerified, tokio_rustls::rustls::Error> {
-        Ok(tokio_rustls::rustls::client::danger::ServerCertVerified::assertion())
-    }
-
-    fn verify_tls12_signature(
-        &self,
-        _message: &[u8],
-        _cert: &tokio_rustls::rustls::pki_types::CertificateDer<'_>,
-        _dss: &tokio_rustls::rustls::DigitallySignedStruct,
-    ) -> Result<tokio_rustls::rustls::client::danger::HandshakeSignatureValid, tokio_rustls::rustls::Error> {
-        Ok(tokio_rustls::rustls::client::danger::HandshakeSignatureValid::assertion())
-    }
-
-    fn verify_tls13_signature(
-        &self,
-        _message: &[u8],
-        _cert: &tokio_rustls::rustls::pki_types::CertificateDer<'_>,
-        _dss: &tokio_rustls::rustls::DigitallySignedStruct,
-    ) -> Result<tokio_rustls::rustls::client::danger::HandshakeSignatureValid, tokio_rustls::rustls::Error> {
-        Ok(tokio_rustls::rustls::client::danger::HandshakeSignatureValid::assertion())
-    }
-
-    fn supported_verify_schemes(&self) -> Vec<tokio_rustls::rustls::SignatureScheme> {
-        use tokio_rustls::rustls::SignatureScheme::*;
-        vec![
-            ECDSA_NISTP256_SHA256,
-            ECDSA_NISTP384_SHA384,
-            ECDSA_NISTP521_SHA512,
-            RSA_PSS_SHA256,
-            RSA_PSS_SHA384,
-            RSA_PSS_SHA512,
-            RSA_PKCS1_SHA256,
-            RSA_PKCS1_SHA384,
-            RSA_PKCS1_SHA512,
-            ED25519,
-        ]
-    }
+fn load_settings() -> Result<Settings, Box<dyn std::error::Error>> {
+    let args = std::env::args().skip(1).collect::<Vec<_>>();
+    parse_settings_from(args, |key| std::env::var(key).ok())
 }
 
-fn load_settings() -> Result<Settings, Box<dyn std::error::Error>> {
+fn parse_settings_from<I, F>(
+    args: I,
+    mut env_get: F,
+) -> Result<Settings, Box<dyn std::error::Error>>
+where
+    I: IntoIterator<Item = String>,
+    F: FnMut(&str) -> Option<String>,
+{
     let mut server_addr = None;
     let mut agent_id = None;
     let mut token = None;
     let mut streams = None;
     let mut ca_cert = None;
-    let mut insecure = false;
     let mut ping_interval = 15u64;
     let mut rtp_interval_ms = 100u64;
     let mut event_interval_sec = 10u64;
 
-    let mut args = std::env::args().skip(1);
+    let mut args = args.into_iter();
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--server" => server_addr = args.next(),
@@ -447,7 +429,7 @@ fn load_settings() -> Result<Settings, Box<dyn std::error::Error>> {
             "--token" => token = args.next(),
             "--streams" => streams = args.next(),
             "--ca" => ca_cert = args.next().map(PathBuf::from),
-            "--insecure" => insecure = true,
+            "--insecure" => return Err("--insecure is not supported".into()),
             "--ping" => {
                 if let Some(v) = args.next() {
                     ping_interval = v.parse().unwrap_or(ping_interval)
@@ -468,31 +450,75 @@ fn load_settings() -> Result<Settings, Box<dyn std::error::Error>> {
     }
 
     let server_addr = server_addr
-        .or_else(|| std::env::var("SERVER_ADDR").ok())
+        .or_else(|| env_get("SERVER_ADDR"))
         .ok_or("--server or SERVER_ADDR is required")?;
     let agent_id = agent_id
-        .or_else(|| std::env::var("AGENT_ID").ok())
+        .or_else(|| env_get("AGENT_ID"))
         .ok_or("--agent-id or AGENT_ID is required")?;
     let token = token
-        .or_else(|| std::env::var("AGENT_TOKEN").ok())
+        .or_else(|| env_get("AGENT_TOKEN"))
         .ok_or("--token or AGENT_TOKEN is required")?;
     let streams = streams
-        .or_else(|| std::env::var("STREAMS").ok())
+        .or_else(|| env_get("STREAMS"))
         .unwrap_or_else(|| "stream1".to_string())
         .split(',')
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
         .collect::<Vec<_>>();
+    let ca_cert = ca_cert
+        .or_else(|| env_get("AGENT_CA_CERT").map(PathBuf::from))
+        .ok_or("--ca or AGENT_CA_CERT is required")?;
 
     Ok(Settings {
         server_addr,
         agent_id,
         token,
         streams,
-        ca_cert,
-        insecure,
+        ca_cert: Some(ca_cert),
         ping_interval,
         rtp_interval_ms,
         event_interval_sec,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_settings_from;
+
+    fn sample_args() -> Vec<String> {
+        vec![
+            "--server".to_string(),
+            "127.0.0.1:7443".to_string(),
+            "--agent-id".to_string(),
+            "agent-1".to_string(),
+            "--token".to_string(),
+            "secret".to_string(),
+            "--streams".to_string(),
+            "cam-1".to_string(),
+        ]
+    }
+
+    #[test]
+    fn rejects_insecure_flag() {
+        let mut args = sample_args();
+        args.push("--insecure".to_string());
+        args.push("--ca".to_string());
+        args.push("dev-ca.pem".to_string());
+
+        let err = parse_settings_from(args, |_| None).expect_err("expected insecure to be rejected");
+        assert!(
+            err.to_string().contains("--insecure is not supported"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn requires_ca_in_args_or_env() {
+        let args = sample_args();
+        let err = parse_settings_from(args, |_| None).expect_err("expected missing ca to fail");
+        assert!(
+            err.to_string().contains("--ca or AGENT_CA_CERT is required"),
+            "unexpected error: {err}"
+        );
+    }
 }
