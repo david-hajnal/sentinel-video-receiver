@@ -20,6 +20,8 @@ use sentinel_rtp_cam::server_pipeline::{run_stream, StreamConfig, StreamMsg};
 use sentinel_rtp_cam::AgentConfig;
 
 const DEFAULT_CAMERA_CONFIG_PATH: &str = "/etc/sentinel_rtp_cam/camera.json";
+const DEFAULT_SERVER_BIND: &str = "127.0.0.1:9000";
+const INSECURE_DEFAULT_SERVER_TOKEN: &str = "devtoken";
 
 fn runtime_var(name: &str) -> Option<String> {
     AgentConfig::runtime_var(name).filter(|v| !v.trim().is_empty())
@@ -33,6 +35,38 @@ fn runtime_u64(name: &str, default: u64) -> u64 {
 
 fn runtime_opt_u64(name: &str) -> Option<u64> {
     runtime_var(name).and_then(|v| v.parse::<u64>().ok())
+}
+
+fn resolved_server_bind(bind: Option<String>) -> String {
+    bind.unwrap_or_else(|| DEFAULT_SERVER_BIND.to_string())
+}
+
+fn runtime_server_bind() -> String {
+    resolved_server_bind(runtime_var("SERVER_BIND"))
+}
+
+fn validate_server_token(token: Option<String>) -> Result<String> {
+    match token {
+        None => Err(anyhow!(
+            "SERVER_TOKEN is required and must be non-empty; refusing to start"
+        )),
+        Some(token) if token == INSECURE_DEFAULT_SERVER_TOKEN => Err(anyhow!(
+            "SERVER_TOKEN must not be set to '{}' in ingest mode",
+            INSECURE_DEFAULT_SERVER_TOKEN
+        )),
+        Some(token) => Ok(token),
+    }
+}
+
+fn validated_server_token() -> Result<String> {
+    validate_server_token(runtime_var("SERVER_TOKEN"))
+}
+
+fn bind_scope(bind: &str) -> &'static str {
+    match bind.parse::<SocketAddr>() {
+        Ok(addr) if addr.ip().is_loopback() => "loopback-only",
+        _ => "network-exposed",
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -239,8 +273,9 @@ async fn main() -> Result<()> {
         );
     }
 
-    let bind = runtime_var("SERVER_BIND").unwrap_or_else(|| "0.0.0.0:9000".to_string());
-    let token = runtime_var("SERVER_TOKEN").unwrap_or_else(|| "devtoken".to_string());
+    let bind = runtime_server_bind();
+    let bind_scope = bind_scope(&bind);
+    let token = validated_server_token()?;
 
     let clip_dir = PathBuf::from(runtime_var("CLIP_DIR").unwrap_or_else(|| "clips".to_string()));
     let pre_secs: u64 = runtime_u64("CLIP_PRE_SECS", 3);
@@ -263,11 +298,18 @@ async fn main() -> Result<()> {
     let listener = TcpListener::bind(&bind).await?;
     info!(
         bind = %bind,
+        bind_scope,
         pipeline_version = ?live_pipeline_version,
         live_hls_segment_secs,
         live_hls_window_secs,
         "Server ingest listening"
     );
+    if bind_scope != "loopback-only" {
+        warn!(
+            bind = %bind,
+            "SERVER_BIND is non-loopback; use firewalling or TLS fronting for safe exposure"
+        );
+    }
     match live_pipeline_version {
         LivePipelineVersion::V1 => {
             info!(
@@ -701,8 +743,9 @@ fn ensure_stream(
 #[cfg(test)]
 mod tests {
     use super::{
-        decode_h264_sync_seed, ensure_stream, parse_motion_msg, send_or_recreate_stream_msg,
-        HelloStream, LivePipelineVersion, StreamHandle, TEST_PIPELINE_HOOK,
+        decode_h264_sync_seed, ensure_stream, parse_motion_msg, resolved_server_bind,
+        send_or_recreate_stream_msg, validate_server_token, HelloStream, LivePipelineVersion,
+        StreamHandle, INSECURE_DEFAULT_SERVER_TOKEN, TEST_PIPELINE_HOOK,
     };
     use anyhow::{anyhow, Result};
     use sentinel_rtp_cam::server_pipeline::StreamMsg;
@@ -814,6 +857,28 @@ mod tests {
             }
             other => panic!("expected motion msg, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn default_bind_is_loopback() {
+        assert_eq!(resolved_server_bind(None), "127.0.0.1:9000");
+    }
+
+    #[test]
+    fn missing_token_is_rejected() {
+        assert!(validate_server_token(None).is_err());
+    }
+
+    #[test]
+    fn devtoken_is_rejected() {
+        assert!(validate_server_token(Some(INSECURE_DEFAULT_SERVER_TOKEN.to_string())).is_err());
+    }
+
+    #[test]
+    fn explicit_non_default_token_is_accepted() {
+        let token = validate_server_token(Some("prod-token-abc123".to_string()))
+            .expect("non-default token should be accepted");
+        assert_eq!(token, "prod-token-abc123");
     }
 
     #[test]
