@@ -94,11 +94,15 @@ Then use `server.local:9000` in `camera.json`.
 {
   "server": {
     "enabled": true,
-    "base_url": "http://localhost:8080",
+    "base_url": "https://admin.example.com",
     "bearer_token": "PUT_AGENT_TOKEN_HERE"
   }
 }
 ```
+
+Use `https://` for non-local servers. `http://` is accepted only for loopback
+(`localhost`, `127.0.0.1`, `::1`) unless `ALLOW_INSECURE_SERVER_HTTP=true` is
+explicitly set for local development.
 
 `/etc/sentinel_rtp_cam/camera.json`
 

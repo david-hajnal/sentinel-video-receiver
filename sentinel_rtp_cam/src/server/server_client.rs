@@ -830,7 +830,7 @@ async fn post_heartbeat(
     config: &ServerConfig,
     payload: &Value,
 ) -> Result<()> {
-    let base = config.base_url.trim_end_matches('/');
+    let base = config.base_url_prefix();
     let posted = try_fallback_paths(&["/api/v1/heartbeat", "/api/heartbeat"], |path| {
         let url = format!("{base}{path}");
         let payload_json = payload.to_string();
@@ -1007,7 +1007,7 @@ async fn fetch_restart_job_command(
     client: &reqwest::Client,
     config: &ServerConfig,
 ) -> Result<Option<RestartJobCommand>> {
-    let base = config.base_url.trim_end_matches('/');
+    let base = config.base_url_prefix();
     let payload = try_fallback_paths(
         &["/api/v1/agent/restart/job", "/api/agent/restart/job"],
         |path| {
@@ -1193,7 +1193,7 @@ async fn fetch_firmware_job_command(
     client: &reqwest::Client,
     config: &ServerConfig,
 ) -> Result<Option<FirmwareJobCommand>> {
-    let base = config.base_url.trim_end_matches('/');
+    let base = config.base_url_prefix();
     for path in ["/api/agent/firmware/job", "/api/v1/agent/firmware/job"] {
         let url = format!("{base}{path}");
         let response = client
@@ -1422,7 +1422,7 @@ async fn fetch_onvif_probe_job_command(
     client: &reqwest::Client,
     config: &ServerConfig,
 ) -> Result<Option<OnvifProbeJobCommand>> {
-    let base = config.base_url.trim_end_matches('/');
+    let base = config.base_url_prefix();
     let payload = try_fallback_paths(
         &["/api/agent/onvif/job", "/api/v1/agent/onvif/job"],
         |path| {
@@ -1451,7 +1451,7 @@ async fn post_onvif_probe_report(
     config: &ServerConfig,
     payload: &Value,
 ) -> Result<()> {
-    let base = config.base_url.trim_end_matches('/');
+    let base = config.base_url_prefix();
     let posted = try_fallback_paths(
         &["/api/agent/onvif/report", "/api/v1/agent/onvif/report"],
         |path| {

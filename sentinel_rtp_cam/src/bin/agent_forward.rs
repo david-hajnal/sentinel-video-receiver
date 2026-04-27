@@ -220,7 +220,7 @@ fn start_runtime(desired: &DesiredRuntime) -> Result<AgentRuntime> {
     );
     let mut tasks = Vec::new();
     if runtime_var("SERVER_BASE_URL").is_some() && runtime_var("SERVER_BEARER_TOKEN").is_some() {
-        let server_cfg = AgentConfig::from_env().server;
+        let server_cfg = AgentConfig::from_env()?.server;
         let applied_config_version = applied_config_version.clone();
         let camera_targets = camera_targets.clone();
         let heartbeat_agent_id = agent_id.clone();
@@ -415,7 +415,14 @@ async fn main() -> Result<()> {
             serde_json::Value::Object(Default::default())
         }
     };
-    let config_value = AgentConfig::merge_server_camera_configs(&camera_value, &server_value);
+    let config_value = match AgentConfig::merge_server_camera_configs(&camera_value, &server_value)
+    {
+        Ok(value) => value,
+        Err(error) => {
+            server_error = Some(error.to_string());
+            serde_json::Value::Object(Default::default())
+        }
+    };
     let mut last_logged_intervals = None;
     apply_runtime_overrides_and_log_intervals(&config_value, &mut last_logged_intervals);
 
@@ -474,7 +481,15 @@ async fn main() -> Result<()> {
             }
         };
         let mut config_value =
-            AgentConfig::merge_server_camera_configs(&camera_value, &server_value);
+            match AgentConfig::merge_server_camera_configs(&camera_value, &server_value) {
+                Ok(value) => value,
+                Err(error) => {
+                    if last_status.elapsed() > Duration::from_secs(30) {
+                        warn!(error = %error, "Invalid server base URL; waiting for config");
+                    }
+                    camera_value.clone()
+                }
+            };
         apply_runtime_overrides_and_log_intervals(&config_value, &mut last_logged_intervals);
 
         let mut desired = match desired_runtime_from_config(&config_value) {
@@ -509,10 +524,19 @@ async fn main() -> Result<()> {
                         match AgentConfig::load_camera_json(&camera_config_path) {
                             Ok(value) => {
                                 camera_value = value;
-                                config_value = AgentConfig::merge_server_camera_configs(
+                                config_value = match AgentConfig::merge_server_camera_configs(
                                     &camera_value,
                                     &server_value,
-                                );
+                                ) {
+                                    Ok(value) => value,
+                                    Err(error) => {
+                                        warn!(
+                                            error = %error,
+                                            "Reloaded server config has invalid base URL"
+                                        );
+                                        camera_value.clone()
+                                    }
+                                };
                                 apply_runtime_overrides_and_log_intervals(
                                     &config_value,
                                     &mut last_logged_intervals,
@@ -1351,7 +1375,8 @@ mod tests {
 
         let server_value = AgentConfig::load_server_json(&server_path).expect("read server config");
         let camera_value = AgentConfig::load_camera_json(&camera_path).expect("read camera config");
-        let merged = AgentConfig::merge_server_camera_configs(&camera_value, &server_value);
+        let merged = AgentConfig::merge_server_camera_configs(&camera_value, &server_value)
+            .expect("merge server+camera config");
         AgentConfig::apply_json_env_overrides(&merged);
         let cams = load_cameras_from_env().expect("load cameras from merged config");
         let targets = build_camera_heartbeat_targets(&cams, &merged);

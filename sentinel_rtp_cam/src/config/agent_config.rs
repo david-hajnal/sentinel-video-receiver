@@ -2,12 +2,13 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
 use std::fs;
+use std::io;
 use std::path::Path;
 #[cfg(test)]
 use std::sync::Mutex;
 use std::sync::{OnceLock, RwLock};
 use std::time::Duration;
-use url::Url;
+use url::{Host, Url};
 
 static RUNTIME_OVERRIDES: OnceLock<RwLock<HashMap<String, String>>> = OnceLock::new();
 #[cfg(test)]
@@ -44,7 +45,7 @@ pub struct ServerConfig {
     /// Whether server integration is enabled
     pub enabled: bool,
 
-    /// Base URL for server API (e.g., "http://127.0.0.1:8080")
+    /// Base URL for server API (e.g., "https://admin.example.com")
     pub base_url: String,
 
     /// Bearer token for authentication
@@ -55,6 +56,12 @@ pub struct ServerConfig {
 
     /// Maximum number of retry attempts before dropping message (0 = infinite)
     pub max_retries: u32,
+}
+
+impl ServerConfig {
+    pub fn base_url_prefix(&self) -> &str {
+        self.base_url.trim_end_matches('/')
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -68,7 +75,7 @@ pub struct CleanupConfig {
 
 impl AgentConfig {
     /// Load configuration from runtime overrides initialized from JSON.
-    pub fn from_env() -> Self {
+    pub fn from_env() -> io::Result<Self> {
         let camera_id = Self::runtime_var("CAMERA_ID")
             .or_else(|| Self::runtime_var("ONVIF_HOST"))
             .unwrap_or_else(|| "unknown-camera".to_string());
@@ -77,10 +84,20 @@ impl AgentConfig {
             enabled: Self::runtime_bool("MOTION_ENABLED", true),
         };
 
+        let server_base_url = Self::runtime_var("SERVER_BASE_URL")
+            .unwrap_or_else(|| "http://127.0.0.1:8080".to_string());
+        let server_base_url =
+            validate_server_base_url(&server_base_url, allow_insecure_server_http()).map_err(
+                |error| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("Invalid SERVER_BASE_URL: {error}"),
+                    )
+                },
+            )?;
         let server = ServerConfig {
             enabled: Self::runtime_bool("SERVER_ENABLED", false),
-            base_url: Self::runtime_var("SERVER_BASE_URL")
-                .unwrap_or_else(|| "http://127.0.0.1:8080".to_string()),
+            base_url: server_base_url,
             bearer_token: Self::runtime_var("SERVER_BEARER_TOKEN")
                 .unwrap_or_else(|| "devtoken".to_string()),
             retry_interval_secs: Self::runtime_u64("SERVER_RETRY_INTERVAL_SECS", 2),
@@ -92,27 +109,27 @@ impl AgentConfig {
             min_free_bytes: Self::runtime_u64("CLIP_MIN_FREE_BYTES", 2_000_000_000),
         };
 
-        Self {
+        Ok(Self {
             camera_id,
             motion,
             server,
             cleanup,
-        }
+        })
     }
 
     /// Load configuration from a JSON file, creating a default empty file if missing.
-    pub fn from_json_file(path: &Path) -> std::io::Result<Self> {
+    pub fn from_json_file(path: &Path) -> io::Result<Self> {
         let value = Self::load_json_value(path)?;
-        Ok(Self::from_json_value(value))
+        Self::from_json_value(value)
     }
 
     /// Load the raw JSON value from disk, creating a default empty file if missing.
-    pub fn load_json_value(path: &Path) -> std::io::Result<Value> {
+    pub fn load_json_value(path: &Path) -> io::Result<Value> {
         Self::load_json_value_with_default(path, default_empty_json())
     }
 
     /// Load the raw JSON value from disk, creating a file from the provided default if missing.
-    pub fn load_json_value_with_default(path: &Path, default: Value) -> std::io::Result<Value> {
+    pub fn load_json_value_with_default(path: &Path, default: Value) -> io::Result<Value> {
         if !path.exists() {
             if let Some(parent) = path.parent() {
                 fs::create_dir_all(parent)?;
@@ -129,22 +146,24 @@ impl AgentConfig {
     }
 
     /// Load the server config JSON, creating the default if missing.
-    pub fn load_server_json(path: &Path) -> std::io::Result<Value> {
-        Self::load_json_value_with_default(path, Self::default_server_json())
+    pub fn load_server_json(path: &Path) -> io::Result<Value> {
+        let value = Self::load_json_value_with_default(path, Self::default_server_json())?;
+        validate_server_base_url_in_config_value(&value)?;
+        Ok(value)
     }
 
     /// Load the camera config JSON, creating the default if missing.
-    pub fn load_camera_json(path: &Path) -> std::io::Result<Value> {
+    pub fn load_camera_json(path: &Path) -> io::Result<Value> {
         Self::load_json_value_with_default(path, Self::default_camera_json())
     }
 
     /// Build the agent config from a JSON value (merging with defaults).
-    pub fn from_json_value(value: Value) -> Self {
+    pub fn from_json_value(value: Value) -> io::Result<Self> {
         Self::merge_with_defaults(value)
     }
 
     /// Overwrite the JSON file with the provided config value.
-    pub fn write_json_file(path: &Path, value: &Value) -> std::io::Result<()> {
+    pub fn write_json_file(path: &Path, value: &Value) -> io::Result<()> {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
@@ -153,7 +172,7 @@ impl AgentConfig {
     }
 
     /// Merge an update into the existing JSON file and persist it.
-    pub fn merge_json_file(path: &Path, update: &Value) -> std::io::Result<()> {
+    pub fn merge_json_file(path: &Path, update: &Value) -> io::Result<()> {
         Self::merge_json_file_with_default(path, update, default_empty_json())
     }
 
@@ -162,7 +181,7 @@ impl AgentConfig {
         path: &Path,
         update: &Value,
         default: Value,
-    ) -> std::io::Result<()> {
+    ) -> io::Result<()> {
         let mut current = Self::load_json_value_with_default(path, default)?;
         merge_value(&mut current, update);
         Self::write_json_file(path, &current)
@@ -172,7 +191,7 @@ impl AgentConfig {
     ///
     /// Canonical remote configs carry cameras[]; when one arrives, stale legacy
     /// top-level camera fields must not survive from an older local file.
-    pub fn merge_remote_camera_json(path: &Path, update: &Value) -> std::io::Result<()> {
+    pub fn merge_remote_camera_json(path: &Path, update: &Value) -> io::Result<()> {
         let mut current = Self::load_json_value_with_default(path, Self::default_camera_json())?;
         let mut update = update.clone();
         if has_canonical_cameras(&update) {
@@ -488,11 +507,8 @@ impl AgentConfig {
 
     pub fn runtime_bool(key: &str, default: bool) -> bool {
         Self::runtime_var(key)
-            .and_then(|v| match v.as_str() {
-                "1" | "true" | "TRUE" | "yes" | "YES" => Some(true),
-                "0" | "false" | "FALSE" | "no" | "NO" => Some(false),
-                _ => None,
-            })
+            .as_deref()
+            .and_then(parse_bool)
             .unwrap_or(default)
     }
 
@@ -539,7 +555,11 @@ impl AgentConfig {
         merge_value(base, update);
     }
 
-    pub fn merge_server_camera_configs(camera_value: &Value, server_value: &Value) -> Value {
+    pub fn merge_server_camera_configs(
+        camera_value: &Value,
+        server_value: &Value,
+    ) -> io::Result<Value> {
+        validate_server_base_url_in_config_value(server_value)?;
         let mut merged = camera_value.clone();
         if let Some(server_section) = server_value.get("server") {
             if has_non_null(server_section) {
@@ -548,7 +568,7 @@ impl AgentConfig {
                 }
             }
         }
-        merged
+        Ok(merged)
     }
 
     pub fn default_server_json() -> Value {
@@ -732,6 +752,75 @@ fn merge_u64(value: &Value, key: &str, default: u64) -> u64 {
 
 fn merge_with_section<'a>(value: &'a Value, key: &str) -> &'a Value {
     value.get(key).unwrap_or(&Value::Null)
+}
+
+fn allow_insecure_server_http() -> bool {
+    AgentConfig::runtime_var("ALLOW_INSECURE_SERVER_HTTP")
+        .as_deref()
+        .and_then(parse_bool)
+        .or_else(|| {
+            std::env::var("ALLOW_INSECURE_SERVER_HTTP")
+                .ok()
+                .as_deref()
+                .and_then(parse_bool)
+        })
+        .unwrap_or(false)
+}
+
+fn is_local_server_host(host: &Host<&str>) -> bool {
+    match host {
+        Host::Domain(domain) => domain.eq_ignore_ascii_case("localhost"),
+        Host::Ipv4(addr) => addr.is_loopback(),
+        Host::Ipv6(addr) => addr.is_loopback(),
+    }
+}
+
+fn validate_server_base_url_in_config_value(value: &Value) -> io::Result<()> {
+    let Some(base_url) = value
+        .get("server")
+        .and_then(|server| server.get("base_url"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|base_url| !base_url.is_empty())
+    else {
+        return Ok(());
+    };
+    validate_server_base_url(base_url, allow_insecure_server_http())
+        .map(|_| ())
+        .map_err(|error| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("Invalid server.base_url in config: {error}"),
+            )
+        })
+}
+
+pub fn validate_server_base_url(
+    base_url: &str,
+    allow_insecure_http: bool,
+) -> Result<String, String> {
+    let trimmed = base_url.trim();
+    if trimmed.is_empty() {
+        return Err("value is empty".to_string());
+    }
+    let parsed = Url::parse(trimmed).map_err(|error| format!("invalid URL: {error}"))?;
+    let Some(host) = parsed.host() else {
+        return Err("missing host".to_string());
+    };
+
+    match parsed.scheme() {
+        "https" => Ok(parsed.to_string()),
+        "http" => {
+            if allow_insecure_http || is_local_server_host(&host) {
+                Ok(parsed.to_string())
+            } else {
+                Err("http:// is only allowed for localhost/loopback unless ALLOW_INSECURE_SERVER_HTTP=true; use https:// for remote servers".to_string())
+            }
+        }
+        scheme => Err(format!(
+            "unsupported scheme '{scheme}'; expected https:// or http://"
+        )),
+    }
 }
 
 fn merge_camera_id(value: &Value, default: &str) -> String {
@@ -965,6 +1054,14 @@ fn value_to_string(value: &Value) -> Option<String> {
     }
 }
 
+fn parse_bool(value: &str) -> Option<bool> {
+    match value.trim() {
+        "1" | "true" | "TRUE" | "yes" | "YES" => Some(true),
+        "0" | "false" | "FALSE" | "no" | "NO" => Some(false),
+        _ => None,
+    }
+}
+
 fn bool_to_runtime_string(value: bool) -> String {
     if value {
         "1".to_string()
@@ -1023,7 +1120,7 @@ fn set_map_if_unset_bool(map: &mut HashMap<String, String>, key: &str, value: Op
 }
 
 impl AgentConfig {
-    fn merge_with_defaults(value: Value) -> Self {
+    fn merge_with_defaults(value: Value) -> io::Result<Self> {
         let defaults = AgentConfig::default();
 
         let motion_val = merge_with_section(&value, "motion");
@@ -1032,14 +1129,25 @@ impl AgentConfig {
         let camera_id = merge_camera_id(&value, &defaults.camera_id);
         let motion_enabled = merge_motion_enabled(&value, defaults.motion.enabled);
 
-        AgentConfig {
+        let server_base_url_raw = merge_string(server_val, "base_url", &defaults.server.base_url);
+        let server_base_url =
+            validate_server_base_url(&server_base_url_raw, allow_insecure_server_http()).map_err(
+                |error| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("Invalid server.base_url: {error}"),
+                    )
+                },
+            )?;
+
+        Ok(AgentConfig {
             camera_id,
             motion: MotionConfig {
                 enabled: merge_bool(motion_val, "enabled", motion_enabled),
             },
             server: ServerConfig {
                 enabled: merge_bool(server_val, "enabled", defaults.server.enabled),
-                base_url: merge_string(server_val, "base_url", &defaults.server.base_url),
+                base_url: server_base_url,
                 bearer_token: merge_string(
                     server_val,
                     "bearer_token",
@@ -1068,7 +1176,7 @@ impl AgentConfig {
                     defaults.cleanup.min_free_bytes,
                 ),
             },
-        }
+        })
     }
 }
 
@@ -1417,6 +1525,102 @@ mod tests {
             "aff8812b-c6be-4e59-aefd-40b59b425d92"
         );
         assert_eq!(written["cleanup"]["min_free_bytes"], 12345);
+
+        fs::remove_dir_all(dir).expect("remove test dir");
+    }
+
+    #[test]
+    fn validate_server_base_url_accepts_localhost_http() {
+        let normalized = super::validate_server_base_url("http://localhost:8080", false)
+            .expect("localhost http should be allowed");
+        assert_eq!(normalized, "http://localhost:8080/");
+    }
+
+    #[test]
+    fn validate_server_base_url_rejects_remote_http_without_override() {
+        let error = super::validate_server_base_url("http://example.com:8080", false)
+            .expect_err("remote http should be rejected");
+        assert!(error.to_string().contains("https://"));
+    }
+
+    #[test]
+    fn validate_server_base_url_accepts_remote_https() {
+        let normalized = super::validate_server_base_url("https://example.com:8443", false)
+            .expect("remote https should be allowed");
+        assert_eq!(normalized, "https://example.com:8443/");
+    }
+
+    #[test]
+    fn validate_server_base_url_override_allows_remote_http_only_when_enabled() {
+        assert!(super::validate_server_base_url("http://example.com", false).is_err());
+        assert!(super::validate_server_base_url("http://example.com", true).is_ok());
+    }
+
+    #[test]
+    fn from_env_rejects_remote_http_base_url_without_override() {
+        let _guard = EnvGuard::new();
+        AgentConfig::runtime_restore(
+            [(
+                "SERVER_BASE_URL".to_string(),
+                "http://example.com".to_string(),
+            )]
+            .into_iter()
+            .collect(),
+        );
+        let error = AgentConfig::from_env().expect_err("from_env should reject insecure URL");
+        assert!(error.to_string().contains("SERVER_BASE_URL"));
+    }
+
+    #[test]
+    fn from_env_allows_remote_http_base_url_with_override() {
+        let _guard = EnvGuard::new();
+        AgentConfig::runtime_restore(
+            [
+                (
+                    "SERVER_BASE_URL".to_string(),
+                    "http://example.com".to_string(),
+                ),
+                ("ALLOW_INSECURE_SERVER_HTTP".to_string(), "true".to_string()),
+            ]
+            .into_iter()
+            .collect(),
+        );
+        let config = AgentConfig::from_env().expect("from_env should allow override");
+        assert_eq!(config.server.base_url, "http://example.com/");
+    }
+
+    #[test]
+    fn merge_server_camera_configs_rejects_remote_http_base_url() {
+        let error = AgentConfig::merge_server_camera_configs(
+            &json!({ "cameras": [] }),
+            &json!({
+                "server": {
+                    "base_url": "http://example.com:8080"
+                }
+            }),
+        )
+        .expect_err("merge should reject insecure URL");
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn load_server_json_rejects_remote_http_base_url() {
+        let dir = unique_test_dir("invalid-server-http");
+        fs::create_dir_all(&dir).expect("test dir");
+        let server_path = dir.join("server.json");
+        AgentConfig::write_json_file(
+            &server_path,
+            &json!({
+                "server": {
+                    "base_url": "http://example.com:8080"
+                }
+            }),
+        )
+        .expect("write server config");
+
+        let error = AgentConfig::load_server_json(&server_path)
+            .expect_err("load_server_json should reject insecure URL");
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
 
         fs::remove_dir_all(dir).expect("remove test dir");
     }

@@ -1,8 +1,8 @@
 {
   "server": {
     "enabled": true,
-    "base_url": "http://localhost:8000",
-    "bearer_token": 01KNXJ3SZWJYE01YHJMVTPD4J8,
+    "base_url": "https://admin.example.com",
+    "bearer_token": "PUT_AGENT_TOKEN_HERE",
     "retry_interval_secs": null,
     "max_retries": null
   }

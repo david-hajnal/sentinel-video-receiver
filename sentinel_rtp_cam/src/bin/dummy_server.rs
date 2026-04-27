@@ -442,7 +442,8 @@ async fn main() -> anyhow::Result<()> {
     let camera_value =
         AgentConfig::load_camera_json(std::path::Path::new(DEFAULT_CAMERA_CONFIG_PATH))
             .unwrap_or_else(|_| serde_json::Value::Object(Default::default()));
-    let config_value = AgentConfig::merge_server_camera_configs(&camera_value, &server_value);
+    let config_value = AgentConfig::merge_server_camera_configs(&camera_value, &server_value)
+        .unwrap_or_else(|_| serde_json::Value::Object(Default::default()));
     AgentConfig::apply_json_env_overrides(&config_value);
 
     // Initialize tracing
