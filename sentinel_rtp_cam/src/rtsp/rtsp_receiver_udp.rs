@@ -1,8 +1,14 @@
 use anyhow::{bail, Result};
 use base64::Engine;
-use tokio::{net::UdpSocket, sync::mpsc};
+use std::net::{IpAddr, SocketAddr};
+use std::time::Duration;
+use tokio::{
+    net::{lookup_host, UdpSocket},
+    sync::mpsc,
+    time::{timeout, Instant},
+};
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 use crate::config::AgentConfig;
 use crate::core::h264_depacketize::H264Depacketizer;
@@ -105,6 +111,87 @@ fn header_value<'a>(headers: &'a [(String, String)], key: &str) -> Option<&'a st
         .map(|(_, v)| v.as_str())
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ExpectedRtpSource {
+    ip: IpAddr,
+    port: Option<u16>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SourceRejectReason {
+    UnexpectedIp,
+    UnexpectedPort,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SourceValidation {
+    Accept,
+    Reject(SourceRejectReason),
+}
+
+#[derive(Clone, Debug)]
+struct SourceValidator {
+    expected: Option<ExpectedRtpSource>,
+    pinned_ip: Option<IpAddr>,
+}
+
+impl SourceValidator {
+    fn new(expected: Option<ExpectedRtpSource>) -> Self {
+        Self {
+            expected,
+            pinned_ip: None,
+        }
+    }
+
+    fn validate(&mut self, sender: SocketAddr) -> SourceValidation {
+        if let Some(expected) = self.expected {
+            if sender.ip() != expected.ip {
+                return SourceValidation::Reject(SourceRejectReason::UnexpectedIp);
+            }
+            if let Some(expected_port) = expected.port {
+                if sender.port() != expected_port {
+                    return SourceValidation::Reject(SourceRejectReason::UnexpectedPort);
+                }
+            }
+            return SourceValidation::Accept;
+        }
+
+        if let Some(pinned_ip) = self.pinned_ip {
+            if sender.ip() != pinned_ip {
+                return SourceValidation::Reject(SourceRejectReason::UnexpectedIp);
+            }
+            return SourceValidation::Accept;
+        }
+
+        // Pin to the source IP of the first valid RTP packet.
+        self.pinned_ip = Some(sender.ip());
+        SourceValidation::Accept
+    }
+}
+
+fn should_log_rate_limited(count: u64) -> bool {
+    count <= 3 || count.is_multiple_of(100)
+}
+
+fn parse_server_rtp_port(transport: &str) -> Option<u16> {
+    for part in transport.split(';') {
+        let part = part.trim();
+        if let Some(v) = part.strip_prefix("server_port=") {
+            let (rtp_port, _) = v.split_once('-')?;
+            return rtp_port.parse().ok();
+        }
+    }
+    None
+}
+
+async fn resolve_rtsp_host_ip(host: &str, port: u16) -> Option<IpAddr> {
+    if let Ok(ip) = host.parse::<IpAddr>() {
+        return Some(ip);
+    }
+    let mut addrs = lookup_host((host, port)).await.ok()?;
+    addrs.next().map(|addr| addr.ip())
+}
+
 /// Receives RTP/H264 over UDP and emits Annex-B NALs + RTP timestamps.
 pub async fn run_udp_receiver(
     cfg: UdpReceiverConfig,
@@ -188,6 +275,8 @@ pub async fn run_udp_receiver(
         }
         bail!("SETUP failed: {}", r.status);
     }
+    let negotiated_transport = header_value(&r.headers, "Transport").unwrap_or("");
+    let negotiated_server_rtp_port = parse_server_rtp_port(negotiated_transport);
     c.set_session_from(&r);
 
     // PLAY
@@ -205,6 +294,24 @@ pub async fn run_udp_receiver(
     let sock = UdpSocket::bind(("0.0.0.0", cfg.rtp_port)).await?;
     info!(port = cfg.rtp_port, "RTP receiving on UDP socket");
 
+    let expected_rtp_source = resolve_rtsp_host_ip(&cfg.host, cfg.port)
+        .await
+        .map(|ip| ExpectedRtpSource {
+            ip,
+            port: negotiated_server_rtp_port,
+        });
+    let mut source_validator = SourceValidator::new(expected_rtp_source);
+    let mut source_mismatch_count: u64 = 0;
+    if let Some(expected) = expected_rtp_source {
+        info!(
+            expected_ip = %expected.ip,
+            expected_port = expected.port,
+            "RTP source validation configured from RTSP setup"
+        );
+    } else {
+        info!("RTP source validation will pin to first valid packet source IP");
+    }
+
     let mut dep = H264Depacketizer::new();
     let mut gate = H264SyncGate::new(true);
     if let (Some(sps), Some(pps)) = (track.sprop_sps, track.sprop_pps) {
@@ -214,6 +321,8 @@ pub async fn run_udp_receiver(
 
     // continuity
     let mut expected_seq: Option<u16> = None;
+    let mut first_valid_rtp = false;
+    let startup_deadline = Instant::now() + Duration::from_secs(10);
 
     loop {
         tokio::select! {
@@ -222,8 +331,23 @@ pub async fn run_udp_receiver(
                 let _ = c.request("TEARDOWN", &rtsp_url, &common_headers, None).await;
                 break;
             }
-            r = sock.recv_from(&mut buf) => {
-                let (n, _src) = r?;
+            r = async {
+                if first_valid_rtp {
+                    sock.recv_from(&mut buf).await.map(Some)
+                } else {
+                    let remaining = startup_deadline.saturating_duration_since(Instant::now());
+                    if remaining.is_zero() {
+                        return Ok(None);
+                    }
+                    match timeout(remaining, sock.recv_from(&mut buf)).await {
+                        Ok(result) => result.map(Some),
+                        Err(_) => Ok(None),
+                    }
+                }
+            } => {
+                let Some((n, src)) = r? else {
+                    bail!("No valid RTP received within startup watchdog window");
+                };
                 let pkt = match RtpPacket::parse(&buf[..n]) {
                     Ok(p) => p,
                     Err(_) => {
@@ -233,6 +357,27 @@ pub async fn run_udp_receiver(
                         continue;
                     }
                 };
+
+                match source_validator.validate(src) {
+                    SourceValidation::Accept => {
+                        if !first_valid_rtp {
+                            first_valid_rtp = true;
+                            info!(source = %src, "First valid RTP packet accepted");
+                        }
+                    }
+                    SourceValidation::Reject(reason) => {
+                        source_mismatch_count += 1;
+                        if should_log_rate_limited(source_mismatch_count) {
+                            warn!(
+                                source = %src,
+                                ?reason,
+                                mismatch_count = source_mismatch_count,
+                                "Dropping RTP packet from unexpected source"
+                            );
+                        }
+                        continue;
+                    }
+                }
 
                 // Drop on gap/out-of-order for now
                 if let Some(exp) = expected_seq {
@@ -399,5 +544,64 @@ mod tests {
         assert_eq!(cfg.path, "/general-stream");
         assert_eq!(cfg.user, "general-user");
         assert_eq!(cfg.pass, "general-pass");
+    }
+
+    #[test]
+    fn parse_server_rtp_port_extracts_first_server_port() {
+        let transport =
+            "RTP/AVP;unicast;client_port=5004-5005;server_port=6000-6001;ssrc=ABCD1234";
+        assert_eq!(parse_server_rtp_port(transport), Some(6000));
+    }
+
+    #[test]
+    fn parse_server_rtp_port_returns_none_when_missing() {
+        let transport = "RTP/AVP;unicast;client_port=5004-5005;mode=play";
+        assert_eq!(parse_server_rtp_port(transport), None);
+    }
+
+    #[test]
+    fn source_validator_pins_first_valid_packet_ip_without_preconfigured_expected_source() {
+        let mut validator = SourceValidator::new(None);
+
+        let first = "192.168.1.10:5000".parse().unwrap();
+        let second_same_ip = "192.168.1.10:6500".parse().unwrap();
+        let other_ip = "192.168.1.11:5000".parse().unwrap();
+
+        assert_eq!(validator.validate(first), SourceValidation::Accept);
+        assert_eq!(validator.validate(second_same_ip), SourceValidation::Accept);
+        assert_eq!(
+            validator.validate(other_ip),
+            SourceValidation::Reject(SourceRejectReason::UnexpectedIp)
+        );
+    }
+
+    #[test]
+    fn source_validator_rejects_ip_mismatch_when_expected_ip_is_known_after_setup() {
+        let expected = ExpectedRtpSource {
+            ip: "192.168.1.20".parse().unwrap(),
+            port: None,
+        };
+        let mut validator = SourceValidator::new(Some(expected));
+
+        let sender = "192.168.1.99:7000".parse().unwrap();
+        assert_eq!(
+            validator.validate(sender),
+            SourceValidation::Reject(SourceRejectReason::UnexpectedIp)
+        );
+    }
+
+    #[test]
+    fn source_validator_enforces_port_when_transport_exposes_server_port() {
+        let expected = ExpectedRtpSource {
+            ip: "192.168.1.20".parse().unwrap(),
+            port: Some(6000),
+        };
+        let mut validator = SourceValidator::new(Some(expected));
+
+        let sender = "192.168.1.20:6001".parse().unwrap();
+        assert_eq!(
+            validator.validate(sender),
+            SourceValidation::Reject(SourceRejectReason::UnexpectedPort)
+        );
     }
 }
