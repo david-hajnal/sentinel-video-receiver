@@ -1216,22 +1216,34 @@ mod tests {
     struct EnvGuard {
         _lock: MutexGuard<'static, ()>,
         saved: HashMap<String, String>,
+        saved_allow_insecure_http: Option<String>,
     }
 
     impl EnvGuard {
         fn new() -> Self {
             let lock = AgentConfig::runtime_test_lock()
                 .lock()
-                .expect("lock runtime mutex");
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
             let saved = AgentConfig::runtime_snapshot();
+            let saved_allow_insecure_http = std::env::var("ALLOW_INSECURE_SERVER_HTTP").ok();
             AgentConfig::clear_runtime_overrides();
-            Self { _lock: lock, saved }
+            std::env::remove_var("ALLOW_INSECURE_SERVER_HTTP");
+            Self {
+                _lock: lock,
+                saved,
+                saved_allow_insecure_http,
+            }
         }
     }
 
     impl Drop for EnvGuard {
         fn drop(&mut self) {
             AgentConfig::runtime_restore(std::mem::take(&mut self.saved));
+            if let Some(value) = self.saved_allow_insecure_http.take() {
+                std::env::set_var("ALLOW_INSECURE_SERVER_HTTP", value);
+            } else {
+                std::env::remove_var("ALLOW_INSECURE_SERVER_HTTP");
+            }
         }
     }
 
@@ -1585,6 +1597,7 @@ mod tests {
                     "http://example.com".to_string(),
                 ),
                 ("ALLOW_INSECURE_SERVER_HTTP".to_string(), "true".to_string()),
+                ("SERVER_BEARER_TOKEN".to_string(), "test-token".to_string()),
             ]
             .into_iter()
             .collect(),
