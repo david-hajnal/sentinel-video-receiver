@@ -55,6 +55,22 @@ fn runtime_bool(key: &str, default: bool) -> bool {
     AgentConfig::runtime_bool(key, default)
 }
 
+fn motion_enabled_for_slot(slot: usize) -> (bool, bool) {
+    let slot_key = format!("CAM{}_MOTION_ENABLED", slot);
+    let global_value = AgentConfig::runtime_var("MOTION_ENABLED");
+    let slot_value = AgentConfig::runtime_var(&slot_key);
+    let inferred = slot_value.is_none() && global_value.is_none();
+    let enabled = runtime_bool(&slot_key, runtime_bool("MOTION_ENABLED", true));
+    (enabled, inferred)
+}
+
+fn global_motion_enabled_with_inference() -> (bool, bool) {
+    let global_value = AgentConfig::runtime_var("MOTION_ENABLED");
+    let inferred = global_value.is_none();
+    let enabled = runtime_bool("MOTION_ENABLED", true);
+    (enabled, inferred)
+}
+
 #[derive(Clone)]
 struct OnvifSettings {
     sub_termination: String,
@@ -574,10 +590,14 @@ fn load_onvif_cameras_from_env() -> Result<Vec<OnvifCameraConfig>> {
             _ => continue,
         };
         saw_configured_slot = true;
-        let motion_enabled = runtime_bool(
-            &format!("CAM{}_MOTION_ENABLED", i),
-            runtime_bool("MOTION_ENABLED", true),
-        );
+        let (motion_enabled, inferred) = motion_enabled_for_slot(i);
+        if inferred {
+            warn!(
+                camera_id = %AgentConfig::runtime_var(&format!("CAM{}_CAMERA_ID", i)).unwrap_or_else(|| format!("cam-{}", i)),
+                slot = i,
+                "Motion enablement inferred from default (true) because CAMx_MOTION_ENABLED and MOTION_ENABLED are unset"
+            );
+        }
         if !motion_enabled {
             continue;
         }
@@ -604,7 +624,17 @@ fn load_onvif_cameras_from_env() -> Result<Vec<OnvifCameraConfig>> {
     }
 
     let host = env_string("ONVIF_HOST", "192.168.1.187");
-    if !runtime_bool("MOTION_ENABLED", true) {
+    let (global_motion_enabled, inferred) = global_motion_enabled_with_inference();
+    if inferred {
+        warn!(
+            camera_id = %AgentConfig::runtime_var("CAMERA_ID")
+                .or_else(|| AgentConfig::runtime_var("CAM1_CAMERA_ID"))
+                .or_else(|| AgentConfig::runtime_var("ONVIF_HOST"))
+                .unwrap_or_else(|| "unknown-camera".to_string()),
+            "Motion enablement inferred from default (true) because MOTION_ENABLED is unset"
+        );
+    }
+    if !global_motion_enabled {
         return Ok(Vec::new());
     }
     let port: u16 = AgentConfig::runtime_var("ONVIF_PORT")
@@ -872,7 +902,8 @@ async fn run_onvif_motion_poller_for_camera(
 mod tests {
     use super::{
         debug_enabled, dump_enabled, env_string, env_u32, env_u64, is_connectish_error,
-        load_onvif_cameras_from_env, reset_motion_tracking, DEFAULT_AFTER_SUB_DELAY_MS,
+        global_motion_enabled_with_inference, load_onvif_cameras_from_env, motion_enabled_for_slot,
+        reset_motion_tracking, DEFAULT_AFTER_SUB_DELAY_MS,
         DEFAULT_CONNREFUSED_BACKOFF_MS, DEFAULT_CONNREFUSED_RETRIES, DEFAULT_MIN_POLL_GAP_MS,
         DEFAULT_PULL_LIMIT, DEFAULT_PULL_TIMEOUT, DEFAULT_RENEW_EVERY_SECS,
         DEFAULT_RESUBSCRIBE_AFTER_ERRORS, DEFAULT_SUB_TERMINATION,
@@ -1028,6 +1059,43 @@ mod tests {
 
         let cameras = load_onvif_cameras_from_env().expect("load onvif cameras from env");
         assert!(cameras.is_empty());
+    }
+
+    #[test]
+    fn motion_flag_resolution_marks_inference_when_no_flags_are_present() {
+        let _guard = EnvGuard::new();
+
+        AgentConfig::runtime_restore(HashMap::new());
+
+        let (slot_enabled, slot_inferred) = motion_enabled_for_slot(1);
+        assert!(slot_enabled);
+        assert!(slot_inferred);
+
+        let (global_enabled, global_inferred) = global_motion_enabled_with_inference();
+        assert!(global_enabled);
+        assert!(global_inferred);
+    }
+
+    #[test]
+    fn motion_flag_resolution_is_not_inferred_when_flags_are_explicit() {
+        let _guard = EnvGuard::new();
+
+        AgentConfig::runtime_restore(
+            [
+                ("MOTION_ENABLED".to_string(), "0".to_string()),
+                ("CAM1_MOTION_ENABLED".to_string(), "1".to_string()),
+            ]
+            .into_iter()
+            .collect(),
+        );
+
+        let (slot_enabled, slot_inferred) = motion_enabled_for_slot(1);
+        assert!(slot_enabled);
+        assert!(!slot_inferred);
+
+        let (global_enabled, global_inferred) = global_motion_enabled_with_inference();
+        assert!(!global_enabled);
+        assert!(!global_inferred);
     }
 
     #[test]
