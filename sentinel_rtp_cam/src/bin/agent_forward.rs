@@ -2,7 +2,10 @@ use anyhow::{anyhow, bail, Result};
 use serde_json::Value;
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
 use std::time::{Duration, Instant};
 use tokio::net::UdpSocket;
 use tokio::sync::RwLock;
@@ -194,6 +197,155 @@ fn format_rtsp_target(rtsp_url: &str) -> String {
         .unwrap_or_else(|_| rtsp_url.to_string())
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum OfflineTransition {
+    Offline,
+    Online,
+}
+
+#[derive(Debug, Clone)]
+struct OfflineTracker {
+    offline_timeout: Duration,
+    retry_outage: Duration,
+    retry_count: usize,
+    retry_window: Duration,
+    outage_starts: Vec<Instant>,
+    outage_started_at: Option<Instant>,
+    offline: bool,
+}
+
+impl OfflineTracker {
+    fn new(
+        offline_timeout: Duration,
+        retry_outage: Duration,
+        retry_count: usize,
+        retry_window: Duration,
+    ) -> Self {
+        Self {
+            offline_timeout,
+            retry_outage,
+            retry_count,
+            retry_window,
+            outage_starts: Vec::new(),
+            outage_started_at: None,
+            offline: false,
+        }
+    }
+
+    fn on_outage_started(&mut self, now: Instant) {
+        if self.outage_started_at.is_none() {
+            self.outage_started_at = Some(now);
+        }
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
+    fn on_outage_recovered(&mut self, now: Instant) -> Option<OfflineTransition> {
+        if let Some(started) = self.outage_started_at.take() {
+            if now.duration_since(started) >= self.retry_outage {
+                self.outage_starts.push(started);
+            }
+        }
+        self.prune(now);
+        if self.offline {
+            self.offline = false;
+            Some(OfflineTransition::Online)
+        } else {
+            None
+        }
+    }
+
+    fn evaluate(&mut self, now: Instant) -> Option<OfflineTransition> {
+        self.prune(now);
+        let continuous = self
+            .outage_started_at
+            .map(|started| now.duration_since(started) >= self.offline_timeout)
+            .unwrap_or(false);
+        let burst = self.outage_starts.len() >= self.retry_count;
+        if (continuous || burst) && !self.offline {
+            self.offline = true;
+            return Some(OfflineTransition::Offline);
+        }
+        None
+    }
+
+    fn prune(&mut self, now: Instant) {
+        self.outage_starts
+            .retain(|started| now.duration_since(*started) <= self.retry_window);
+    }
+
+    fn threshold_context(&self) -> String {
+        format!(
+            "timeout={}s, retry_outage={}s, retry_count={}, retry_window={}s",
+            self.offline_timeout.as_secs(),
+            self.retry_outage.as_secs(),
+            self.retry_count,
+            self.retry_window.as_secs()
+        )
+    }
+}
+
+fn classify_camera_session_failure(error: &anyhow::Error) -> (&'static str, &'static str) {
+    let lower = error.to_string().to_ascii_lowercase();
+    if lower.contains("timeout") || lower.contains("timed out") {
+        ("timeout", "warn")
+    } else {
+        ("connect_fail", "error")
+    }
+}
+
+fn emit_agent_lifecycle_activity(
+    cam: &CamConfig,
+    event: &'static str,
+    level: &'static str,
+    message: String,
+) {
+    let Some(base_url) = runtime_var("SERVER_BASE_URL") else {
+        return;
+    };
+    let Some(token) = runtime_var("SERVER_BEARER_TOKEN") else {
+        return;
+    };
+    let camera_id = cam.camera_id.clone();
+    tokio::spawn(async move {
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(5))
+            .build();
+        let Ok(client) = client else {
+            return;
+        };
+        let url = format!("{}/api/v1/agent/activity", base_url.trim_end_matches('/'));
+        let payload = serde_json::json!({
+            "events": [{
+                "camera_id": camera_id,
+                "source": "rtsp",
+                "level": level,
+                "event": event,
+                "message": message
+            }]
+        });
+        match client
+            .post(&url)
+            .bearer_auth(token)
+            .json(&payload)
+            .send()
+            .await
+        {
+            Ok(response) if response.status().is_success() => {}
+            Ok(response) => {
+                warn!(
+                    status = %response.status(),
+                    event,
+                    "Failed to post lifecycle activity"
+                );
+            }
+            Err(error) => {
+                warn!(error = %error, event, "Failed to post lifecycle activity");
+            }
+        }
+    });
+}
+
 fn start_runtime(desired: &DesiredRuntime) -> Result<AgentRuntime> {
     let applied_config_version: Arc<RwLock<Option<Value>>> =
         Arc::new(RwLock::new(config_version_value(&desired.config_value)));
@@ -305,7 +457,7 @@ fn start_runtime(desired: &DesiredRuntime) -> Result<AgentRuntime> {
         let uplink = uplink.clone();
         let cancel = cancel.clone();
         tasks.push(spawn_task(async move {
-            if let Err(error) = run_camera(cam, uplink, cancel).await {
+            if let Err(error) = run_camera_supervisor(cam, uplink, cancel).await {
                 warn!(error = %error, "Camera task ended");
             }
         }));
@@ -644,7 +796,12 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-async fn run_camera(cam: CamConfig, uplink: Uplink, cancel: CancellationToken) -> Result<()> {
+async fn run_camera_session(
+    cam: CamConfig,
+    uplink: Uplink,
+    cancel: CancellationToken,
+    offline_state: Arc<AtomicBool>,
+) -> Result<()> {
     let (host, port, path) = parse_rtsp_url(&cam.rtsp_url)?;
     info!(
         stream_id = cam.stream_id,
@@ -793,7 +950,13 @@ async fn run_camera(cam: CamConfig, uplink: Uplink, cancel: CancellationToken) -
                 _ = cancel.cancelled() => break,
                 r = async {
                     if first_logged {
-                        sock.recv_from(&mut buf).await.map(Some)
+                        let offline_timeout = Duration::from_secs(
+                            AgentConfig::runtime_u64_nonzero("CAMERA_OFFLINE_TIMEOUT_SECS", 20),
+                        );
+                        match timeout(offline_timeout, sock.recv_from(&mut buf)).await {
+                            Ok(result) => result.map(Some),
+                            Err(_) => Ok(None),
+                        }
                     } else {
                         match timeout(Duration::from_secs(10), sock.recv_from(&mut buf)).await {
                             Ok(result) => result.map(Some),
@@ -813,6 +976,9 @@ async fn run_camera(cam: CamConfig, uplink: Uplink, cancel: CancellationToken) -
                     }
                 } => {
                     let Some((n, _)) = r? else {
+                        if first_logged {
+                            bail!("RTP receive timeout");
+                        }
                         bail!("No RTP received within startup watchdog window");
                     };
                     total_pkts += 1;
@@ -824,6 +990,15 @@ async fn run_camera(cam: CamConfig, uplink: Uplink, cancel: CancellationToken) -
                     if !first_logged {
                         info!(stream_id = cam.stream_id, seq = pkt.sequence_number, "First RTP packet received");
                         first_logged = true;
+                        if offline_state.swap(false, Ordering::SeqCst) {
+                            info!(camera_id = %cam.camera_id, "Camera transitioned online");
+                            emit_agent_lifecycle_activity(
+                                &cam,
+                                "reconnect",
+                                "info",
+                                "Camera stream recovered and forwarding resumed".to_string(),
+                            );
+                        }
                     }
                     if let Some(exp) = expected_seq {
                         if pkt.sequence_number != exp {
@@ -914,7 +1089,16 @@ async fn run_camera(cam: CamConfig, uplink: Uplink, cancel: CancellationToken) -
                 _ = cancel.cancelled() => break,
                 frame = async {
                     if first_logged {
-                        read_interleaved_frame(&mut c, rtp_channel, rtcp_channel).await.map(Some)
+                        let offline_timeout = Duration::from_secs(
+                            AgentConfig::runtime_u64_nonzero("CAMERA_OFFLINE_TIMEOUT_SECS", 20),
+                        );
+                        match timeout(
+                            offline_timeout,
+                            read_interleaved_frame(&mut c, rtp_channel, rtcp_channel),
+                        ).await {
+                            Ok(result) => result.map(Some),
+                            Err(_) => Ok(None),
+                        }
                     } else {
                         match timeout(
                             Duration::from_secs(10),
@@ -937,6 +1121,9 @@ async fn run_camera(cam: CamConfig, uplink: Uplink, cancel: CancellationToken) -
                     }
                 } => {
                     let Some(frame) = frame? else {
+                        if first_logged {
+                            bail!("RTP receive timeout");
+                        }
                         bail!("No RTP received within startup watchdog window");
                     };
                     match frame {
@@ -946,6 +1133,15 @@ async fn run_camera(cam: CamConfig, uplink: Uplink, cancel: CancellationToken) -
                             if !first_logged {
                                 info!(stream_id = cam.stream_id, "First RTP frame received (TCP)");
                                 first_logged = true;
+                                if offline_state.swap(false, Ordering::SeqCst) {
+                                    info!(camera_id = %cam.camera_id, "Camera transitioned online");
+                                    emit_agent_lifecycle_activity(
+                                        &cam,
+                                        "reconnect",
+                                        "info",
+                                        "Camera stream recovered and forwarding resumed".to_string(),
+                                    );
+                                }
                             }
                             uplink.send_rtp(cam.stream_id, bytes);
 
@@ -974,13 +1170,96 @@ async fn run_camera(cam: CamConfig, uplink: Uplink, cancel: CancellationToken) -
     Ok(())
 }
 
+async fn run_camera_supervisor(cam: CamConfig, uplink: Uplink, cancel: CancellationToken) -> Result<()> {
+    let offline_state = Arc::new(AtomicBool::new(false));
+    let tracker = OfflineTracker::new(
+        Duration::from_secs(AgentConfig::runtime_u64_nonzero("CAMERA_OFFLINE_TIMEOUT_SECS", 20)),
+        Duration::from_secs(AgentConfig::runtime_u64_nonzero(
+            "CAMERA_OFFLINE_RETRY_OUTAGE_SECS",
+            5,
+        )),
+        AgentConfig::runtime_u64_nonzero("CAMERA_OFFLINE_RETRY_COUNT", 4) as usize,
+        Duration::from_secs(AgentConfig::runtime_u64_nonzero(
+            "CAMERA_OFFLINE_RETRY_WINDOW_SECS",
+            120,
+        )),
+    );
+    run_camera_supervisor_with_runner(
+        cam,
+        uplink,
+        cancel,
+        tracker,
+        offline_state.clone(),
+        move |cam, uplink, cancel| {
+        let offline_state = offline_state.clone();
+        async move { run_camera_session(cam, uplink, cancel, offline_state).await }
+    })
+    .await
+}
+
+async fn run_camera_supervisor_with_runner<F, Fut>(
+    cam: CamConfig,
+    uplink: Uplink,
+    cancel: CancellationToken,
+    mut tracker: OfflineTracker,
+    offline_state: Arc<AtomicBool>,
+    mut runner: F,
+) -> Result<()>
+where
+    F: FnMut(CamConfig, Uplink, CancellationToken) -> Fut,
+    Fut: std::future::Future<Output = Result<()>>,
+{
+    let mut backoff = Duration::from_secs(1);
+    loop {
+        if cancel.is_cancelled() {
+            return Ok(());
+        }
+        match runner(cam.clone(), uplink.clone(), cancel.clone()).await {
+            Ok(()) => return Ok(()),
+            Err(error) => {
+                let now = Instant::now();
+                tracker.on_outage_started(now);
+                if tracker.evaluate(now) == Some(OfflineTransition::Offline) {
+                    warn!(camera_id = %cam.camera_id, "Camera transitioned offline");
+                    offline_state.store(true, Ordering::SeqCst);
+                    let (event, level) = classify_camera_session_failure(&error);
+                    emit_agent_lifecycle_activity(
+                        &cam,
+                        event,
+                        level,
+                        format!(
+                            "Camera marked offline after outage policy threshold ({}) | last error: {}",
+                            tracker.threshold_context(),
+                            error
+                        ),
+                    );
+                }
+                warn!(
+                    camera_id = %cam.camera_id,
+                    error = %error,
+                    retry_in_secs = backoff.as_secs(),
+                    "Camera session failed; reconnecting"
+                );
+                tokio::select! {
+                    _ = cancel.cancelled() => return Ok(()),
+                    _ = sleep(backoff) => {}
+                }
+                backoff = (backoff * 2).min(Duration::from_secs(30));
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use sentinel_rtp_cam::forward_agent::resolve_stream_id;
     use serde_json::json;
     use std::fs;
-    use std::sync::{Mutex, MutexGuard, OnceLock};
+    use std::sync::{
+        atomic::AtomicBool,
+        Arc, Mutex, MutexGuard, OnceLock,
+    };
     use std::time::{SystemTime, UNIX_EPOCH};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::{TcpListener, TcpStream};
@@ -1460,5 +1739,186 @@ mod tests {
             "unexpected error: {error}"
         );
         fs::remove_dir_all(dir).expect("remove test dir");
+    }
+
+    fn test_cam() -> CamConfig {
+        CamConfig {
+            name: "cam1".to_string(),
+            rtsp_url: "rtsp://127.0.0.1:8554/stream".to_string(),
+            rtsp_user: None,
+            rtsp_pass: None,
+            stream_id: 1,
+            transport: "tcp".to_string(),
+            rtp_port: 5004,
+            rtcp_port: 5005,
+            camera_id: "cam-1".to_string(),
+            agent_id: "agent-1".to_string(),
+            agent_token: "token".to_string(),
+        }
+    }
+
+    #[tokio::test]
+    async fn camera_supervisor_retries_after_failure_until_success() {
+        let cancel = CancellationToken::new();
+        let cam = test_cam();
+        let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let attempts_ref = attempts.clone();
+        let runner = move |_cam: CamConfig, _uplink: Uplink, _cancel: CancellationToken| {
+            let attempts_ref = attempts_ref.clone();
+            async move {
+                let n = attempts_ref.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+                if n < 3 {
+                    Err(anyhow!("simulated failure"))
+                } else {
+                    Ok(())
+                }
+            }
+        };
+        let uplink = Uplink::connect_and_run(
+            "127.0.0.1:9".to_string(),
+            "token".to_string(),
+            "agent-1".to_string(),
+            HashMap::from([(1, "cam1".to_string())]),
+            HashMap::from([(1, "cam-1".to_string())]),
+            None,
+            HashMap::new(),
+        );
+        let tracker = OfflineTracker::new(
+            Duration::from_secs(20),
+            Duration::from_secs(5),
+            4,
+            Duration::from_secs(120),
+        );
+        let offline_state = Arc::new(AtomicBool::new(false));
+        let result = run_camera_supervisor_with_runner(
+            cam,
+            uplink,
+            cancel,
+            tracker,
+            offline_state,
+            runner,
+        )
+        .await;
+        assert!(result.is_ok());
+        assert_eq!(attempts.load(std::sync::atomic::Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test]
+    async fn camera_supervisor_stops_cleanly_on_cancel() {
+        let cancel = CancellationToken::new();
+        let cancel_clone = cancel.clone();
+        let cam = test_cam();
+        let runner = move |_cam: CamConfig, _uplink: Uplink, _cancel: CancellationToken| async move {
+            Err(anyhow!("simulated persistent failure"))
+        };
+        let uplink = Uplink::connect_and_run(
+            "127.0.0.1:9".to_string(),
+            "token".to_string(),
+            "agent-1".to_string(),
+            HashMap::from([(1, "cam1".to_string())]),
+            HashMap::from([(1, "cam-1".to_string())]),
+            None,
+            HashMap::new(),
+        );
+        let handle = tokio::spawn(async move {
+            let tracker = OfflineTracker::new(
+                Duration::from_secs(20),
+                Duration::from_secs(5),
+                4,
+                Duration::from_secs(120),
+            );
+            let offline_state = Arc::new(AtomicBool::new(false));
+            run_camera_supervisor_with_runner(
+                cam,
+                uplink,
+                cancel_clone,
+                tracker,
+                offline_state,
+                runner,
+            )
+            .await
+        });
+        sleep(Duration::from_millis(50)).await;
+        cancel.cancel();
+        let result = handle.await.expect("join");
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn offline_tracker_triggers_continuous_timeout_once() {
+        let now = Instant::now();
+        let mut tracker = OfflineTracker::new(
+            Duration::from_secs(20),
+            Duration::from_secs(5),
+            4,
+            Duration::from_secs(120),
+        );
+        tracker.on_outage_started(now);
+        assert_eq!(tracker.evaluate(now + Duration::from_secs(19)), None);
+        assert_eq!(
+            tracker.evaluate(now + Duration::from_secs(20)),
+            Some(OfflineTransition::Offline)
+        );
+        assert_eq!(tracker.evaluate(now + Duration::from_secs(21)), None);
+    }
+
+    #[test]
+    fn offline_tracker_triggers_burst_threshold() {
+        let base = Instant::now();
+        let mut tracker = OfflineTracker::new(
+            Duration::from_secs(20),
+            Duration::from_secs(5),
+            4,
+            Duration::from_secs(120),
+        );
+        for i in 0..4 {
+            let start = base + Duration::from_secs(i * 10);
+            tracker.on_outage_started(start);
+            let recovered = start + Duration::from_secs(5);
+            assert_eq!(tracker.on_outage_recovered(recovered), None);
+        }
+        assert_eq!(
+            tracker.evaluate(base + Duration::from_secs(40)),
+            Some(OfflineTransition::Offline)
+        );
+    }
+
+    #[test]
+    fn offline_tracker_prunes_stale_outages() {
+        let base = Instant::now();
+        let mut tracker = OfflineTracker::new(
+            Duration::from_secs(20),
+            Duration::from_secs(5),
+            4,
+            Duration::from_secs(120),
+        );
+        for i in 0..4 {
+            let start = base + Duration::from_secs(i * 10);
+            tracker.on_outage_started(start);
+            let recovered = start + Duration::from_secs(5);
+            let _ = tracker.on_outage_recovered(recovered);
+        }
+        assert_eq!(tracker.evaluate(base + Duration::from_secs(131)), None);
+    }
+
+    #[test]
+    fn offline_tracker_emits_online_once_after_recovery() {
+        let now = Instant::now();
+        let mut tracker = OfflineTracker::new(
+            Duration::from_secs(20),
+            Duration::from_secs(5),
+            4,
+            Duration::from_secs(120),
+        );
+        tracker.on_outage_started(now);
+        assert_eq!(
+            tracker.evaluate(now + Duration::from_secs(20)),
+            Some(OfflineTransition::Offline)
+        );
+        assert_eq!(
+            tracker.on_outage_recovered(now + Duration::from_secs(21)),
+            Some(OfflineTransition::Online)
+        );
+        assert_eq!(tracker.on_outage_recovered(now + Duration::from_secs(22)), None);
     }
 }
