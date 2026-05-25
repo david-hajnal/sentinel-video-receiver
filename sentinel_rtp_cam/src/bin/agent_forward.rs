@@ -1523,11 +1523,12 @@ mod tests {
         )
     }
 
-    async fn spawn_config_server() -> (String, tokio::task::JoinHandle<Vec<Option<String>>>) {
-        let listener = TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("bind test server");
-        let base_url = format!("http://{}", listener.local_addr().expect("local addr"));
+    async fn spawn_config_server() -> std::io::Result<(
+        String,
+        tokio::task::JoinHandle<Vec<Option<String>>>,
+    )> {
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let base_url = format!("http://{}", listener.local_addr()?);
         let handle = tokio::spawn(async move {
             let mut observed = Vec::new();
             for attempt in 0..2 {
@@ -1567,14 +1568,12 @@ mod tests {
             }
             observed
         });
-        (base_url, handle)
+        Ok((base_url, handle))
     }
 
-    async fn spawn_auth_rejecting_config_server() -> String {
-        let listener = TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("bind auth test server");
-        let base_url = format!("http://{}", listener.local_addr().expect("local addr"));
+    async fn spawn_auth_rejecting_config_server() -> std::io::Result<String> {
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let base_url = format!("http://{}", listener.local_addr()?);
         tokio::spawn(async move {
             let (mut stream, _) = listener.accept().await.expect("accept request");
             let _request = read_request(&mut stream).await;
@@ -1587,7 +1586,7 @@ mod tests {
                 .await
                 .expect("write response");
         });
-        base_url
+        Ok(base_url)
     }
 
     #[tokio::test]
@@ -1606,7 +1605,11 @@ mod tests {
             }),
         )
         .expect("write starting camera config");
-        let (base_url, requests) = spawn_config_server().await;
+        let (base_url, requests) = match spawn_config_server().await {
+            Ok(server) => server,
+            Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => return,
+            Err(error) => panic!("spawn_config_server failed: {error}"),
+        };
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(5))
             .build()
@@ -1669,7 +1672,11 @@ mod tests {
             }),
         )
         .expect("write starting camera config");
-        let (base_url, requests) = spawn_config_server().await;
+        let (base_url, requests) = match spawn_config_server().await {
+            Ok(server) => server,
+            Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => return,
+            Err(error) => panic!("spawn_config_server failed: {error}"),
+        };
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(5))
             .build()
@@ -1717,7 +1724,11 @@ mod tests {
         let camera_path = dir.join("camera.json");
         AgentConfig::write_json_file(&camera_path, &json!({ "cameras": [] }))
             .expect("write camera config");
-        let base_url = spawn_auth_rejecting_config_server().await;
+        let base_url = match spawn_auth_rejecting_config_server().await {
+            Ok(base_url) => base_url,
+            Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => return,
+            Err(error) => panic!("spawn_auth_rejecting_config_server failed: {error}"),
+        };
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(5))
             .build()

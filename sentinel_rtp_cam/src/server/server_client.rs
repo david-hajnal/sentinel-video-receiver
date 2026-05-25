@@ -54,6 +54,18 @@ struct RestartJobResponse {
     job: Option<RestartJobCommand>,
 }
 
+#[derive(Debug, Deserialize, Clone, PartialEq, Eq)]
+struct ShutdownJobCommand {
+    job_id: i64,
+    action: String,
+    status: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct ShutdownJobResponse {
+    job: Option<ShutdownJobCommand>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct RestartJobMarker {
     job_id: i64,
@@ -103,10 +115,21 @@ struct RestartJobMemory {
     handled_job_ids: HashSet<i64>,
 }
 
+#[derive(Debug, Default)]
+struct ShutdownJobMemory {
+    handled_job_ids: HashSet<i64>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RestartProcessOutcome {
     Continue,
     ExitNonZero,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ShutdownProcessOutcome {
+    Continue,
+    ExitZero,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -619,6 +642,16 @@ impl RestartJobMemory {
     }
 }
 
+impl ShutdownJobMemory {
+    fn is_handled(&self, job_id: i64) -> bool {
+        self.handled_job_ids.contains(&job_id)
+    }
+
+    fn mark_handled(&mut self, job_id: i64) {
+        self.handled_job_ids.insert(job_id);
+    }
+}
+
 impl RestartProcessOutcome {
     fn should_exit(self) -> bool {
         self == Self::ExitNonZero
@@ -629,6 +662,12 @@ impl RestartProcessOutcome {
             Self::Continue => 0,
             Self::ExitNonZero => RESTART_EXIT_CODE,
         }
+    }
+}
+
+impl ShutdownProcessOutcome {
+    fn should_exit(self) -> bool {
+        self == Self::ExitZero
     }
 }
 
@@ -1161,6 +1200,62 @@ where
     process_restart_job_command(&job, marker_path, memory, report).await
 }
 
+async fn fetch_shutdown_job_command(
+    client: &reqwest::Client,
+    config: &ServerConfig,
+) -> Result<Option<ShutdownJobCommand>> {
+    let base = config.base_url_prefix();
+    let payload = try_fallback_paths(
+        &["/api/v1/agent/shutdown/job", "/api/agent/shutdown/job"],
+        |path| {
+            let url = format!("{base}{path}");
+            async move {
+                let response = client
+                    .get(&url)
+                    .bearer_auth(&config.bearer_token)
+                    .send()
+                    .await?;
+                if response.status() == reqwest::StatusCode::NOT_FOUND {
+                    return Ok(FallbackOutcome::NotFound);
+                }
+                let response = response.error_for_status()?;
+                let payload: ShutdownJobResponse = response.json().await?;
+                Ok(FallbackOutcome::Success(payload))
+            }
+        },
+    )
+    .await?;
+    Ok(payload.and_then(|payload| payload.job))
+}
+
+async fn maybe_process_shutdown_job(
+    client: &reqwest::Client,
+    config: &ServerConfig,
+    memory: &mut ShutdownJobMemory,
+) -> ShutdownProcessOutcome {
+    let job = match fetch_shutdown_job_command(client, config).await {
+        Ok(job) => job,
+        Err(error) => {
+            warn!(error = %error, "Failed to poll shutdown job command");
+            return ShutdownProcessOutcome::Continue;
+        }
+    };
+    let Some(job) = job else {
+        return ShutdownProcessOutcome::Continue;
+    };
+    if memory.is_handled(job.job_id) || job.status != "pending" {
+        return ShutdownProcessOutcome::Continue;
+    }
+    if job.action != "shutdown" {
+        warn!(job_id = job.job_id, action = %job.action, "Ignoring unsupported shutdown job action");
+        memory.mark_handled(job.job_id);
+        return ShutdownProcessOutcome::Continue;
+    }
+    memory.mark_handled(job.job_id);
+    info!(job_id = job.job_id, "Shutdown job accepted; exiting with code 0");
+    ShutdownProcessOutcome::ExitZero
+}
+
 fn pending_firmware_status(job: &FirmwareJobCommand) -> &'static str {
     if job.action == "rollback" {
         "rollback_pending"
@@ -1605,6 +1700,7 @@ pub async fn run_agent_heartbeat_poster(
     let mut telemetry_sampler = TelemetrySampler::new();
     let mut firmware_job_memory = FirmwareJobMemory::default();
     let mut restart_job_memory = RestartJobMemory::default();
+    let mut shutdown_job_memory = ShutdownJobMemory::default();
     loop {
         sleep(heartbeat_interval).await;
         onvif_probe.poll_for_jobs(&client, &config).await;
@@ -1669,6 +1765,26 @@ pub async fn run_agent_heartbeat_poster(
             RestartMarkerReportOutcome::Missing => None,
             RestartMarkerReportOutcome::Pending => None,
         };
+
+        if maybe_process_shutdown_job(&client, &config, &mut shutdown_job_memory)
+            .await
+            .should_exit()
+        {
+            let timestamp = Utc::now().to_rfc3339();
+            let payload = build_agent_heartbeat_payload(
+                &agent_id,
+                &timestamp,
+                applied_config_version_snapshot.as_ref(),
+                camera_status.clone(),
+                &telemetry,
+                &firmware,
+                restart_for_payload.as_ref(),
+            );
+            if let Err(error) = post_heartbeat(&client, &config, &payload).await {
+                warn!(error = %error, "Failed to post final heartbeat before shutdown exit");
+            }
+            std::process::exit(0);
+        }
 
         if restart_marker_outcome != RestartMarkerReportOutcome::Pending {
             let restart_outcome = maybe_process_restart_job(
@@ -1774,6 +1890,7 @@ mod tests {
         MemoryUsageMb, OnvifProbeJobCommand, OnvifProbeJobResponse, OnvifProbeManager,
         RestartHeartbeatState, RestartJobCommand, RestartJobMarker, RestartJobMemory,
         RestartJobResponse, RestartMarkerReportOutcome, RestartProcessOutcome,
+        ShutdownJobResponse,
         TelemetryCapabilities, TelemetryStatus, DEFAULT_FIRMWARE_UPDATER_CMD, RESTART_EXIT_CODE,
     };
     use serde::Deserialize;
@@ -2296,6 +2413,26 @@ mod tests {
 
         assert_eq!(job.job_id, 44);
         assert_eq!(job.action, "restart");
+        assert_eq!(job.status, "pending");
+    }
+
+    #[test]
+    fn shutdown_job_response_parses_null_and_pending_job() {
+        let empty: ShutdownJobResponse =
+            serde_json::from_value(json!({ "job": Value::Null })).expect("empty response");
+        assert!(empty.job.is_none());
+
+        let pending: ShutdownJobResponse = serde_json::from_value(json!({
+            "job": {
+                "job_id": 45,
+                "action": "shutdown",
+                "status": "pending",
+            },
+        }))
+        .expect("pending response");
+        let job = pending.job.expect("job exists");
+        assert_eq!(job.job_id, 45);
+        assert_eq!(job.action, "shutdown");
         assert_eq!(job.status, "pending");
     }
 

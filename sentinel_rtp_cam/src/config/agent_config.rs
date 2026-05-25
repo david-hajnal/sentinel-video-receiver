@@ -1628,6 +1628,8 @@ mod tests {
 
     #[test]
     fn merge_server_camera_configs_rejects_remote_http_base_url() {
+        let _guard = EnvGuard::new();
+        AgentConfig::runtime_restore(HashMap::new());
         let error = AgentConfig::merge_server_camera_configs(
             &json!({ "cameras": [] }),
             &json!({
@@ -1642,6 +1644,8 @@ mod tests {
 
     #[test]
     fn load_server_json_rejects_remote_http_base_url() {
+        let _guard = EnvGuard::new();
+        AgentConfig::runtime_restore(HashMap::new());
         let dir = unique_test_dir("invalid-server-http");
         fs::create_dir_all(&dir).expect("test dir");
         let server_path = dir.join("server.json");

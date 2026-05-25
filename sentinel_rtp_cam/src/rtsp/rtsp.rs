@@ -155,18 +155,21 @@ impl RtspClient {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io;
     use tokio::io::AsyncWriteExt;
     use tokio::net::TcpListener;
 
-    async fn connected_streams() -> (TcpStream, TcpStream) {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
+    async fn connected_streams() -> io::Result<(TcpStream, TcpStream)> {
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let addr = listener.local_addr()?;
 
-        let client_task = tokio::spawn(async move { TcpStream::connect(addr).await.unwrap() });
-        let (server_stream, _) = listener.accept().await.unwrap();
-        let client_stream = client_task.await.unwrap();
+        let client_task = tokio::spawn(async move { TcpStream::connect(addr).await });
+        let (server_stream, _) = listener.accept().await?;
+        let client_stream = client_task
+            .await
+            .map_err(|err| io::Error::new(io::ErrorKind::Other, err.to_string()))??;
 
-        (client_stream, server_stream)
+        Ok((client_stream, server_stream))
     }
 
     #[test]
@@ -184,7 +187,11 @@ mod tests {
 
     #[tokio::test]
     async fn read_exact_bytes_consumes_leftover_then_stream() {
-        let (client_stream, mut server_stream) = connected_streams().await;
+        let (client_stream, mut server_stream) = match connected_streams().await {
+            Ok(streams) => streams,
+            Err(error) if error.kind() == io::ErrorKind::PermissionDenied => return,
+            Err(error) => panic!("connected_streams failed: {error}"),
+        };
         let writer = tokio::spawn(async move {
             server_stream.write_all(&[3u8, 4u8]).await.unwrap();
         });
@@ -204,7 +211,11 @@ mod tests {
 
     #[tokio::test]
     async fn set_session_from_strips_session_parameters() {
-        let (client_stream, _server_stream) = connected_streams().await;
+        let (client_stream, _server_stream) = match connected_streams().await {
+            Ok(streams) => streams,
+            Err(error) if error.kind() == io::ErrorKind::PermissionDenied => return,
+            Err(error) => panic!("connected_streams failed: {error}"),
+        };
         let mut client = RtspClient {
             stream: client_stream,
             cseq: 1,

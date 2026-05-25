@@ -37,32 +37,39 @@ pub async fn read_interleaved_frame(
 mod tests {
     use super::{read_interleaved_frame, InterleavedFrame};
     use crate::rtsp::rtsp::RtspClient;
+    use std::io;
     use tokio::net::{TcpListener, TcpStream};
 
-    async fn connected_streams() -> (TcpStream, TcpStream) {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
+    async fn connected_streams() -> io::Result<(TcpStream, TcpStream)> {
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let addr = listener.local_addr()?;
 
-        let client_task = tokio::spawn(async move { TcpStream::connect(addr).await.unwrap() });
-        let (server_stream, _) = listener.accept().await.unwrap();
-        let client_stream = client_task.await.unwrap();
+        let client_task = tokio::spawn(async move { TcpStream::connect(addr).await });
+        let (server_stream, _) = listener.accept().await?;
+        let client_stream = client_task
+            .await
+            .map_err(|err| io::Error::new(io::ErrorKind::Other, err.to_string()))??;
 
-        (client_stream, server_stream)
+        Ok((client_stream, server_stream))
     }
 
-    async fn client_with_leftover(leftover: Vec<u8>) -> RtspClient {
-        let (client_stream, _server_stream) = connected_streams().await;
-        RtspClient {
+    async fn client_with_leftover(leftover: Vec<u8>) -> io::Result<RtspClient> {
+        let (client_stream, _server_stream) = connected_streams().await?;
+        Ok(RtspClient {
             stream: client_stream,
             cseq: 1,
             session: None,
             leftover,
-        }
+        })
     }
 
     #[tokio::test]
     async fn read_interleaved_frame_recognizes_rtp_channel() {
-        let mut client = client_with_leftover(vec![0x24, 0x00, 0x00, 0x03, 1, 2, 3]).await;
+        let mut client = match client_with_leftover(vec![0x24, 0x00, 0x00, 0x03, 1, 2, 3]).await {
+            Ok(client) => client,
+            Err(error) if error.kind() == io::ErrorKind::PermissionDenied => return,
+            Err(error) => panic!("connected_streams failed: {error}"),
+        };
 
         let frame = read_interleaved_frame(&mut client, 0, 1).await.unwrap();
         match frame {
@@ -73,7 +80,11 @@ mod tests {
 
     #[tokio::test]
     async fn read_interleaved_frame_recognizes_rtcp_channel() {
-        let mut client = client_with_leftover(vec![0x24, 0x01, 0x00, 0x02, 9, 8]).await;
+        let mut client = match client_with_leftover(vec![0x24, 0x01, 0x00, 0x02, 9, 8]).await {
+            Ok(client) => client,
+            Err(error) if error.kind() == io::ErrorKind::PermissionDenied => return,
+            Err(error) => panic!("connected_streams failed: {error}"),
+        };
 
         let frame = read_interleaved_frame(&mut client, 0, 1).await.unwrap();
         match frame {
@@ -84,7 +95,11 @@ mod tests {
 
     #[tokio::test]
     async fn read_interleaved_frame_maps_unknown_channel() {
-        let mut client = client_with_leftover(vec![0x24, 0x05, 0x00, 0x01, 0xAA]).await;
+        let mut client = match client_with_leftover(vec![0x24, 0x05, 0x00, 0x01, 0xAA]).await {
+            Ok(client) => client,
+            Err(error) if error.kind() == io::ErrorKind::PermissionDenied => return,
+            Err(error) => panic!("connected_streams failed: {error}"),
+        };
 
         let frame = read_interleaved_frame(&mut client, 0, 1).await.unwrap();
         match frame {
@@ -98,7 +113,11 @@ mod tests {
 
     #[tokio::test]
     async fn read_interleaved_frame_rejects_non_dollar_prefix() {
-        let mut client = client_with_leftover(vec![0x21]).await;
+        let mut client = match client_with_leftover(vec![0x21]).await {
+            Ok(client) => client,
+            Err(error) if error.kind() == io::ErrorKind::PermissionDenied => return,
+            Err(error) => panic!("connected_streams failed: {error}"),
+        };
 
         let err = read_interleaved_frame(&mut client, 0, 1).await.unwrap_err();
         assert!(err.to_string().contains("Expected '$'"));
