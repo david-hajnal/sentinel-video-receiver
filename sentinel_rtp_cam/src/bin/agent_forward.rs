@@ -22,7 +22,7 @@ use sentinel_rtp_cam::forward_agent::{
     basic_auth_value, build_stream_maps, forward_motion_event, load_cameras_from_env,
     load_uplink_ingest_config_from_env, parse_rtsp_url, CamConfig, MotionEventIdLatch,
 };
-use sentinel_rtp_cam::onvif::run_onvif_motion_poller;
+use sentinel_rtp_cam::onvif::{run_onvif_motion_poller, run_onvif_night_vision_sync_once};
 use sentinel_rtp_cam::rtsp::interleaved::{read_interleaved_frame, InterleavedFrame};
 use sentinel_rtp_cam::rtsp::rtsp::RtspClient;
 use sentinel_rtp_cam::{
@@ -488,6 +488,12 @@ fn start_runtime(desired: &DesiredRuntime) -> Result<AgentRuntime> {
     tasks.push(spawn_task(async move {
         if let Err(error) = run_onvif_motion_poller(bus, motion_state).await {
             warn!(error = %error, "ONVIF motion poller ended");
+        }
+    }));
+
+    tasks.push(spawn_task(async move {
+        if let Err(error) = run_onvif_night_vision_sync_once().await {
+            warn!(error = %error, "ONVIF night vision sync ended");
         }
     }));
 
@@ -1170,10 +1176,17 @@ async fn run_camera_session(
     Ok(())
 }
 
-async fn run_camera_supervisor(cam: CamConfig, uplink: Uplink, cancel: CancellationToken) -> Result<()> {
+async fn run_camera_supervisor(
+    cam: CamConfig,
+    uplink: Uplink,
+    cancel: CancellationToken,
+) -> Result<()> {
     let offline_state = Arc::new(AtomicBool::new(false));
     let tracker = OfflineTracker::new(
-        Duration::from_secs(AgentConfig::runtime_u64_nonzero("CAMERA_OFFLINE_TIMEOUT_SECS", 20)),
+        Duration::from_secs(AgentConfig::runtime_u64_nonzero(
+            "CAMERA_OFFLINE_TIMEOUT_SECS",
+            20,
+        )),
         Duration::from_secs(AgentConfig::runtime_u64_nonzero(
             "CAMERA_OFFLINE_RETRY_OUTAGE_SECS",
             5,
@@ -1191,9 +1204,10 @@ async fn run_camera_supervisor(cam: CamConfig, uplink: Uplink, cancel: Cancellat
         tracker,
         offline_state.clone(),
         move |cam, uplink, cancel| {
-        let offline_state = offline_state.clone();
-        async move { run_camera_session(cam, uplink, cancel, offline_state).await }
-    })
+            let offline_state = offline_state.clone();
+            async move { run_camera_session(cam, uplink, cancel, offline_state).await }
+        },
+    )
     .await
 }
 
@@ -1256,10 +1270,7 @@ mod tests {
     use sentinel_rtp_cam::forward_agent::resolve_stream_id;
     use serde_json::json;
     use std::fs;
-    use std::sync::{
-        atomic::AtomicBool,
-        Arc, Mutex, MutexGuard, OnceLock,
-    };
+    use std::sync::{atomic::AtomicBool, Arc, Mutex, MutexGuard, OnceLock};
     use std::time::{SystemTime, UNIX_EPOCH};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::{TcpListener, TcpStream};
@@ -1523,10 +1534,8 @@ mod tests {
         )
     }
 
-    async fn spawn_config_server() -> std::io::Result<(
-        String,
-        tokio::task::JoinHandle<Vec<Option<String>>>,
-    )> {
+    async fn spawn_config_server(
+    ) -> std::io::Result<(String, tokio::task::JoinHandle<Vec<Option<String>>>)> {
         let listener = TcpListener::bind("127.0.0.1:0").await?;
         let base_url = format!("http://{}", listener.local_addr()?);
         let handle = tokio::spawn(async move {
@@ -1801,15 +1810,9 @@ mod tests {
             Duration::from_secs(120),
         );
         let offline_state = Arc::new(AtomicBool::new(false));
-        let result = run_camera_supervisor_with_runner(
-            cam,
-            uplink,
-            cancel,
-            tracker,
-            offline_state,
-            runner,
-        )
-        .await;
+        let result =
+            run_camera_supervisor_with_runner(cam, uplink, cancel, tracker, offline_state, runner)
+                .await;
         assert!(result.is_ok());
         assert_eq!(attempts.load(std::sync::atomic::Ordering::SeqCst), 3);
     }
@@ -1930,6 +1933,9 @@ mod tests {
             tracker.on_outage_recovered(now + Duration::from_secs(21)),
             Some(OfflineTransition::Online)
         );
-        assert_eq!(tracker.on_outage_recovered(now + Duration::from_secs(22)), None);
+        assert_eq!(
+            tracker.on_outage_recovered(now + Duration::from_secs(22)),
+            None
+        );
     }
 }
