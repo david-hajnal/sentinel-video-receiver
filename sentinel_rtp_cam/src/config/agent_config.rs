@@ -400,6 +400,11 @@ impl AgentConfig {
                     &format!("{prefix}ONVIF_CONNREFUSED_BACKOFF_MS"),
                     onvif.get("connrefused_backoff_ms"),
                 );
+                set_map_if_value(
+                    &mut map,
+                    &format!("{prefix}ONVIF_NIGHT_VISION_MODE"),
+                    onvif.get("night_vision").and_then(|value| value.get("mode")),
+                );
                 set_map_if_bool(
                     &mut map,
                     &format!("{prefix}MOTION_ENABLED"),
@@ -488,6 +493,11 @@ impl AgentConfig {
                     &mut map,
                     "ONVIF_CONNREFUSED_BACKOFF_MS",
                     onvif.get("connrefused_backoff_ms"),
+                );
+                set_map_if_unset(
+                    &mut map,
+                    "ONVIF_NIGHT_VISION_MODE",
+                    onvif.get("night_vision").and_then(|value| value.get("mode")),
                 );
             }
         }
@@ -618,7 +628,10 @@ impl AgentConfig {
                         "min_poll_gap_ms": null,
                         "after_sub_delay_ms": null,
                         "connrefused_retries": null,
-                        "connrefused_backoff_ms": null
+                        "connrefused_backoff_ms": null,
+                        "night_vision": {
+                            "mode": null
+                        }
                     }
                 }
             ],
@@ -724,7 +737,10 @@ fn default_empty_json() -> Value {
                     "min_poll_gap_ms": null,
                     "after_sub_delay_ms": null,
                     "connrefused_retries": null,
-                    "connrefused_backoff_ms": null
+                    "connrefused_backoff_ms": null,
+                    "night_vision": {
+                        "mode": null
+                    }
                 }
             }
         ],
@@ -1381,6 +1397,49 @@ mod tests {
         assert_eq!(
             AgentConfig::runtime_var("CAM2_RTSP_URL").as_deref(),
             Some("rtsp://192.168.1.189:554/stream2")
+        );
+    }
+
+    #[test]
+    fn apply_json_env_overrides_maps_onvif_night_vision_mode() {
+        let _guard = EnvGuard::new();
+
+        let cfg = json!({
+            "cameras": [
+                {
+                    "id": "cam-one",
+                    "onvif": {
+                        "url": "http://192.168.1.187:2020/onvif/service",
+                        "night_vision": {
+                            "mode": "night"
+                        }
+                    }
+                },
+                {
+                    "id": "cam-two",
+                    "onvif": {
+                        "url": "http://192.168.1.188:2020/onvif/service",
+                        "night_vision": {
+                            "mode": "day"
+                        }
+                    }
+                }
+            ]
+        });
+
+        AgentConfig::apply_json_env_overrides(&cfg);
+
+        assert_eq!(
+            AgentConfig::runtime_var("ONVIF_NIGHT_VISION_MODE").as_deref(),
+            Some("night")
+        );
+        assert_eq!(
+            AgentConfig::runtime_var("CAM1_ONVIF_NIGHT_VISION_MODE").as_deref(),
+            Some("night")
+        );
+        assert_eq!(
+            AgentConfig::runtime_var("CAM2_ONVIF_NIGHT_VISION_MODE").as_deref(),
+            Some("day")
         );
     }
 
