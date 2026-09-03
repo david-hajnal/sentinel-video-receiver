@@ -340,7 +340,68 @@ async fn soap_call(
     if !status.is_success() {
         bail!("SOAP HTTP {}: {}", status, text);
     }
+    if let Some(reason) = soap_fault_reason(&text) {
+        bail!("SOAP fault: {}", reason);
+    }
     Ok(text)
+}
+
+fn soap_fault_reason(xml: &str) -> Option<String> {
+    let mut reader = Reader::from_str(xml);
+    reader.trim_text(true);
+
+    let mut buf = Vec::new();
+    let mut in_fault = false;
+    let mut current_tag: Option<String> = None;
+    let mut fault_reason: Option<String> = None;
+    let mut fault_code: Option<String> = None;
+
+    loop {
+        match reader.read_event_into(&mut buf) {
+            Ok(XmlEvent::Start(e)) => {
+                let local = local_name(e.name().as_ref());
+                if local == "Fault" {
+                    in_fault = true;
+                }
+                if in_fault {
+                    current_tag = Some(local);
+                }
+            }
+            Ok(XmlEvent::Text(t)) => {
+                if !in_fault {
+                    buf.clear();
+                    continue;
+                }
+                let value = t.unescape().ok()?.to_string();
+                if value.trim().is_empty() {
+                    buf.clear();
+                    continue;
+                }
+                match current_tag.as_deref() {
+                    Some("Text") | Some("faultstring") if fault_reason.is_none() => {
+                        fault_reason = Some(value)
+                    }
+                    Some("Value") | Some("faultcode") if fault_code.is_none() => {
+                        fault_code = Some(value)
+                    }
+                    _ => {}
+                }
+            }
+            Ok(XmlEvent::End(e)) => {
+                let local = local_name(e.name().as_ref());
+                if local == "Fault" {
+                    return fault_reason.or(fault_code).or(Some("unknown SOAP fault".to_string()));
+                }
+                current_tag = None;
+            }
+            Ok(XmlEvent::Eof) => break,
+            Err(_) => break,
+            _ => {}
+        }
+        buf.clear();
+    }
+
+    None
 }
 
 fn wsse_header(username: &str, password: &str) -> String {
@@ -431,7 +492,8 @@ fn xml_escape(value: &str) -> String {
 mod tests {
     use super::{
         build_set_imaging_settings_body, load_onvif_night_vision_cameras_from_env,
-        parse_first_video_source_token, parse_service_endpoint, NightVisionMode,
+        parse_first_video_source_token, parse_service_endpoint, soap_fault_reason,
+        NightVisionMode,
     };
     use crate::config::AgentConfig;
     use serde_json::json;
@@ -546,5 +608,22 @@ mod tests {
         assert!(body.contains("<timg:VideoSourceToken>video-source-1</timg:VideoSourceToken>"));
         assert!(body.contains("<tt:IrCutFilter>Off</tt:IrCutFilter>"));
         assert!(body.contains("<timg:ForcePersistence>true</timg:ForcePersistence>"));
+    }
+
+    #[test]
+    fn extracts_soap_11_fault_string() {
+        let xml = r#"
+        <SOAP-ENV:Envelope xmlns:SOAP-ENV="http://schemas.xmlsoap.org/soap/envelope/">
+          <SOAP-ENV:Body>
+            <SOAP-ENV:Fault>
+              <faultcode>SOAP-ENV:Client</faultcode>
+              <faultstring>Imaging settings are not writable</faultstring>
+            </SOAP-ENV:Fault>
+          </SOAP-ENV:Body>
+        </SOAP-ENV:Envelope>
+        "#;
+
+        let reason = soap_fault_reason(xml).expect("fault reason");
+        assert_eq!(reason, "Imaging settings are not writable");
     }
 }

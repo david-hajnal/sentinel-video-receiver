@@ -403,7 +403,25 @@ impl AgentConfig {
                 set_map_if_value(
                     &mut map,
                     &format!("{prefix}ONVIF_NIGHT_VISION_MODE"),
-                    onvif.get("night_vision").and_then(|value| value.get("mode")),
+                    onvif
+                        .get("night_vision")
+                        .and_then(|value| value.get("mode")),
+                );
+                set_map_if_value(
+                    &mut map,
+                    &format!("{prefix}ONVIF_MOTION_DETECTION_ENABLED"),
+                    onvif
+                        .get("motion_detection")
+                        .and_then(|value| value.get("enabled")),
+                );
+                set_map_if_string(
+                    &mut map,
+                    &format!("{prefix}ONVIF_MOTION_REGION_POINTS"),
+                    onvif
+                        .get("motion_detection")
+                        .and_then(|value| value.get("region"))
+                        .and_then(|value| value.get("points"))
+                        .and_then(compact_json_string),
                 );
                 set_map_if_bool(
                     &mut map,
@@ -497,7 +515,25 @@ impl AgentConfig {
                 set_map_if_unset(
                     &mut map,
                     "ONVIF_NIGHT_VISION_MODE",
-                    onvif.get("night_vision").and_then(|value| value.get("mode")),
+                    onvif
+                        .get("night_vision")
+                        .and_then(|value| value.get("mode")),
+                );
+                set_map_if_unset(
+                    &mut map,
+                    "ONVIF_MOTION_DETECTION_ENABLED",
+                    onvif
+                        .get("motion_detection")
+                        .and_then(|value| value.get("enabled")),
+                );
+                set_map_if_unset_string(
+                    &mut map,
+                    "ONVIF_MOTION_REGION_POINTS",
+                    onvif
+                        .get("motion_detection")
+                        .and_then(|value| value.get("region"))
+                        .and_then(|value| value.get("points"))
+                        .and_then(compact_json_string),
                 );
             }
         }
@@ -1125,6 +1161,10 @@ fn set_map_if_unset_string(map: &mut HashMap<String, String>, key: &str, value: 
     set_map_if_string(map, key, value);
 }
 
+fn compact_json_string(value: &Value) -> Option<String> {
+    serde_json::to_string(value).ok()
+}
+
 fn set_map_if_unset(map: &mut HashMap<String, String>, key: &str, value: Option<&Value>) {
     if map.contains_key(key) {
         return;
@@ -1440,6 +1480,69 @@ mod tests {
         assert_eq!(
             AgentConfig::runtime_var("CAM2_ONVIF_NIGHT_VISION_MODE").as_deref(),
             Some("day")
+        );
+    }
+
+    #[test]
+    fn apply_json_env_overrides_maps_onvif_motion_detection_region() {
+        let _guard = EnvGuard::new();
+
+        let cfg = json!({
+            "cameras": [
+                {
+                    "id": "cam-one",
+                    "onvif": {
+                        "url": "http://192.168.1.187:2020/onvif/service",
+                        "motion_detection": {
+                            "enabled": true,
+                            "region": {
+                                "points": [
+                                    { "x": 0.1, "y": 0.1 },
+                                    { "x": 0.8, "y": 0.1 },
+                                    { "x": 0.8, "y": 0.7 },
+                                    { "x": 0.1, "y": 0.7 }
+                                ]
+                            }
+                        }
+                    }
+                },
+                {
+                    "id": "cam-two",
+                    "onvif": {
+                        "url": "http://192.168.1.188:2020/onvif/service",
+                        "motion_detection": {
+                            "enabled": false
+                        }
+                    }
+                }
+            ]
+        });
+
+        AgentConfig::apply_json_env_overrides(&cfg);
+
+        assert_eq!(
+            AgentConfig::runtime_var("ONVIF_MOTION_DETECTION_ENABLED").as_deref(),
+            Some("1")
+        );
+        assert_eq!(
+            AgentConfig::runtime_var("CAM1_ONVIF_MOTION_DETECTION_ENABLED").as_deref(),
+            Some("1")
+        );
+        assert_eq!(
+            AgentConfig::runtime_var("CAM2_ONVIF_MOTION_DETECTION_ENABLED").as_deref(),
+            Some("0")
+        );
+        assert_eq!(
+            AgentConfig::runtime_var("ONVIF_MOTION_REGION_POINTS").as_deref(),
+            Some("[{\"x\":0.1,\"y\":0.1},{\"x\":0.8,\"y\":0.1},{\"x\":0.8,\"y\":0.7},{\"x\":0.1,\"y\":0.7}]")
+        );
+        assert_eq!(
+            AgentConfig::runtime_var("CAM1_ONVIF_MOTION_REGION_POINTS").as_deref(),
+            Some("[{\"x\":0.1,\"y\":0.1},{\"x\":0.8,\"y\":0.1},{\"x\":0.8,\"y\":0.7},{\"x\":0.1,\"y\":0.7}]")
+        );
+        assert_eq!(
+            AgentConfig::runtime_var("CAM2_ONVIF_MOTION_REGION_POINTS").as_deref(),
+            None
         );
     }
 

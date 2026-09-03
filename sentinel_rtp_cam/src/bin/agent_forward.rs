@@ -22,7 +22,9 @@ use sentinel_rtp_cam::forward_agent::{
     basic_auth_value, build_stream_maps, forward_motion_event, load_cameras_from_env,
     load_uplink_ingest_config_from_env, parse_rtsp_url, CamConfig, MotionEventIdLatch,
 };
-use sentinel_rtp_cam::onvif::{run_onvif_motion_poller, run_onvif_night_vision_sync_once};
+use sentinel_rtp_cam::onvif::{
+    run_onvif_motion_poller, run_onvif_motion_region_sync_once, run_onvif_night_vision_sync_once,
+};
 use sentinel_rtp_cam::rtsp::interleaved::{read_interleaved_frame, InterleavedFrame};
 use sentinel_rtp_cam::rtsp::rtsp::RtspClient;
 use sentinel_rtp_cam::{
@@ -494,6 +496,19 @@ fn start_runtime(desired: &DesiredRuntime) -> Result<AgentRuntime> {
     tasks.push(spawn_task(async move {
         if let Err(error) = run_onvif_night_vision_sync_once().await {
             warn!(error = %error, "ONVIF night vision sync ended");
+        }
+    }));
+
+    tasks.push(spawn_task(async move {
+        let outcomes = run_onvif_motion_region_sync_once().await;
+        for outcome in &outcomes {
+            if outcome.status == "failed" {
+                warn!(
+                    camera_id = %outcome.camera_id,
+                    error = ?outcome.error,
+                    "ONVIF motion region sync failed for camera"
+                );
+            }
         }
     }));
 

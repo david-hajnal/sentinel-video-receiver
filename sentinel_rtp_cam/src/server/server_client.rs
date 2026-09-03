@@ -1252,7 +1252,10 @@ async fn maybe_process_shutdown_job(
         return ShutdownProcessOutcome::Continue;
     }
     memory.mark_handled(job.job_id);
-    info!(job_id = job.job_id, "Shutdown job accepted; exiting with code 0");
+    info!(
+        job_id = job.job_id,
+        "Shutdown job accepted; exiting with code 0"
+    );
     ShutdownProcessOutcome::ExitZero
 }
 
@@ -1889,8 +1892,7 @@ mod tests {
         try_fallback_paths, write_restart_job_marker, FallbackOutcome, FirmwareJobMemory,
         MemoryUsageMb, OnvifProbeJobCommand, OnvifProbeJobResponse, OnvifProbeManager,
         RestartHeartbeatState, RestartJobCommand, RestartJobMarker, RestartJobMemory,
-        RestartJobResponse, RestartMarkerReportOutcome, RestartProcessOutcome,
-        ShutdownJobResponse,
+        RestartJobResponse, RestartMarkerReportOutcome, RestartProcessOutcome, ShutdownJobResponse,
         TelemetryCapabilities, TelemetryStatus, DEFAULT_FIRMWARE_UPDATER_CMD, RESTART_EXIT_CODE,
     };
     use serde::Deserialize;
@@ -2667,8 +2669,12 @@ mod tests {
 
     #[test]
     fn auth_failure_statuses_are_classified_explicitly() {
-        assert!(super::is_auth_failure_status(reqwest::StatusCode::UNAUTHORIZED));
-        assert!(super::is_auth_failure_status(reqwest::StatusCode::FORBIDDEN));
+        assert!(super::is_auth_failure_status(
+            reqwest::StatusCode::UNAUTHORIZED
+        ));
+        assert!(super::is_auth_failure_status(
+            reqwest::StatusCode::FORBIDDEN
+        ));
         assert!(!super::is_auth_failure_status(
             reqwest::StatusCode::BAD_REQUEST
         ));

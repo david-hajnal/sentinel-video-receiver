@@ -88,7 +88,8 @@ pub use rtsp::{run_udp_receiver, UdpReceiverConfig};
 // ONVIF
 pub use onvif::{
     load_onvif_probe_cameras_from_env, run_onvif_capability_probe, run_onvif_motion_poller,
-    OnvifProbeCameraConfig, OnvifProbeReport,
+    run_onvif_motion_region_sync_once, OnvifMotionRegionSyncOutcome, OnvifProbeCameraConfig,
+    OnvifProbeReport,
 };
 
 // Events

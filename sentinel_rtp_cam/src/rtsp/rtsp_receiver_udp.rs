@@ -294,12 +294,13 @@ pub async fn run_udp_receiver(
     let sock = UdpSocket::bind(("0.0.0.0", cfg.rtp_port)).await?;
     info!(port = cfg.rtp_port, "RTP receiving on UDP socket");
 
-    let expected_rtp_source = resolve_rtsp_host_ip(&cfg.host, cfg.port)
-        .await
-        .map(|ip| ExpectedRtpSource {
-            ip,
-            port: negotiated_server_rtp_port,
-        });
+    let expected_rtp_source =
+        resolve_rtsp_host_ip(&cfg.host, cfg.port)
+            .await
+            .map(|ip| ExpectedRtpSource {
+                ip,
+                port: negotiated_server_rtp_port,
+            });
     let mut source_validator = SourceValidator::new(expected_rtp_source);
     let mut source_mismatch_count: u64 = 0;
     if let Some(expected) = expected_rtp_source {
@@ -548,8 +549,7 @@ mod tests {
 
     #[test]
     fn parse_server_rtp_port_extracts_first_server_port() {
-        let transport =
-            "RTP/AVP;unicast;client_port=5004-5005;server_port=6000-6001;ssrc=ABCD1234";
+        let transport = "RTP/AVP;unicast;client_port=5004-5005;server_port=6000-6001;ssrc=ABCD1234";
         assert_eq!(parse_server_rtp_port(transport), Some(6000));
     }
 

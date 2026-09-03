@@ -901,9 +901,9 @@ async fn run_onvif_motion_poller_for_camera(
 #[cfg(test)]
 mod tests {
     use super::{
-        debug_enabled, dump_enabled, env_string, env_u32, env_u64, is_connectish_error,
-        global_motion_enabled_with_inference, load_onvif_cameras_from_env, motion_enabled_for_slot,
-        reset_motion_tracking, DEFAULT_AFTER_SUB_DELAY_MS,
+        debug_enabled, dump_enabled, env_string, env_u32, env_u64,
+        global_motion_enabled_with_inference, is_connectish_error, load_onvif_cameras_from_env,
+        motion_enabled_for_slot, reset_motion_tracking, DEFAULT_AFTER_SUB_DELAY_MS,
         DEFAULT_CONNREFUSED_BACKOFF_MS, DEFAULT_CONNREFUSED_RETRIES, DEFAULT_MIN_POLL_GAP_MS,
         DEFAULT_PULL_LIMIT, DEFAULT_PULL_TIMEOUT, DEFAULT_RENEW_EVERY_SECS,
         DEFAULT_RESUBSCRIBE_AFTER_ERRORS, DEFAULT_SUB_TERMINATION,

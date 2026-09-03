@@ -92,6 +92,23 @@ pub struct OnvifPtzSummary {
 }
 
 #[derive(Debug, Clone, Serialize, Default, PartialEq, Eq)]
+pub struct OnvifMotionRegionSummary {
+    pub supported: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub probe_failed: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub target_kind: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub target_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub target_type: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub point_count: Option<usize>,
+}
+
+#[derive(Debug, Clone, Serialize, Default, PartialEq, Eq)]
 pub struct OnvifServiceError {
     pub service: String,
     pub operation: String,
@@ -106,6 +123,7 @@ pub struct OnvifProbeReport {
     pub media: Option<OnvifMediaSummary>,
     pub events: Option<OnvifEventsSummary>,
     pub ptz: Option<OnvifPtzSummary>,
+    pub motion_region: Option<OnvifMotionRegionSummary>,
     pub service_errors: Vec<OnvifServiceError>,
 }
 
@@ -211,6 +229,7 @@ pub async fn run_onvif_capability_probe(cam: &OnvifProbeCameraConfig) -> Result<
         media: None,
         events: None,
         ptz: None,
+        motion_region: None,
         service_errors: Vec::new(),
     };
 
@@ -338,7 +357,116 @@ pub async fn run_onvif_capability_probe(cam: &OnvifProbeCameraConfig) -> Result<
         }
     }
 
+    if report.capabilities.analytics || xaddrs.contains_key("analytics") {
+        let analytics_url = xaddrs
+            .get("analytics")
+            .cloned()
+            .unwrap_or_else(|| cam.service_url.clone());
+        let media_url = xaddrs
+            .get("media")
+            .cloned()
+            .unwrap_or_else(|| cam.service_url.clone());
+        report.motion_region = Some(
+            probe_motion_region_support(
+                &client,
+                &media_url,
+                &analytics_url,
+                &cam.username,
+                &cam.password,
+                &mut report.service_errors,
+            )
+            .await,
+        );
+    }
+
     Ok(report)
+}
+
+async fn probe_motion_region_support(
+    client: &reqwest::Client,
+    media_url: &str,
+    analytics_url: &str,
+    username: &str,
+    password: &str,
+    service_errors: &mut Vec<OnvifServiceError>,
+) -> OnvifMotionRegionSummary {
+    let profiles_xml = match capture_optional(
+        service_errors,
+        "media",
+        "GetProfiles",
+        call_operation(
+            client,
+            media_url,
+            username,
+            password,
+            MEDIA_NAMESPACE,
+            "GetProfiles",
+            "<trt:GetProfiles/>",
+        ),
+    )
+    .await
+    {
+        Some(xml) => xml,
+        None => {
+            return OnvifMotionRegionSummary {
+                supported: false,
+                probe_failed: Some(true),
+                reason: Some("Failed to load ONVIF media profiles for motion region probing".to_string()),
+                ..Default::default()
+            }
+        }
+    };
+
+    let Some(config_token) = parse_video_analytics_config_token(&profiles_xml) else {
+        return OnvifMotionRegionSummary {
+            supported: false,
+            reason: Some("Camera exposes ONVIF media profiles but no VideoAnalyticsConfiguration token was found".to_string()),
+            ..Default::default()
+        };
+    };
+
+    let body = format!(
+        "<tan:GetRules><tan:ConfigurationToken>{}</tan:ConfigurationToken></tan:GetRules>",
+        xml_escape(&config_token)
+    );
+    let rules_xml = match capture_optional(
+        service_errors,
+        "analytics",
+        "GetRules",
+        call_operation(
+            client,
+            analytics_url,
+            username,
+            password,
+            "http://www.onvif.org/ver20/analytics/wsdl",
+            "GetRules",
+            &body,
+        ),
+    )
+    .await
+    {
+        Some(xml) => xml,
+        None => {
+            return OnvifMotionRegionSummary {
+                supported: false,
+                probe_failed: Some(true),
+                reason: Some("Failed to load ONVIF analytics rules for motion region probing".to_string()),
+                ..Default::default()
+            }
+        }
+    };
+
+    match parse_motion_region_rule_target(&rules_xml) {
+        Some(summary) => summary,
+        None => OnvifMotionRegionSummary {
+            supported: false,
+            reason: Some(
+                "Camera exposes ONVIF analytics config but no writable motion region polygon rule was found"
+                    .to_string(),
+            ),
+            ..Default::default()
+        },
+    }
 }
 
 async fn capture_optional(
@@ -825,6 +953,102 @@ fn extract_first_text(xml: &str, wanted_local: &str) -> Option<String> {
     None
 }
 
+fn parse_video_analytics_config_token(xml: &str) -> Option<String> {
+    let mut reader = Reader::from_str(xml);
+    reader.trim_text(true);
+
+    let mut buf = Vec::new();
+
+    loop {
+        match reader.read_event_into(&mut buf) {
+            Ok(XmlEvent::Start(event)) | Ok(XmlEvent::Empty(event)) => {
+                let name = local_name(event.name().as_ref());
+                if name == "VideoAnalyticsConfiguration" {
+                    if let Some(token) = attr_value(&event, "token") {
+                        if !token.trim().is_empty() {
+                            return Some(token);
+                        }
+                    }
+                }
+            }
+            Ok(XmlEvent::Eof) => break,
+            Err(_) => break,
+            _ => {}
+        }
+        buf.clear();
+    }
+
+    None
+}
+
+fn parse_motion_region_rule_target(xml: &str) -> Option<OnvifMotionRegionSummary> {
+    let mut reader = Reader::from_str(xml);
+    reader.trim_text(true);
+
+    let mut buf = Vec::new();
+    let mut in_rule = false;
+    let mut target_name: Option<String> = None;
+    let mut target_type: Option<String> = None;
+    let mut point_count = 0usize;
+
+    loop {
+        match reader.read_event_into(&mut buf) {
+            Ok(XmlEvent::Start(event)) => {
+                let name = local_name(event.name().as_ref());
+                match name.as_str() {
+                    "Rule" => {
+                        in_rule = attr_value(&event, "Type")
+                            .map(|value| value.to_ascii_lowercase().contains("motionregion"))
+                            .unwrap_or(false);
+                        if in_rule {
+                            target_name = attr_value(&event, "Name");
+                            target_type = attr_value(&event, "Type");
+                            point_count = 0;
+                        }
+                    }
+                    "Point" if in_rule => point_count += 1,
+                    _ => {}
+                }
+            }
+            Ok(XmlEvent::Empty(event)) => {
+                let name = local_name(event.name().as_ref());
+                if name == "Point" && in_rule {
+                    point_count += 1;
+                }
+            }
+            Ok(XmlEvent::End(event)) => {
+                let name = local_name(event.name().as_ref());
+                match name.as_str() {
+                    "Rule" if in_rule => {
+                        if point_count > 0 {
+                            return Some(OnvifMotionRegionSummary {
+                                supported: true,
+                                probe_failed: None,
+                                reason: None,
+                                target_kind: Some("rule".to_string()),
+                                target_name,
+                                target_type,
+                                point_count: Some(point_count),
+                            });
+                        }
+                        in_rule = false;
+                        target_name = None;
+                        target_type = None;
+                        point_count = 0;
+                    }
+                    _ => {}
+                }
+            }
+            Ok(XmlEvent::Eof) => break,
+            Err(_) => break,
+            _ => {}
+        }
+        buf.clear();
+    }
+
+    None
+}
+
 fn service_key_from_namespace(namespace: &str) -> String {
     let lower = namespace.to_ascii_lowercase();
     if lower.contains("/device/wsdl") {
@@ -882,7 +1106,8 @@ fn xml_escape(value: &str) -> String {
 mod tests {
     use super::{
         collect_service_xaddrs, load_onvif_probe_cameras_from_env, parse_capabilities,
-        parse_device_information, parse_event_properties, parse_profiles, parse_services,
+        parse_device_information, parse_event_properties, parse_motion_region_rule_target,
+        parse_profiles, parse_services, parse_video_analytics_config_token,
         parse_video_encoder_configurations,
     };
     use crate::config::AgentConfig;
@@ -972,6 +1197,87 @@ mod tests {
         assert!(caps.ptz);
         assert!(caps.analytics);
         assert!(!caps.device_io);
+    }
+
+    #[test]
+    fn parses_video_analytics_config_token_from_profiles() {
+        let xml = r#"
+<Envelope xmlns:trt="http://www.onvif.org/ver10/media/wsdl" xmlns:tt="http://www.onvif.org/ver10/schema">
+  <Body>
+    <trt:GetProfilesResponse>
+      <trt:Profiles token="MainProfile">
+        <tt:VideoAnalyticsConfiguration token="analytics-token-1"/>
+      </trt:Profiles>
+    </trt:GetProfilesResponse>
+  </Body>
+</Envelope>
+"#;
+
+        assert_eq!(
+            parse_video_analytics_config_token(xml).as_deref(),
+            Some("analytics-token-1")
+        );
+    }
+
+    #[test]
+    fn parses_motion_region_rule_target_summary() {
+        let xml = r#"
+<Envelope xmlns:tan="http://www.onvif.org/ver20/analytics/wsdl" xmlns:tt="http://www.onvif.org/ver10/schema">
+  <Body>
+    <tan:GetRulesResponse>
+      <tan:Rule Name="Region1" Type="tt:MotionRegionDetector">
+        <tt:Parameters>
+          <tt:ElementItem Name="RegionPolygon">
+            <tt:Polygon>
+              <tt:Point x="0.1" y="0.1"/>
+              <tt:Point x="0.8" y="0.1"/>
+              <tt:Point x="0.8" y="0.7"/>
+            </tt:Polygon>
+          </tt:ElementItem>
+        </tt:Parameters>
+      </tan:Rule>
+    </tan:GetRulesResponse>
+  </Body>
+</Envelope>
+"#;
+
+        let summary = parse_motion_region_rule_target(xml).expect("motion region summary");
+        assert!(summary.supported);
+        assert_eq!(summary.target_kind.as_deref(), Some("rule"));
+        assert_eq!(summary.target_name.as_deref(), Some("Region1"));
+        assert_eq!(summary.target_type.as_deref(), Some("tt:MotionRegionDetector"));
+        assert_eq!(summary.point_count, Some(3));
+    }
+
+    #[test]
+    fn parses_motion_region_rule_target_summary_from_non_polygon_point_layout() {
+        let xml = r#"
+<Envelope xmlns:tan="http://www.onvif.org/ver20/analytics/wsdl" xmlns:tt="http://www.onvif.org/ver10/schema">
+  <Body>
+    <tan:GetRulesResponse>
+      <tan:Rule Name="RegionLayout1" Type="tt:MotionRegionDetector">
+        <tt:Parameters>
+          <tt:ElementItem Name="RegionLayout">
+            <tt:Region>
+              <tt:Point x="0.1" y="0.1"/>
+              <tt:Point x="0.8" y="0.1"/>
+              <tt:Point x="0.8" y="0.7"/>
+              <tt:Point x="0.1" y="0.7"/>
+            </tt:Region>
+          </tt:ElementItem>
+        </tt:Parameters>
+      </tan:Rule>
+    </tan:GetRulesResponse>
+  </Body>
+</Envelope>
+"#;
+
+        let summary = parse_motion_region_rule_target(xml).expect("motion region summary");
+        assert!(summary.supported);
+        assert_eq!(summary.target_kind.as_deref(), Some("rule"));
+        assert_eq!(summary.target_name.as_deref(), Some("RegionLayout1"));
+        assert_eq!(summary.target_type.as_deref(), Some("tt:MotionRegionDetector"));
+        assert_eq!(summary.point_count, Some(4));
     }
 
     #[test]
